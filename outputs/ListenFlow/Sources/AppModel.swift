@@ -80,7 +80,6 @@ final class AppModel: ObservableObject {
     @Published var autoOrganize = false
     @Published var showSettings = false
     @Published var showHistory = false
-    @Published var now = Date()
     @Published var source: AudioSource = .app
     /// Bumped to pull keyboard focus into the question field from the menu bar.
     /// A counter rather than a flag, so repeated ⌘K always re-focuses.
@@ -284,7 +283,8 @@ final class AppModel: ObservableObject {
 
     private func tick() {
         let current = Date()
-        if isRecording { now = current }
+        // The elapsed-time readout is driven by a TimelineView, so this timer never
+        // publishes a clock value — only real state changes reach the views.
         let age = pending.values.map { current.timeIntervalSince($0.start) }.max() ?? 0
         if age != oldestPending { oldestPending = age }
         if current.timeIntervalSince(lastAppSignal) > 1 && levels.app != 0 { levels.app = 0 }

@@ -6,6 +6,50 @@ private let teal = Color(red: 0.05, green: 0.48, blue: 0.43)
 private let paper = Color(red: 0.965, green: 0.967, blue: 0.955)
 private let muted = Color(red: 0.47, green: 0.51, blue: 0.53)
 
+/// Shared visual tokens. Centralising these keeps the surfaces consistent and makes
+/// the palette adjustable in one place rather than scattered across modifier chains.
+private enum Look {
+    static let sidebar = Color(red: 0.960, green: 0.963, blue: 0.953)
+    static let card = Color.white
+    static let canvas = Color(red: 0.988, green: 0.989, blue: 0.984)
+    static let hairline = Color.black.opacity(0.075)
+    static let accentSoft = teal.opacity(0.10)
+
+    static let radiusCard: CGFloat = 12
+    static let radiusRow: CGFloat = 10
+    static let radiusControl: CGFloat = 8
+
+    /// A restrained card: hairline border plus a very soft shadow, so surfaces read
+    /// as layered without the heavy drop shadows that look dated on macOS.
+    static func cardStyle(_ radius: CGFloat = radiusCard) -> some ViewModifier { CardSurface(radius: radius) }
+}
+
+private struct CardSurface: ViewModifier {
+    let radius: CGFloat
+    func body(content: Content) -> some View {
+        content
+            .background(Look.card, in: RoundedRectangle(cornerRadius: radius, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: radius, style: .continuous).strokeBorder(Look.hairline, lineWidth: 1))
+            .shadow(color: .black.opacity(0.045), radius: 5, y: 2)
+    }
+}
+
+private extension View {
+    func surfaceCard(_ radius: CGFloat = Look.radiusCard) -> some View { modifier(CardSurface(radius: radius)) }
+}
+
+/// A slow breathing pulse on the recording dot. Kept as its own modifier so it
+/// animates without invalidating any sibling view.
+private struct Pulse: ViewModifier {
+    @State private var on = false
+    func body(content: Content) -> some View {
+        content
+            .opacity(on ? 0.45 : 1)
+            .animation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true), value: on)
+            .onAppear { on = true }
+    }
+}
+
 struct ContentView: View {
     @ObservedObject var model: AppModel
     var body: some View {
@@ -38,16 +82,25 @@ struct ContentView: View {
     }
 
     private var sidebar: some View {
-        VStack(alignment: .leading, spacing: 24) {
-            HStack(spacing: 10) {
-                Image(systemName: "waveform").font(.system(size: 22, weight: .bold)).foregroundStyle(.white)
-                    .frame(width: 40, height: 40).background(teal, in: RoundedRectangle(cornerRadius: 13))
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("听流").font(.system(size: 23, weight: .semibold))
-                    Text("LISTENFLOW").font(.system(size: 9, weight: .medium, design: .monospaced)).tracking(2).foregroundStyle(muted)
+        VStack(alignment: .leading, spacing: 22) {
+            // The app mark reuses the icon's mark-and-ripple idea at a small size.
+            HStack(spacing: 11) {
+                Image(systemName: "waveform")
+                    .font(.system(size: 19, weight: .semibold)).foregroundStyle(.white)
+                    .frame(width: 38, height: 38)
+                    .background(
+                        LinearGradient(colors: [teal, Color(red: 0.06, green: 0.36, blue: 0.52)],
+                                       startPoint: .topLeading, endPoint: .bottomTrailing),
+                        in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+                    .shadow(color: teal.opacity(0.28), radius: 6, y: 2)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("听流").font(.system(size: 21, weight: .semibold))
+                    Text("LISTENFLOW").font(.system(size: 8.5, weight: .medium, design: .monospaced))
+                        .tracking(2.2).foregroundStyle(muted)
                 }
-            }.padding(.top, 12)
-            VStack(alignment: .leading, spacing: 9) {
+            }.padding(.top, 10)
+
+            VStack(alignment: .leading, spacing: 11) {
                 sectionLabel("音频来源")
                 Picker("音频来源", selection: $model.source) {
                     ForEach(AudioSource.allCases) { source in
@@ -57,15 +110,16 @@ struct ContentView: View {
                     .disabled(model.isRecording || model.isBusy)
                 Text(model.source.detail).font(.system(size: 11)).foregroundStyle(muted)
                     .fixedSize(horizontal: false, vertical: true)
+                    .lineSpacing(2)
 
                 if model.source == .app {
                     HStack {
-                        Text("指定 App").font(.system(size: 13, weight: .medium))
+                        Text("指定 App").font(.system(size: 12, weight: .medium)).foregroundStyle(muted)
                         Spacer()
                         Button { model.refreshApps() } label: { Image(systemName: "arrow.clockwise") }
                             .buttonStyle(.plain).foregroundStyle(muted).help("刷新正在运行的 App")
                             .disabled(model.isRecording || model.isBusy)
-                    }.padding(.top, 2)
+                    }.padding(.top, 3)
                     Picker("指定 App", selection: $model.selectedPID) {
                         if model.apps.isEmpty { Text("先打开一个 App").tag(pid_t(0)) }
                         ForEach(model.apps) { Text($0.name).tag($0.id) }
@@ -75,6 +129,9 @@ struct ContentView: View {
 
                 AudioLevelMeter(levels: model.levels, microphone: model.source == .microphone)
             }
+            .padding(14)
+            .surfaceCard()
+
             if model.source == .app, model.isRecording {
                 // Mixing an open microphone with speaker output re-records the app's
                 // own sound; the option exists, but only as an explicit choice.
@@ -82,7 +139,7 @@ struct ContentView: View {
                     HStack {
                         Image(systemName: model.micEnabled ? "mic.fill" : "mic.slash.fill")
                             .foregroundStyle(model.micEnabled ? teal : muted)
-                        Text("同时录麦克风").font(.system(size: 13, weight: .medium))
+                        Text("同时录麦克风").font(.system(size: 12, weight: .medium))
                         Spacer()
                         Toggle("同时录麦克风", isOn: Binding(get: { model.micEnabled }, set: { value in
                             Task { await model.toggleMic(value) }
@@ -91,33 +148,43 @@ struct ContentView: View {
                     }
                     AudioLevelMeter(levels: model.levels, microphone: true)
                     if model.micEnabled {
-                        Text("外放时会重复录入 App 的声音，建议戴耳机").font(.system(size: 10)).foregroundStyle(.orange)
+                        Text("外放时会重复录入 App 的声音，建议戴耳机")
+                            .font(.system(size: 10)).foregroundStyle(.orange)
                             .fixedSize(horizontal: false, vertical: true)
                     }
-                }.padding(14).background(Color.white.opacity(0.7), in: RoundedRectangle(cornerRadius: 12))
+                }.padding(14).surfaceCard()
             }
-            VStack(alignment: .leading, spacing: 10) {
-                sectionLabel("会话")
+
+            VStack(alignment: .leading, spacing: 6) {
+                sectionLabel("会话").padding(.bottom, 2)
                 sideButton("新建会话", icon: "plus.square") { model.newSession() }.disabled(!model.canChangeSession)
                 sideButton("历史记录", icon: "clock.arrow.circlepath") { model.showHistory = true }.disabled(!model.canChangeSession)
                 sideButton("导出转写与问答", icon: "square.and.arrow.up") { model.export() }
                     .disabled(model.session.lines.isEmpty && model.session.chat.isEmpty && model.session.imageLibrary.isEmpty)
             }
-            Spacer(minLength: 10)
-            VStack(alignment: .leading, spacing: 10) {
-                HStack(spacing: 6) {
-                    Circle().fill(model.modelReady ? teal : .orange).frame(width: 6, height: 6)
+
+            Spacer(minLength: 8)
+            VStack(alignment: .leading, spacing: 9) {
+                HStack(spacing: 7) {
+                    Circle().fill(model.modelReady ? teal : .orange)
+                        .frame(width: 6, height: 6)
+                        .shadow(color: (model.modelReady ? teal : .orange).opacity(0.6), radius: 3)
                     Text(model.modelStatus).font(.system(size: 11, weight: .medium))
                 }
                 Text(model.preferences.asrModel.components(separatedBy: "/").last ?? "本地 ASR")
-                    .font(.system(size: 10, design: .monospaced)).foregroundStyle(muted).lineLimit(1)
+                    .font(.system(size: 9.5, design: .monospaced)).foregroundStyle(muted).lineLimit(1)
                 if !model.modelReady && !model.modelLoading {
                     Button("重新加载模型") { model.loadModel() }.font(.system(size: 11))
                 }
-                Divider()
+                Divider().padding(.vertical, 2)
                 sideButton("模型与 API 设置", icon: "slider.horizontal.3") { model.showSettings = true }
             }
-        }.padding(22).background(paper)
+        }
+        .padding(.horizontal, 20).padding(.vertical, 22)
+        // A whisper of a gradient gives the sidebar depth without competing with content.
+        .background(
+            LinearGradient(colors: [Look.sidebar, Look.sidebar.opacity(0.94)],
+                           startPoint: .top, endPoint: .bottom))
     }
 
     /// Spoken guidance depends on what the session is actually listening to.
@@ -134,18 +201,31 @@ struct ContentView: View {
 
     private var header: some View {
         HStack(spacing: 14) {
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(spacing: 8) {
-                    Text(model.isRecording ? "正在聆听" : "实时转写").font(.system(size: 24, weight: .semibold))
-                    if model.isRecording { Circle().fill(teal).frame(width: 7, height: 7) }
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(spacing: 9) {
+                    Text(model.isRecording ? "正在聆听" : "实时转写")
+                        .font(.system(size: 23, weight: .semibold))
+                    if model.isRecording {
+                        Circle().fill(teal).frame(width: 7, height: 7)
+                            .shadow(color: teal.opacity(0.7), radius: 4)
+                            .modifier(Pulse())
+                    }
                 }
                 Text(model.session.lines.isEmpty && model.session.chat.isEmpty && model.session.imageLibrary.isEmpty ? "让声音留下，也让问题有据可循。" : model.session.title)
                     .font(.system(size: 12)).foregroundStyle(muted).lineLimit(1)
             }
             Spacer()
             if model.isRecording {
-                Text(SessionStore.timestamp(model.now, relativeTo: model.session.created))
-                    .font(.system(size: 14, weight: .medium, design: .monospaced)).foregroundStyle(muted)
+                // Isolated in its own timeline so the ticking clock redraws one label
+                // instead of publishing a value the whole window observes.
+                TimelineView(.periodic(from: model.session.created, by: 1)) { context in
+                    Text(SessionStore.timestamp(context.date, relativeTo: model.session.created))
+                        .font(.system(size: 13, weight: .medium, design: .monospaced))
+                        .foregroundStyle(muted)
+                        .monospacedDigit()
+                        .padding(.horizontal, 9).padding(.vertical, 4)
+                        .background(Look.hairline, in: Capsule())
+                }
             }
             Button { Task { if model.isRecording { await model.stop() } else { await model.start() } } } label: {
                 HStack(spacing: 8) {
@@ -195,16 +275,7 @@ struct ContentView: View {
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 24) {
                             ForEach(model.session.lines) { line in
-                                VStack(alignment: .leading, spacing: 8) {
-                                    HStack(spacing: 8) {
-                                        Text(SessionStore.timestamp(line.start, relativeTo: model.session.created))
-                                            .font(.system(size: 10, weight: .medium, design: .monospaced)).foregroundStyle(muted)
-                                        Text(line.source).font(.system(size: 10, weight: .medium))
-                                            .foregroundStyle(line.source == "麦克风" ? .orange : teal)
-                                        Spacer()
-                                    }
-                                    Text(line.text).font(.system(size: 15)).lineSpacing(6).textSelection(.enabled)
-                                }.id(line.id)
+                                TranscriptRow(line: line, sessionCreated: model.session.created)
                             }
                             if model.pendingCount > 0 {
                                 HStack(spacing: 8) { ProgressView().controlSize(.mini); Text("正在识别 \(model.pendingCount) 段音频…").font(.system(size: 11)).foregroundStyle(muted) }
@@ -254,24 +325,27 @@ struct ContentView: View {
 
     private var askPanel: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack {
-                Image(systemName: "sparkle").foregroundStyle(teal)
-                Text("问问这段内容").font(.system(size: 14, weight: .semibold))
+            HStack(spacing: 8) {
+                Image(systemName: "sparkle").font(.system(size: 12)).foregroundStyle(teal)
+                Text("问问这段内容").font(.system(size: 13.5, weight: .semibold))
                 Spacer()
-                Button { model.showSettings = true } label: { Image(systemName: "gearshape") }.buttonStyle(.plain).foregroundStyle(muted)
-            }.padding(.horizontal, 22).padding(.top, 17).padding(.bottom, 8)
-            Text(model.connectionLabel).font(.system(size: 10)).foregroundStyle(muted).padding(.horizontal, 22)
+                Button { model.showSettings = true } label: {
+                    Image(systemName: "gearshape").font(.system(size: 12))
+                }.buttonStyle(.plain).foregroundStyle(muted)
+            }.padding(.horizontal, 20).padding(.top, 16).padding(.bottom, 6)
+            Text(model.connectionLabel).font(.system(size: 10)).foregroundStyle(muted).padding(.horizontal, 20)
             if model.session.chat.isEmpty {
-                VStack(alignment: .leading, spacing: 16) {
-                    Text(model.askImages.isEmpty ? "边听，边理解。" : "看图，也结合上下文。").font(.system(size: 22, weight: .medium))
+                VStack(alignment: .leading, spacing: 15) {
+                    Text(model.askImages.isEmpty ? "边听，边理解。" : "看图，也结合上下文。")
+                        .font(.system(size: 21, weight: .medium))
                     Text(model.askImages.isEmpty ? "基于当前会话已经转写的内容回答。\n提问期间，转写会继续。" : "结合选中的图片与已有转写回答。\n没有录音，也可以直接提问图片内容。")
                         .font(.system(size: 12)).foregroundStyle(muted).lineSpacing(5)
                     VStack(alignment: .leading, spacing: 8) {
                         suggestion("总结目前的讨论", icon: "text.alignleft")
                         suggestion("有哪些待办事项？", icon: "checklist")
                         suggestion("解释一下刚才的内容", icon: "lightbulb")
-                    }.padding(.top, 8)
-                }.padding(26).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+                    }.padding(.top, 7)
+                }.padding(24).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
             } else {
                 ScrollViewReader { proxy in
                     ScrollView {
@@ -305,19 +379,6 @@ struct ContentView: View {
         }.background(paper.opacity(0.55))
     }
 
-    private var footer: some View {
-        HStack(spacing: 16) {
-            Label("音频本地处理", systemImage: "lock.shield").font(.system(size: 10))
-            if model.lastLatency > 0 {
-                Text(String(format: "最近片段延迟 %.1f 秒", model.lastLatency)).font(.system(size: 10))
-            }
-            if model.oldestPending > 10 {
-                Text("识别延迟较高，正在处理积压").font(.system(size: 10)).foregroundStyle(.orange)
-            }
-            Spacer()
-            Text(!model.session.imageLibrary.isEmpty ? "会话与图片已保存在本机" : model.session.lines.isEmpty ? "会话文字自动保存在本机" : "已自动保存 · 不保存原始音频").font(.system(size: 10))
-        }.foregroundStyle(muted).padding(.horizontal, 26).padding(.vertical, 11).background(paper.opacity(0.6))
-    }
 
     private var historySheet: some View {
         VStack(alignment: .leading, spacing: 18) {
@@ -338,13 +399,69 @@ struct ContentView: View {
     }
     private func suggestion(_ text: String, icon: String) -> some View {
         Button { model.ask(text) } label: {
-            HStack(spacing: 10) { Image(systemName: icon).foregroundStyle(teal).frame(width: 18); Text(text); Spacer(); Image(systemName: "arrow.up.left").foregroundStyle(muted) }
-                .font(.system(size: 12)).padding(12).background(Color.white, in: RoundedRectangle(cornerRadius: 9))
-        }.buttonStyle(.plain).disabled(!model.hasAskContext || model.isAsking || model.isImportingImages)
+            HStack(spacing: 10) {
+                Image(systemName: icon).foregroundStyle(teal).frame(width: 17)
+                Text(text)
+                Spacer()
+                Image(systemName: "arrow.up.left").font(.system(size: 10)).foregroundStyle(muted)
+            }
+            .font(.system(size: 12))
+            .padding(.horizontal, 13).padding(.vertical, 11)
+            .surfaceCard(Look.radiusRow)
+        }
+        .buttonStyle(.plain)
+        .disabled(!model.hasAskContext || model.isAsking || model.isImportingImages)
+        .opacity(model.hasAskContext ? 1 : 0.55)
+    }
+
+    private var footer: some View {
+        HStack(spacing: 14) {
+            Label("音频本地处理", systemImage: "lock.shield")
+                .font(.system(size: 10))
+            if model.lastLatency > 0 {
+                Text(String(format: "最近片段延迟 %.1f 秒", model.lastLatency)).font(.system(size: 10)).monospacedDigit()
+            }
+            if model.oldestPending > 10 {
+                Label("识别延迟较高，正在处理积压", systemImage: "exclamationmark.triangle")
+                    .font(.system(size: 10)).foregroundStyle(.orange)
+            }
+            Spacer()
+            Text(!model.session.imageLibrary.isEmpty ? "会话与图片已保存在本机" : model.session.lines.isEmpty ? "会话文字自动保存在本机" : "已自动保存 · 不保存原始音频")
+                .font(.system(size: 10))
+        }
+        .foregroundStyle(muted)
+        .padding(.horizontal, 24).padding(.vertical, 10)
+        .background(Look.canvas)
+        .overlay(alignment: .top) { Rectangle().fill(Look.hairline).frame(height: 1) }
     }
     private func sectionLabel(_ text: String) -> some View { Text(text).font(.system(size: 10, weight: .medium)).tracking(1).foregroundStyle(muted) }
     private func sideButton(_ title: String, icon: String, action: @escaping () -> Void) -> some View {
         Button(action: action) { HStack(spacing: 10) { Image(systemName: icon).frame(width: 16); Text(title); Spacer() }.font(.system(size: 12)).padding(.vertical, 5) }.buttonStyle(.plain)
+    }
+}
+
+/// One transcribed segment. A monospaced timestamp and a colour-coded source chip
+/// give the list a scannable rhythm without adding visual noise.
+private struct TranscriptRow: View {
+    let line: TranscriptLine
+    let sessionCreated: Date
+    private var microphone: Bool { line.source == "麦克风" }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 7) {
+                Text(SessionStore.timestamp(line.start, relativeTo: sessionCreated))
+                    .font(.system(size: 10, weight: .medium, design: .monospaced))
+                    .foregroundStyle(muted).monospacedDigit()
+                Text(line.source)
+                    .font(.system(size: 9.5, weight: .semibold))
+                    .foregroundStyle(microphone ? Color.orange : teal)
+                    .padding(.horizontal, 6).padding(.vertical, 1.5)
+                    .background((microphone ? Color.orange : teal).opacity(0.11), in: Capsule())
+                Spacer()
+            }
+            Text(line.text).font(.system(size: 15)).lineSpacing(6).textSelection(.enabled)
+        }
+        .id(line.id)
     }
 }
 
