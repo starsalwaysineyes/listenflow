@@ -1,0 +1,98 @@
+Processes: 1063 total, 7 running, 1056 sleeping, 7389 threads 
+2026/10/10 20:03:51
+Load Avg: 8.10, 8.89, 10.68 
+CPU usage: 20.36% user, 19.67% sys, 59.96% idle 
+SharedLibs: 1362M resident, 211M data, 202M linkedit.
+MemRegions: 1206384 total, 20G resident, 874M private, 11G shared.
+PhysMem: 62G used (5025M wired, 4984M compressor), 870M unused.
+VM: 522T vsize, 6144M framework vsize, 3816617(0) swapins, 9522124(0) swapouts.
+Networks: packets: 1001444302/1313G in, 796797900/801G out.
+Disks: 74536876/1953G read, 1271954571/9432G written.
+
+PID    COMMAND    %CPU MEM   #TH STATE    TIME    
+24324  Python     0.0  2707M 21  sleeping 00:03.81
+24323  ListenFlow 0.0  49M   8   sleeping 00:03.84
+Processes: 1063 total, 6 running, 1057 sleeping, 7537 threads 
+2026/10/10 20:03:56
+Load Avg: 14.09, 10.12, 11.10 
+CPU usage: 27.31% user, 14.6% sys, 58.62% idle 
+SharedLibs: 1362M resident, 211M data, 202M linkedit.
+MemRegions: 0 total, 0B resident, 874M private, 11G shared.
+PhysMem: 62G used (8177M wired, 5005M compressor), 1097M unused.
+VM: 522T vsize, 6144M framework vsize, 3816641(24) swapins, 9522124(0) swapouts.
+Networks: packets: 1001445812/1313G in, 796799512/801G out.
+Disks: 74537475/1953G read, 1271958018/9432G written.
+
+PID    COMMAND    %CPU MEM    #TH STATE    TIME    
+24323  ListenFlow 13.6 51M+   8   sleeping 00:04.69
+24324  Python     7.9  2714M+ 21  sleeping 00:04.31
+Processes: 1065 total, 4 running, 1061 sleeping, 7434 threads 
+2026/10/10 20:04:01
+Load Avg: 13.21, 10.01, 11.06 
+CPU usage: 24.49% user, 11.63% sys, 63.87% idle 
+SharedLibs: 1362M resident, 211M data, 202M linkedit.
+MemRegions: 184 total, 11M resident, 874M private, 11G shared.
+PhysMem: 62G used (4989M wired, 5005M compressor), 1064M unused.
+VM: 523T vsize, 6144M framework vsize, 3816641(0) swapins, 9522124(0) swapouts.
+Networks: packets: 1001446742/1313G in, 796800474/801G out.
+Disks: 74537602/1953G read, 1271960585/9432G written.
+
+PID    COMMAND    %CPU MEM    #TH STATE    TIME    
+24323  ListenFlow 15.0 85M+   8   sleeping 00:05.47
+24324  Python     4.8  2711M- 21  sleeping 00:04.56
+Processes: 1064 total, 11 running, 1053 sleeping, 7386 threads 
+2026/10/10 20:04:06
+Load Avg: 12.23, 9.86, 11.00 
+CPU usage: 21.6% user, 11.27% sys, 67.65% idle 
+SharedLibs: 1362M resident, 211M data, 202M linkedit.
+MemRegions: 0 total, 0B resident, 874M private, 11G shared.
+PhysMem: 62G used (4978M wired, 5005M compressor), 1071M unused.
+VM: 523T vsize, 6144M framework vsize, 3816641(0) swapins, 9522124(0) swapouts.
+Networks: packets: 1001446996/1313G in, 796800730/801G out.
+Disks: 74537997/1953G read, 1271963056/9432G written.
+
+PID    COMMAND    %CPU MEM    #TH STATE    TIME    
+24323  ListenFlow 15.8 86M+   7/1 running  00:06.29
+24324  Python     4.3  2708M- 21  sleeping 00:04.79
+Processes: 1064 total, 5 running, 1059 sleeping, 7368 threads 
+2026/10/10 20:04:12
+Load Avg: 12.29, 9.91, 11.01 
+CPU usage: 22.59% user, 12.31% sys, 65.8% idle 
+SharedLibs: 1362M resident, 211M data, 202M linkedit.
+MemRegions: 0 total, 0B resident, 874M private, 11G shared.
+PhysMem: 62G used (8172M wired, 5004M compressor), 1112M unused.
+VM: 523T vsize, 6144M framework vsize, 3816641(0) swapins, 9522124(0) swapouts.
+Networks: packets: 1001447214/1313G in, 796800967/801G out.
+Disks: 74543480/1953G read, 1271965913/9432G written.
+
+PID    COMMAND    %CPU MEM    #TH STATE    TIME    
+24323  ListenFlow 16.1 86M+   7   sleeping 00:07.13
+24324  Python     8.5  2720M+ 21  sleeping 00:05.24
+Processes: 1064 total, 5 running, 1059 sleeping, 7341 threads 
+2026/10/10 20:04:17
+Load Avg: 11.46, 9.78, 10.96 
+CPU usage: 19.70% user, 10.90% sys, 69.39% idle 
+SharedLibs: 1362M resident, 211M data, 202M linkedit.
+MemRegions: 0 total, 0B resident, 874M private, 11G shared.
+PhysMem: 62G used (7203M wired, 5004M compressor), 1135M unused.
+VM: 523T vsize, 6144M framework vsize, 3816641(0) swapins, 9522124(0) swapouts.
+Networks: packets: 1001447328/1313G in, 796801091/801G out.
+Disks: 74543498/1953G read, 1271968644/9432G written.
+
+PID    COMMAND    %CPU MEM    #TH STATE    TIME    
+24323  ListenFlow 16.0 87M+   7   sleeping 00:07.96
+24324  Python     5.8  2714M- 21  sleeping 00:05.54
+Processes: 1064 total, 6 running, 1058 sleeping, 7343 threads 
+2026/10/10 20:04:22
+Load Avg: 10.79, 9.66, 10.91 
+CPU usage: 19.58% user, 11.20% sys, 69.20% idle 
+SharedLibs: 1362M resident, 211M data, 202M linkedit.
+MemRegions: 0 total, 0B resident, 874M private, 11G shared.
+PhysMem: 62G used (4916M wired, 5004M compressor), 1132M unused.
+VM: 523T vsize, 6144M framework vsize, 3816641(0) swapins, 9522124(0) swapouts.
+Networks: packets: 1001447934/1313G in, 796801678/801G out.
+Disks: 74543620/1953G read, 1271971149/9433G written.
+
+PID    COMMAND    %CPU MEM    #TH STATE    TIME    
+24323  ListenFlow 15.2 87M+   7   sleeping 00:08.75
+24324  Python     4.8  2708M- 21  sleeping 00:05.79

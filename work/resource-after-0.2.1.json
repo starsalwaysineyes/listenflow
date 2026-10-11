@@ -1,0 +1,20 @@
+{
+  "ListenFlow": {
+    "pid": 24323,
+    "samples": 6,
+    "cpu_mean": 15.283333333333333,
+    "cpu_min": 13.6,
+    "cpu_max": 16.1,
+    "memory_min_mib": 51.0,
+    "memory_max_mib": 87.0
+  },
+  "ASR": {
+    "pid": 24324,
+    "samples": 6,
+    "cpu_mean": 6.016666666666667,
+    "cpu_min": 4.3,
+    "cpu_max": 8.5,
+    "memory_min_mib": 2708.0,
+    "memory_max_mib": 2720.0
+  }
+}

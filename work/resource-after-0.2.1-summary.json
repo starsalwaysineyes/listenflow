@@ -1,0 +1,26 @@
+{
+  "Python": {
+    "samples": 5,
+    "cpu_mean": 5.64,
+    "cpu_range": [
+      4.3,
+      8.5
+    ],
+    "memory_mib_range": [
+      2708.0,
+      2720.0
+    ]
+  },
+  "ListenFlow": {
+    "samples": 5,
+    "cpu_mean": 15.620000000000001,
+    "cpu_range": [
+      15.0,
+      16.1
+    ],
+    "memory_mib_range": [
+      85.0,
+      87.0
+    ]
+  }
+}

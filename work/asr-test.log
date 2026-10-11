@@ -1,0 +1,9 @@
+Model loaded and warmed: 3.43 seconds
+Chunk 0: 4.00s audio, 0.328s inference, estimated first-sample latency 4.33s; 你好，这是一次本地实时语音识别测试。
+Chunk 1: 4.00s audio, 0.276s inference, estimated first-sample latency 4.28s; 我们现在使用的是一台搭载 M1 Max 芯片的。
+Chunk 2: 4.00s audio, 0.268s inference, estimated first-sample latency 4.27s; MacBook Pro 内存是六十四GB，接下。
+Chunk 3: 4.00s audio, 0.251s inference, estimated first-sample latency 4.25s; 下来会测试中文普通话、数字和少量英文会。
+Chunk 4: 4.00s audio, 0.245s inference, estimated first-sample latency 4.25s; 任何内容，比如明天下午三点开会，项目。
+Chunk 5: 4.00s audio, 0.268s inference, estimated first-sample latency 4.28s; 编号是ASR二零二六，请判断模型能否。
+Chunk 6: 3.16s audio, 0.203s inference, estimated first-sample latency 3.37s; 在说话的同时，稳定地输出文字。
+PASS: resident real-model ASR, malformed-input recovery, silence gate, ordered chunks, <10s fixture latency

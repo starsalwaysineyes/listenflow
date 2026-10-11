@@ -1,0 +1,136 @@
+# 听流 · ListenFlow
+
+macOS 原生实时转写、全文整理与上下文问答工具。已为当前 Mac 配好本地 Qwen3-ASR 1.7B 和 DeepSeek Flash。
+
+## 打开与使用
+
+最新版本为同目录旁的 `听流-整理版.app`（0.4.1）。若旧版正在录音，先完成录音、暂停并退出旧版，再打开新版。等待左下角显示「本地模型已就绪」。已保存的旧会话可以直接从「历史记录」中打开。
+
+1. 打开想要转写的浏览器、会议软件或播放器，在左侧选择这个 App。
+2. 点击「开始转写」。首次需要在 macOS「系统设置 → 隐私与安全性 → 屏幕与系统音频录制」中授权听流，必要时重启应用。
+3. 让所选 App 播放声音。遇到停顿就转写；连续讲话按最长 4 秒切片。
+4. 麦克风默认关闭，完全不启动麦克风采集。开始转写后可单独开启；关闭时会停止输入引擎并移除采集回调，App 音频继续运行。关闭前已采到的最后一小段仍会完成识别。
+5. 在右侧提问，或点击总结、待办等快捷问题。回答使用点击提问时的转写快照，转写继续运行。
+6. 暂停后可以新建会话、打开历史记录，或导出 Markdown。退出前先暂停，并等待当前音频识别完成。
+
+## 整理稿
+
+在记录区顶部切换到「整理稿」，点击「整理当前记录」。DeepSeek 会将碎片合并成完整句子、补标点、清理重复字和口头语，并按话题分段。保留原意、细节和时间戳，原始转写始终可查。
+
+- 「自动更新」默认关闭。手动开启后，有新增文字时约每 30 秒重新整理一次；会向已配置的问答 API 发送转写文字并产生 API 用量。
+- 整理过程中继续采集音频；生成结束后会提示还有多少新片段未纳入。
+- 失败或手动停止会丢弃未完成的预览，保留原文与上一版完整整理稿；失败后自动更新会关闭。
+- 整理稿自动随会话保存，重新打开历史会话仍可查看。复制按钮复制当前视图；导出同时包含整理稿、原文和问答。
+- 长记录会分批整理，避免因输出长度不足而悄悄变成摘要。批次边界仍可能需要人工调整段落。
+- AI 整理不能保证纠正所有识别错误，不确定内容要求标记「听辨不清」。Ask 继续依据原始转写回答，避免把整理误差再次放大。
+
+快捷键：`⌘R` 开始/暂停，`⌘Return` 发送问题，`⌘N` 新会话，`⌘,` 设置。
+
+## 本机配置
+
+- macOS 26.6.2 / Apple M1 Max / 64GB。
+- 默认 ASR：`mlx-community/Qwen3-ASR-1.7B-8bit`，可切换 0.6B。
+- Python：`/Users/aurora/Desktop/workspace/asr-realtime-lab/.venv/bin/python`。
+- 复用已有 Hugging Face 缓存，启用离线模式；没有再次下载模型。
+- 问答地址：`https://api.deepseek.com`；模型：`deepseek-flash`。
+- DeepSeek 请求默认关闭深度思考，流式显示回答；每次回答上限 4096 tokens。
+- API 密钥存在 macOS 钥匙串的 `local.ListenFlow.llm` 服务中，按 API 地址隔离。源码与设置文件没有密钥。
+
+设置界面支持更换 `chat/completions` 兼容服务、模型和密钥。API 地址需使用 HTTPS，本机服务可以使用 HTTP。填入包含 `/v1` 的地址时，会保留该路径；也可直接填写完整 `/chat/completions` 地址。
+
+## 数据
+
+- 原始音频只在内存和本地进程管道中流转，不落盘，不上传给 LLM。
+- 提问时发送当前会话的全部转写文字、最近 12 条问答和本次问题到配置的 API。
+- 整理时只发送当前转写快照，不使用先前问答作为原文。
+- 会话文字自动保存在 `~/Library/Application Support/ListenFlow/Sessions/`，保存为 JSON。
+- 暂停录制不会关闭问答。切换会话前需要等待已有音频处理完。
+- 左下状态显示本地模型是否就绪；底栏显示最近一段从开始采集到文字返回的延迟。
+- 积压时显示提示；队列过长会暂停采集，识别进程超时会明确报错，不会伪装实时。
+
+## 构建
+
+要求 Apple Silicon、macOS 15+ 和 Swift Command Line Tools。当前机器可直接运行：
+
+```sh
+./build.sh
+```
+
+需要保留正在运行的旧版时，可以指定另一个构建位置：
+
+```sh
+LISTENFLOW_APP_DIR="$PWD/../听流-整理版.app" ./build.sh
+```
+
+产物为项目目录旁的 `听流.app`。使用本地临时签名；更换构建后，macOS 可能要求重新确认录制权限。当前版本复用本机 Python 与模型缓存，还不是可以任意分发给其他电脑的独立安装包。
+
+源码结构：
+
+- `Sources/CaptureEngine.swift`：ScreenCaptureKit 指定 App 音频；独立 AVAudioEngine 麦克风；转换为 16kHz 单声道。
+- `Sources/AudioChunker.swift`：静音切分、前置音频缓存、4 秒最长窗口。
+- `Sources/ASRBridge.swift` / `Backend/asr_worker.py`：常驻 MLX 模型、JSON lines 本地管道。
+- `Sources/LLMClient.swift`：上下文快照、流式问答、错误与截断检查。
+- `Sources/Storage.swift`：钥匙串、会话、导出。
+- `Sources/AppModel.swift` / `ContentView.swift`：会话状态和 SwiftUI 界面。
+
+## 测试
+
+核心逻辑测试：
+
+```sh
+mkdir -p ../../work
+swiftc -swift-version 5 -parse-as-library \
+  Sources/AudioChunker.swift Sources/Storage.swift Sources/ImageAttachments.swift Sources/LLMClient.swift \
+  Tests/CoreTests.swift -o ../../work/core-tests -framework Security
+../../work/core-tests
+```
+
+真实本地模型测试（输入 16kHz、单声道、16-bit WAV）：
+
+```sh
+/Users/aurora/Desktop/workspace/asr-realtime-lab/.venv/bin/python \
+  Tests/test_worker.py /Users/aurora/Desktop/workspace/asr-realtime-lab/sample-zh.wav
+```
+
+测试包括：纯静音不输出、连续音频切分无样本丢失、停顿切分、两路音源互不重置、错误音频恢复、上下文快照、会话序列化和兼容 API 流式响应。
+
+## 当前边界
+
+完整实测结果见 [TESTING.md](TESTING.md)，持续转写资源采样见 [RESOURCE-USAGE.md](RESOURCE-USAGE.md)。
+
+- 第一版是分段转写：4 秒边界可能切在词中间，偶有错词或重复字，还没有重叠窗口校正。
+- 区分「App」和「麦克风」来源，尚不区分会议中不同讲话人。
+- 麦克风开启且使用扬声器外放时，可能重复录入 App 的声音；当前没有回声消除，建议开启麦克风时使用耳机。
+- 默认输入设备取自 macOS；暂未提供独立麦克风设备选择器。
+- App 退出、设备切换、休眠或权限变更可能中断采集，需要重新开始。
+- 连续长会话、双路同时讲话、多种会议软件与受保护媒体需要进一步实测。
+- 测试片段的延迟不能代表任何负载下都保证 10 秒以内。
+
+参考：[Apple ScreenCaptureKit](https://developer.apple.com/documentation/screencapturekit)、[MLX Audio](https://github.com/Blaizzy/mlx-audio)、[DeepSeek 模型接口](https://api-docs.deepseek.com/quick_start/pricing/)。
+
+## 后续整理设计
+
+计划改为「新增转写 + 约 20–40 秒重叠原文」的增量整理：前文定稿保持稳定，只重写末尾与重叠原文对应的段落，用片段 ID 和时间戳防止漏段、重复；录音结束后提供可选全文校对。当前 0.2.1 仍按已有全文快照整理，自动模式默认关闭。
+
+## AI 回答的 Markdown 显示
+
+0.3.0 开始，右侧 AI 回答支持标题、加粗、斜体、删除线、行内代码、有序/无序和嵌套列表、引用、表格、分隔线、链接与代码块。长代码和宽表格可在问答栏内横向滚动，文字可以选择。
+
+「复制回答」复制原始 Markdown；「复制代码」只复制代码正文。历史问答自动使用新的显示方式，保存与导出仍保留原文。基于系统 Markdown 解析和原生视图，不运行回答中的 HTML 或代码，也不自动加载远程图片。当前不提供 LaTeX、Mermaid 或代码语法高亮。
+
+## 手动上传图片与看图问答
+
+0.4.0 增加本地图片上传，不自动截屏。
+
+- 右侧输入框上方「添加图片」用于当前提问；整理稿上方「添加参考图片」用于整理。两组选图独立。
+- 0.4.1 起，点击右侧问答输入框后按 `⌘V` 可粘贴截图或复制的图片；也支持在 Finder 复制图片文件后粘贴。截图快捷键 `⌃⌘⇧4` 可直接把选区放进剪贴板。粘贴后显示缩略图，保留已输入的问题；普通文字按光标位置粘贴。`Shift-Return` 换行，`Return` 或 `⌘Return` 发送。粘贴的图片也能通过整理稿的「会话图片」选作参考。
+- 可以一次多选，每次请求最多 6 张。支持 PNG、JPEG、HEIC、GIF、WebP 等系统可解码图片；GIF 使用首帧。单个原文件限 32 MB，导入时在本机转为 JPEG、最长边缩至 2560 像素并移除原文件元数据。密集小字建议先裁剪。
+- 点击缩略图可预览；点击 × 只取消本次使用，图片仍保留在会话图库中。通过「会话图片」可重新选择，不必再次导入。
+- 添加图片本身不联网。发起问题或整理时，将当前选中的图片与对应文字发送给已配置的 LLM API。选图会保持到手动取消；历史会话恢复最近问答和整理稿的选图，界面会显示当前选择。不会隐式发送未选中的历史图片。
+- 没有录音也可以看图提问或整理图片资料。只添加图片、不输入问题时，发送按钮会使用默认的图片说明请求。
+- 整理时区分发言和图片资料：转写引用时间戳，图片引用「图片N」；图片独有信息单列“图片补充（非发言记录）”。图片不能证明会议中已说过这些话。
+- 自动整理开启时，会在后续整理中继续使用已选参考图片；更换图片选择后会再次更新。
+- 图片副本保存在 `~/Library/Application Support/ListenFlow/Images/<会话ID>/`。会话记录保存图片引用，旧版记录可继续读取。
+- 导出 Markdown 时，会在旁边创建同名 `.images` 文件夹并复制会话图片；分享导出文件时应同时带上该文件夹。
+
+需要配置支持视觉输入的模型，默认 DeepSeek Flash 已完成真实图片 API 测试。更换服务后如出现不兼容错误，请确认该模型支持 chat/completions 的 image_url 内容块。
