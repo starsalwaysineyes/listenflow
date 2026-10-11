@@ -49,37 +49,53 @@ struct ContentView: View {
             }.padding(.top, 12)
             VStack(alignment: .leading, spacing: 9) {
                 sectionLabel("音频来源")
-                HStack {
-                    Text("指定 App").font(.system(size: 13, weight: .medium))
-                    Spacer()
-                    Button { model.refreshApps() } label: { Image(systemName: "arrow.clockwise") }
-                        .buttonStyle(.plain).foregroundStyle(muted).help("刷新正在运行的 App")
+                Picker("音频来源", selection: $model.source) {
+                    ForEach(AudioSource.allCases) { source in
+                        Text(source.label).tag(source)
+                    }
+                }.labelsHidden().pickerStyle(.segmented).frame(maxWidth: .infinity)
+                    .disabled(model.isRecording || model.isBusy)
+                Text(model.source.detail).font(.system(size: 11)).foregroundStyle(muted)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if model.source == .app {
+                    HStack {
+                        Text("指定 App").font(.system(size: 13, weight: .medium))
+                        Spacer()
+                        Button { model.refreshApps() } label: { Image(systemName: "arrow.clockwise") }
+                            .buttonStyle(.plain).foregroundStyle(muted).help("刷新正在运行的 App")
+                            .disabled(model.isRecording || model.isBusy)
+                    }.padding(.top, 2)
+                    Picker("指定 App", selection: $model.selectedPID) {
+                        if model.apps.isEmpty { Text("先打开一个 App").tag(pid_t(0)) }
+                        ForEach(model.apps) { Text($0.name).tag($0.id) }
+                    }.labelsHidden().pickerStyle(.menu).frame(maxWidth: .infinity)
                         .disabled(model.isRecording || model.isBusy)
                 }
-                Picker("指定 App", selection: $model.selectedPID) {
-                    if model.apps.isEmpty { Text("先打开一个 App").tag(pid_t(0)) }
-                    ForEach(model.apps) { Text($0.name).tag($0.id) }
-                }.labelsHidden().pickerStyle(.menu).frame(maxWidth: .infinity)
-                    .disabled(model.isRecording || model.isBusy)
-                AudioLevelMeter(levels: model.levels, microphone: false)
-                Text("只接收所选 App 播放的声音").font(.system(size: 11)).foregroundStyle(muted)
+
+                AudioLevelMeter(levels: model.levels, microphone: model.source == .microphone)
             }
-            VStack(alignment: .leading, spacing: 10) {
-                HStack {
-                    Image(systemName: model.micEnabled ? "mic.fill" : "mic.slash.fill")
-                        .foregroundStyle(model.micEnabled ? teal : muted)
-                    Text("我的麦克风").font(.system(size: 13, weight: .medium))
-                    Spacer()
-                    Toggle("我的麦克风", isOn: Binding(get: { model.micEnabled }, set: { value in
-                        Task { await model.toggleMic(value) }
-                    })).labelsHidden().toggleStyle(.switch).controlSize(.small)
-                        .disabled(!model.isRecording || model.isBusy || model.micBusy)
-                }
-                AudioLevelMeter(levels: model.levels, microphone: true)
-                Text(model.micEnabled ? "正在采集 · 单独标记为麦克风" : "已关闭 · 不采集麦克风声音")
-                    .font(.system(size: 11)).foregroundStyle(model.micEnabled ? teal : muted)
-                if !model.isRecording { Text("开始转写后，可随时开启或关闭").font(.system(size: 10)).foregroundStyle(muted) }
-            }.padding(14).background(Color.white.opacity(0.7), in: RoundedRectangle(cornerRadius: 12))
+            if model.source == .app, model.isRecording {
+                // Mixing an open microphone with speaker output re-records the app's
+                // own sound; the option exists, but only as an explicit choice.
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack {
+                        Image(systemName: model.micEnabled ? "mic.fill" : "mic.slash.fill")
+                            .foregroundStyle(model.micEnabled ? teal : muted)
+                        Text("同时录麦克风").font(.system(size: 13, weight: .medium))
+                        Spacer()
+                        Toggle("同时录麦克风", isOn: Binding(get: { model.micEnabled }, set: { value in
+                            Task { await model.toggleMic(value) }
+                        })).labelsHidden().toggleStyle(.switch).controlSize(.small)
+                            .disabled(model.isBusy || model.micBusy)
+                    }
+                    AudioLevelMeter(levels: model.levels, microphone: true)
+                    if model.micEnabled {
+                        Text("外放时会重复录入 App 的声音，建议戴耳机").font(.system(size: 10)).foregroundStyle(.orange)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }.padding(14).background(Color.white.opacity(0.7), in: RoundedRectangle(cornerRadius: 12))
+            }
             VStack(alignment: .leading, spacing: 10) {
                 sectionLabel("会话")
                 sideButton("新建会话", icon: "plus.square") { model.newSession() }.disabled(!model.canChangeSession)
@@ -102,6 +118,18 @@ struct ContentView: View {
                 sideButton("模型与 API 设置", icon: "slider.horizontal.3") { model.showSettings = true }
             }
         }.padding(22).background(paper)
+    }
+
+    /// Spoken guidance depends on what the session is actually listening to.
+    private var emptyStateDetail: String {
+        if model.isRecording {
+            return model.activeSource == .microphone
+                ? "说话即可，转写会自动出现在这里。\n停顿时更新，连续讲话约每 4 秒更新一次。"
+                : "让所选 App 播放音频，转写会自动出现在这里。\n停顿时更新，连续讲话约每 4 秒更新一次。"
+        }
+        return model.source == .microphone
+            ? "选择左侧「我的麦克风」后点击「开始转写」。\n适合线下课堂与线下会议，音频在这台 Mac 上识别。"
+            : "在左侧选择一个正在播放声音的 App，再点击「开始转写」。\n音频在这台 Mac 上识别。"
     }
 
     private var header: some View {
@@ -127,7 +155,7 @@ struct ContentView: View {
                 }.padding(.horizontal, 14).padding(.vertical, 10)
             }.buttonStyle(.plain).foregroundStyle(.white).background(teal, in: Capsule())
                 .opacity(model.modelReady && !model.isBusy ? 1 : 0.45)
-                .disabled(!model.modelReady || model.isBusy || model.selectedPID == 0 || model.micBusy)
+                .disabled(!model.canStartRecording || model.isBusy || model.micBusy)
                 .keyboardShortcut("r", modifiers: [.command])
         }.padding(.horizontal, 26).padding(.vertical, 23)
     }
@@ -153,10 +181,12 @@ struct ContentView: View {
                 organizedContent
             } else if model.session.lines.isEmpty {
                 VStack(spacing: 16) {
-                    Image(systemName: model.isRecording ? "waveform" : "waveform.path")
+                    Image(systemName: model.isRecording ? (model.activeSource == .microphone ? "mic.fill" : "waveform") : "waveform.path")
                         .font(.system(size: 42, weight: .ultraLight)).foregroundStyle(teal.opacity(0.7))
-                    Text(model.isRecording ? "正在等待 App 中的声音" : "从一段声音开始").font(.system(size: 18, weight: .medium))
-                    Text(model.isRecording ? "让所选 App 播放音频，转写会自动出现在这里。\n停顿时更新，连续讲话约每 4 秒更新一次。" : "选择左侧的 App，再点击「开始转写」。\n音频在这台 Mac 上识别。")
+                    Text(model.isRecording
+                         ? (model.activeSource == .microphone ? "正在聆听麦克风" : "正在等待 App 中的声音")
+                         : "从一段声音开始").font(.system(size: 18, weight: .medium))
+                    Text(emptyStateDetail)
                         .font(.system(size: 12)).foregroundStyle(muted).multilineTextAlignment(.center).lineSpacing(5)
                     if model.modelLoading { ProgressView("正在准备本地模型…").controlSize(.small).font(.system(size: 11)) }
                 }.frame(maxWidth: .infinity, maxHeight: .infinity)

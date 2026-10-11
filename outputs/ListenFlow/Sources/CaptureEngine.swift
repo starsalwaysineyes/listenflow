@@ -56,17 +56,7 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
             appChunker = AudioChunker(source: name) { [weak self] in self?.onChunk?($0) }
             appConverter = nil
             acceptingApp = true
-            let timer = DispatchSource.makeTimerSource(queue: queue)
-            timer.schedule(deadline: .now() + 0.3, repeating: 0.3)
-            timer.setEventHandler { [weak self] in
-                guard let self else { return }
-                let now = Date()
-                // Some apps stop delivering buffers entirely when playback pauses.
-                if self.acceptingApp && now.timeIntervalSince(self.lastAppBuffer) > 0.6 { self.appChunker?.flush() }
-                if self.acceptingMic && now.timeIntervalSince(self.lastMicBuffer) > 0.6 { self.micChunker?.flush() }
-            }
-            idleTimer = timer
-            timer.resume()
+            startIdleFlushTimer()
         }
         stream = newStream
         do { try await newStream.startCapture() }
@@ -75,6 +65,32 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
             stream = nil
             throw error
         }
+    }
+
+    /// In-person classes and meetings: microphone only, and no screen capture
+    /// stream is created at all, so nothing needs to be selected or authorized.
+    @MainActor
+    func startMicrophoneOnly() async throws {
+        idleTimer?.cancel()
+        idleTimer = nil
+        try await setMicrophone(true)
+        queue.sync { startIdleFlushTimer() }
+    }
+
+    /// Some devices and apps simply stop delivering buffers when audio pauses, so
+    /// a periodic tick flushes whatever tail is still buffered.
+    private func startIdleFlushTimer() {
+        idleTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + 0.3, repeating: 0.3)
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            let now = Date()
+            if self.acceptingApp && now.timeIntervalSince(self.lastAppBuffer) > 0.6 { self.appChunker?.flush() }
+            if self.acceptingMic && now.timeIntervalSince(self.lastMicBuffer) > 0.6 { self.micChunker?.flush() }
+        }
+        idleTimer = timer
+        timer.resume()
     }
 
     @MainActor
@@ -97,7 +113,7 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         }
         guard micEngine == nil else { return }
         guard await AVCaptureDevice.requestAccess(for: .audio) else {
-            throw CaptureFailure.message("麦克风权限未获允许；App 音频仍可继续转写。")
+            throw CaptureFailure.message("麦克风权限未获允许。请在「系统设置 → 隐私与安全性 → 麦克风」中允许听流，然后重新开始。")
         }
         let engine = AVAudioEngine()
         let input = engine.inputNode

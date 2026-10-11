@@ -8,6 +8,20 @@ struct AudioApp: Identifiable, Hashable {
     let bundleID: String
 }
 
+/// Where a session's audio comes from. In-person classes and meetings need the
+/// microphone alone, with no app playing anything, so the two are exclusive
+/// choices rather than a picker plus a bolted-on toggle.
+enum AudioSource: String, Codable, CaseIterable, Identifiable {
+    case microphone
+    case app
+    var id: String { rawValue }
+    var label: String { self == .microphone ? "我的麦克风" : "指定 App" }
+    var detail: String {
+        self == .microphone ? "线下课堂、线下会议；只用本机麦克风" : "腾讯会议、网课、播放器；只接收所选 App 的声音"
+    }
+    var icon: String { self == .microphone ? "mic.fill" : "waveform.badge.macwindow" }
+}
+
 @MainActor
 final class AudioLevels: ObservableObject {
     @Published var app: Float = 0
@@ -50,6 +64,10 @@ final class AppModel: ObservableObject {
     @Published var showSettings = false
     @Published var showHistory = false
     @Published var now = Date()
+    @Published var source: AudioSource = .app
+    /// What a running session is actually capturing, decided at start time so the
+    /// user can change the picker freely while stopped.
+    @Published var activeSource: AudioSource?
     private let capture = CaptureEngine()
     private let worker = ASRBridge()
     private var pending: [UUID: AudioChunk] = [:]
@@ -61,6 +79,11 @@ final class AppModel: ObservableObject {
     private var lastAppSignal = Date.distantPast
     private var lastMicSignal = Date.distantPast
     var canChangeSession: Bool { !isRecording && !isBusy && !isAsking && !isOrganizing && !isImportingImages && pendingCount == 0 }
+    /// A microphone session can start with no app selected.
+    var canStartRecording: Bool {
+        guard modelReady, !isBusy, !isRecording else { return false }
+        return source == .microphone || selectedPID != 0
+    }
     var askImages: [ImageAttachment] { session.imageLibrary.filter { askImageIDs.contains($0.id) } }
     var organizationImages: [ImageAttachment] { session.imageLibrary.filter { organizationImageIDs.contains($0.id) } }
     var hasAskContext: Bool { !session.lines.isEmpty || !askImages.isEmpty || !session.chat.isEmpty }
@@ -123,16 +146,31 @@ final class AppModel: ObservableObject {
     }
 
     func start() async {
-        guard modelReady, !isBusy, !isRecording, let app = selectedApp else { return }
+        guard modelReady, !isBusy, !isRecording else { return }
+        // A microphone-only session never needs a target app; an app session does.
+        let app: AudioApp?
+        switch source {
+        case .microphone: app = nil
+        case .app:
+            guard let selected = selectedApp else { return }
+            app = selected
+        }
         isBusy = true
         error = nil
+        let label = app?.name ?? AudioSource.microphone.label
         if session.lines.isEmpty && pending.isEmpty {
             session.created = Date()
-            session.title = "\(app.name) · \(Date().formatted(date: .abbreviated, time: .shortened))"
+            session.title = "\(label) · \(Date().formatted(date: .abbreviated, time: .shortened))"
         }
         do {
-            try await capture.start(pid: app.id, name: app.name)
+            if let app {
+                try await capture.start(pid: app.id, name: app.name)
+            } else {
+                try await capture.startMicrophoneOnly()
+            }
+            activeSource = source
             isRecording = true
+            micEnabled = source == .microphone
         } catch { self.error = error.localizedDescription }
         isBusy = false
     }
@@ -144,6 +182,7 @@ final class AppModel: ObservableObject {
         isRecording = false
         micEnabled = false
         micBusy = false
+        activeSource = nil
         levels.app = 0
         levels.mic = 0
         isBusy = false
