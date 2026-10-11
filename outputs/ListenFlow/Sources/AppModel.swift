@@ -65,6 +65,9 @@ final class AppModel: ObservableObject {
     @Published var showHistory = false
     @Published var now = Date()
     @Published var source: AudioSource = .app
+    /// Bumped to pull keyboard focus into the question field from the menu bar.
+    /// A counter rather than a flag, so repeated ⌘K always re-focuses.
+    @Published var questionFocusToken = 0
     /// What a running session is actually capturing, decided at start time so the
     /// user can change the picker freely while stopped.
     @Published var activeSource: AudioSource?
@@ -143,6 +146,21 @@ final class AppModel: ObservableObject {
         modelStatus = "正在加载本地模型…"
         do { try worker.start(python: preferences.python, model: preferences.asrModel) }
         catch { modelLoading = false; modelStatus = "加载失败"; self.error = error.localizedDescription }
+    }
+
+    func toggleRecording() async {
+        if isRecording { await stop() } else if canStartRecording { await start() }
+    }
+
+    /// Bring the main window forward, optionally focusing the question field, so a
+    /// mid-session question never requires hunting for the window.
+    func showMainWindow(focusQuestion: Bool = false) {
+        NSApp.activate(ignoringOtherApps: true)
+        for window in NSApp.windows where window.canBecomeMain {
+            window.makeKeyAndOrderFront(nil)
+            break
+        }
+        if focusQuestion { questionFocusToken += 1 }
     }
 
     func start() async {

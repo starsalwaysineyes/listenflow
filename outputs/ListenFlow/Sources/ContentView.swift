@@ -306,7 +306,7 @@ struct ContentView: View {
             }
             VStack(alignment: .leading, spacing: 10) {
                 ImageAttachmentPicker(model: model, forOrganization: false)
-                QuestionInput(text: $model.question, onPaste: { model.pasteAskImages(from: $0) }, onSubmit: { model.ask() })
+                QuestionInput(text: $model.question, onPaste: { model.pasteAskImages(from: $0) }, onSubmit: { model.ask() }, focusToken: model.questionFocusToken)
                 HStack {
                     Text(model.askImages.isEmpty ? (!model.hasAskContext ? "添加图片或转写内容后即可提问" : "发送当前会话文字给问答 API") : "发送会话文字及选中的 \(model.askImages.count) 张图片")
                         .font(.system(size: 9)).foregroundStyle(muted)

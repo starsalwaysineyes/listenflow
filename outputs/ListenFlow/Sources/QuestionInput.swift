@@ -6,6 +6,8 @@ struct QuestionInput: NSViewRepresentable {
     @Binding var text: String
     var onPaste: (NSPasteboard) -> Bool
     var onSubmit: () -> Void
+    /// Incremented by the ⌘K menu command; each new value pulls focus here.
+    var focusToken: Int = 0
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
@@ -49,6 +51,13 @@ struct QuestionInput: NSViewRepresentable {
             input.setSelectedRange(NSRange(location: (text as NSString).length, length: 0))
             input.undoManager?.removeAllActions()
         }
+        if context.coordinator.lastFocusToken != focusToken {
+            context.coordinator.lastFocusToken = focusToken
+            // The window may still be ordering front, so defer one runloop turn.
+            DispatchQueue.main.async {
+                input.window?.makeFirstResponder(input)
+            }
+        }
         input.needsDisplay = true
     }
 
@@ -62,6 +71,7 @@ struct QuestionInput: NSViewRepresentable {
 
     final class Coordinator: NSObject, NSTextViewDelegate {
         var parent: QuestionInput
+        var lastFocusToken = 0
         init(_ parent: QuestionInput) { self.parent = parent }
         func textDidChange(_ notification: Notification) {
             guard let input = notification.object as? NSTextView else { return }
