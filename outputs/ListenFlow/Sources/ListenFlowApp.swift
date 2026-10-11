@@ -3,16 +3,24 @@ import AppKit
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var model: AppModel?
-    private var hotKey: GlobalHotKey?
+    private var hotKeys: [GlobalHotKey] = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
-        // ⌥⌘R works from any app, so a class or meeting can be captured without
-        // switching back to the ListenFlow window first.
-        hotKey = GlobalHotKey.toggleRecording { [weak self] in
+        // Both shortcuts work from any app, so a class or meeting can be captured
+        // and queried without switching back to the ListenFlow window first.
+        var keys: [GlobalHotKey] = []
+        if let key = GlobalHotKey.toggleRecording(action: { [weak self] in
             Task { @MainActor in await self?.model?.toggleRecording() }
-        }
+        }) { keys.append(key) }
+        if let key = GlobalHotKey.screenshot(action: { [weak self] in
+            Task { @MainActor in
+                guard let model = self?.model else { return }
+                model.captureScreenshot(forOrganization: model.showOrganized)
+            }
+        }) { keys.append(key) }
+        hotKeys = keys
     }
 
     /// The window closes to the menu bar rather than quitting, so an in-progress
@@ -90,6 +98,8 @@ struct ListenFlowApp: App {
         }.disabled(!model.canStartRecording && !model.isRecording)
         Button("随时提问…（⌘K）") { model.showMainWindow(focusQuestion: true) }
             .disabled(!model.hasAskContext)
+        Button("截取屏幕加入提问（⌥⌘S）") { model.captureScreenshot() }
+            .disabled(model.isAsking || model.isImportingImages)
         Button("打开听流窗口") { model.showMainWindow() }
         Divider()
         Button("模型与 API 设置…") { model.showSettings = true; model.showMainWindow() }

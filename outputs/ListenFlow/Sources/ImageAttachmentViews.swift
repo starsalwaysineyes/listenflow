@@ -34,6 +34,9 @@ struct ImageAttachmentPicker: View {
                 Button { model.importImages(forOrganization: forOrganization) } label: {
                     Label(forOrganization ? "添加参考图片" : "添加图片", systemImage: "photo.badge.plus")
                 }.buttonStyle(.plain).disabled(busy).help("手动选择图片；先保存在本机，发起请求时才发送")
+                Button { model.captureScreenshot(forOrganization: forOrganization) } label: {
+                    Label("截取屏幕", systemImage: "viewfinder")
+                }.buttonStyle(.plain).disabled(busy).help("在屏幕上拖选一个区域，截图会加入本次选择（录屏权限已授权）")
                 if !model.session.imageLibrary.isEmpty {
                     Menu {
                         ForEach(model.session.imageLibrary) { image in

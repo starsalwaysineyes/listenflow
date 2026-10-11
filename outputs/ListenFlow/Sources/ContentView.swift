@@ -277,31 +277,11 @@ struct ContentView: View {
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 22) {
                             ForEach(model.session.chat) { message in
-                                VStack(alignment: .leading, spacing: 8) {
-                                    HStack {
-                                        Text(message.role == "user" ? "你" : "听流").font(.system(size: 11, weight: .semibold)).foregroundStyle(teal)
-                                        if let through = message.contextThrough, message.role == "assistant" {
-                                            Text("依据 \(SessionStore.timestamp(through, relativeTo: model.session.created)) 前的记录")
-                                                .font(.system(size: 9)).foregroundStyle(muted)
-                                        }
-                                    }
-                                    if message.text.isEmpty { ProgressView().controlSize(.small) }
-                                    else if message.role == "assistant" {
-                                        MarkdownAnswerView(text: message.text).equatable()
-                                        Button {
-                                            NSPasteboard.general.clearContents()
-                                            NSPasteboard.general.setString(message.text, forType: .string)
-                                        } label: { Label("复制回答", systemImage: "doc.on.doc").font(.system(size: 10)).foregroundStyle(muted) }
-                                            .buttonStyle(.plain).help("复制原始 Markdown，保留格式")
-                                    } else { Text(message.text).font(.system(size: 13)).lineSpacing(5).textSelection(.enabled) }
-                                    if message.role == "user", let ids = message.imageIDs, !ids.isEmpty {
-                                        ImageReferencesView(images: model.session.imageLibrary.filter { ids.contains($0.id) }, sessionID: model.session.id)
-                                    }
-                                }.frame(maxWidth: .infinity, alignment: .leading)
+                                ChatRow(message: message, model: model)
                             }
                             Color.clear.frame(height: 1).id("chatBottom")
                         }.padding(22)
-                    }.onChange(of: model.session.chat.last?.text) { _, _ in proxy.scrollTo("chatBottom", anchor: .bottom) }
+                    }.onChange(of: model.answerStream.state.text) { _, _ in proxy.scrollTo("chatBottom", anchor: .bottom) }
                 }
             }
             VStack(alignment: .leading, spacing: 10) {
@@ -365,6 +345,88 @@ struct ContentView: View {
     private func sectionLabel(_ text: String) -> some View { Text(text).font(.system(size: 10, weight: .medium)).tracking(1).foregroundStyle(muted) }
     private func sideButton(_ title: String, icon: String, action: @escaping () -> Void) -> some View {
         Button(action: action) { HStack(spacing: 10) { Image(systemName: icon).frame(width: 16); Text(title); Spacer() }.font(.system(size: 12)).padding(.vertical, 5) }.buttonStyle(.plain)
+    }
+}
+
+/// One exchange in the question panel. Kept as its own view so the list body stays
+/// cheap to type-check and so a streaming answer only redraws its own row.
+private struct ChatRow: View {
+    let message: ChatMessage
+    @ObservedObject var model: AppModel
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            header
+            body(for: message)
+            if message.role == "user", let ids = message.imageIDs, !ids.isEmpty {
+                ImageReferencesView(images: model.session.imageLibrary.filter { ids.contains($0.id) },
+                                    sessionID: model.session.id)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    @ViewBuilder private var header: some View {
+        HStack {
+            Text(message.role == "user" ? "你" : "听流")
+                .font(.system(size: 11, weight: .semibold)).foregroundStyle(teal)
+            if let through = message.contextThrough, message.role == "assistant" {
+                Text("依据 \(SessionStore.timestamp(through, relativeTo: model.session.created)) 前的记录")
+                    .font(.system(size: 9)).foregroundStyle(muted)
+            }
+        }
+    }
+
+    @ViewBuilder private func body(for message: ChatMessage) -> some View {
+        if message.role == "assistant" {
+            // Subscribes to answerStream itself, so incoming deltas redraw this
+            // answer only — not the rest of the window.
+            AnswerBody(stream: model.answerStream, messageID: message.id, savedText: message.text)
+        } else {
+            QuestionBody(text: message.text)
+        }
+    }
+}
+
+/// The user's own question text. Split out so the surrounding list stays cheap to type-check.
+private struct QuestionBody: View {
+    let text: String
+    var body: some View {
+        Text(text)
+            .font(.system(size: 13))
+            .lineSpacing(5)
+            .textSelection(.enabled)
+    }
+}
+
+/// One assistant answer. Observing the stream here rather than in the parent keeps
+/// per-delta redraws scoped to this view while text arrives.
+private struct AnswerBody: View {
+    @ObservedObject var stream: AnswerStream
+    let messageID: UUID
+    let savedText: String
+    var body: some View {
+        // Live text only applies to the answer currently being generated.
+        let streaming = stream.state.messageID == messageID
+        let text = streaming ? stream.state.text : savedText
+        VStack(alignment: .leading, spacing: 8) {
+            if text.isEmpty {
+                ProgressView().controlSize(.small)
+            } else {
+                MarkdownAnswerView(text: text).equatable()
+                HStack(spacing: 12) {
+                    Button {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(text, forType: .string)
+                    } label: { Label("复制回答", systemImage: "doc.on.doc").font(.system(size: 10)).foregroundStyle(muted) }
+                        .buttonStyle(.plain).help("复制原始 Markdown，保留格式")
+                    if streaming {
+                        Button { NSPasteboard.general.clearContents() } label: {
+                            Text("生成中…").font(.system(size: 10)).foregroundStyle(muted)
+                        }.buttonStyle(.plain).disabled(true)
+                    }
+                }
+            }
+        }
     }
 }
 

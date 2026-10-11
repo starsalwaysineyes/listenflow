@@ -33,6 +33,22 @@ final class OrganizationPreview: ObservableObject {
     @Published var text = ""
 }
 
+/// Streaming answer text lives outside `AppModel` on purpose. Publishing it on the
+/// session would invalidate every view that observes the model — the sidebar, the
+/// whole transcript list and the footer — several times per second. Only the small
+/// view that observes this object re-renders while an answer streams in.
+@MainActor
+final class AnswerStream: ObservableObject {
+    struct State: Equatable {
+        var messageID: UUID?
+        var text = ""
+    }
+    @Published private(set) var state = State()
+    func begin(_ id: UUID) { state = State(messageID: id, text: "") }
+    func update(_ value: String) { state.text = value }
+    func finish() { state = State() }
+}
+
 @MainActor
 final class AppModel: ObservableObject {
     @Published var preferences = Preferences.load()
@@ -59,6 +75,7 @@ final class AppModel: ObservableObject {
     @Published var askImageIDs: Set<UUID> = []
     @Published var organizationImageIDs: Set<UUID> = []
     let organizationPreview = OrganizationPreview()
+    let answerStream = AnswerStream()
     @Published var showOrganized = false
     @Published var autoOrganize = false
     @Published var showSettings = false
@@ -306,24 +323,33 @@ final class AppModel: ObservableObject {
         let reply = ChatMessage(role: "assistant", text: "", contextThrough: contextEnd)
         session.chat.append(reply)
         isAsking = true
+        // Stream into AnswerStream, not into `session`: publishing every delta on the
+        // model would rebuild the sidebar, transcript and footer ~4x per second.
+        answerStream.begin(reply.id)
         askTask = Task { [weak self] in
             guard let self else { return }
             do {
-                _ = try await LLMClient.ask(preferences: settings, key: key, session: snapshot, question: text, images: selectedImages) { [weak self] answer in
-                    guard let self, let index = self.session.chat.firstIndex(where: { $0.id == reply.id }) else { return }
+                let answer = try await LLMClient.ask(preferences: settings, key: key, session: snapshot, question: text, images: selectedImages) { [weak self] partial in
+                    // Writes to the dedicated stream object, so only the answer view redraws.
+                    self?.answerStream.update(partial)
+                }
+                if let index = self.session.chat.firstIndex(where: { $0.id == reply.id }) {
                     self.session.chat[index].text = answer
                 }
             } catch {
                 let cancelled = Task.isCancelled || error is CancellationError || (error as? URLError)?.code == .cancelled
+                // Keep whatever streamed in before the failure instead of dropping it.
+                let partial = self.answerStream.state.text
                 if let index = self.session.chat.firstIndex(where: { $0.id == reply.id }) {
-                    if self.session.chat[index].text.isEmpty { self.session.chat.remove(at: index) }
-                    else { self.session.chat[index].text += "\n\n（\(cancelled ? "回答已停止" : "连接中断，回答未完成")）" }
+                    if partial.isEmpty { self.session.chat.remove(at: index) }
+                    else { self.session.chat[index].text = partial + "\n\n（\(cancelled ? "回答已停止" : "连接中断，回答未完成")）" }
                 }
                 if !cancelled {
                     self.error = error.localizedDescription
                     if self.question.isEmpty { self.question = text }
                 }
             }
+            self.answerStream.finish()
             self.isAsking = false
             self.persist()
         }
@@ -384,6 +410,21 @@ final class AppModel: ObservableObject {
             guard !isAsking, !isImportingImages else { return }
             if selected && askImageIDs.count >= ImageAttachmentStore.maxSelected { error = "每次最多选择 6 张图片。"; return }
             if selected { askImageIDs.insert(image.id) } else { askImageIDs.remove(image.id) }
+        }
+    }
+
+    /// Mid-meeting grab of whatever is on screen: pick a region, and it lands in
+    /// the session already selected for the pending question.
+    func captureScreenshot(forOrganization: Bool = false) {
+        guard !isImportingImages, !(forOrganization ? isOrganizing : isAsking) else { return }
+        // Bring the window back afterwards, but get out of the way for the crosshair.
+        NSApp.hide(nil)
+        Task { @MainActor in
+            let source = await ScreenshotCapture.captureInteractive()
+            NSApp.unhide(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            guard let source else { return }
+            importImages([source], forOrganization: forOrganization)
         }
     }
 
