@@ -69,12 +69,73 @@ struct ChatMessage: Identifiable, Codable {
     var contextThrough: Date?
     var imageIDs: [UUID]?
 }
+/// One contiguous stretch of organized text, tied to the transcript lines it was
+/// produced from. Keeping batches separate is what makes incremental organizing
+/// possible: settled batches are never re-sent, so earlier wording stays put.
+struct OrganizedSegment: Codable, Identifiable {
+    var id = UUID()
+    var text: String
+    var sourceLineIDs: [UUID]
+    var started: Date
+    var through: Date
+}
+
 struct OrganizedTranscript: Codable {
-    let text: String
-    let generatedAt: Date
-    let sourceLineIDs: [UUID]
-    let through: Date
+    var generatedAt: Date
+    var segments: [OrganizedSegment]
     var imageIDs: [UUID]?
+
+    var text: String { segments.map(\.text).joined(separator: "\n\n") }
+    var sourceLineIDs: [UUID] { segments.flatMap(\.sourceLineIDs) }
+    var through: Date { segments.map(\.through).max() ?? generatedAt }
+
+    init(generatedAt: Date, segments: [OrganizedSegment], imageIDs: [UUID]?) {
+        self.generatedAt = generatedAt
+        self.segments = segments
+        self.imageIDs = imageIDs
+    }
+
+    /// A single settled block. Used for image-only sessions and for tests that do not
+    /// care about batch boundaries.
+    init(text: String, generatedAt: Date, sourceLineIDs: [UUID], through: Date, imageIDs: [UUID]? = nil) {
+        self.init(generatedAt: generatedAt,
+                  segments: [OrganizedSegment(text: text, sourceLineIDs: sourceLineIDs,
+                                              started: through, through: through)],
+                  imageIDs: imageIDs)
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case generatedAt, segments, imageIDs
+        case text, sourceLineIDs, through
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        generatedAt = try container.decode(Date.self, forKey: .generatedAt)
+        imageIDs = try container.decodeIfPresent([UUID].self, forKey: .imageIDs)
+        if let stored = try container.decodeIfPresent([OrganizedSegment].self, forKey: .segments) {
+            segments = stored
+        } else {
+            // Pre-0.5 sessions stored a single flat block with no batch boundaries.
+            segments = [OrganizedSegment(
+                text: try container.decodeIfPresent(String.self, forKey: .text) ?? "",
+                sourceLineIDs: try container.decodeIfPresent([UUID].self, forKey: .sourceLineIDs) ?? [],
+                started: generatedAt,
+                through: try container.decodeIfPresent(Date.self, forKey: .through) ?? generatedAt)]
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(generatedAt, forKey: .generatedAt)
+        try container.encode(segments, forKey: .segments)
+        try container.encodeIfPresent(imageIDs, forKey: .imageIDs)
+        // Mirror the flat fields too, so a build from before this change can still
+        // open a session this version wrote.
+        try container.encode(text, forKey: .text)
+        try container.encode(sourceLineIDs, forKey: .sourceLineIDs)
+        try container.encode(through, forKey: .through)
+    }
 }
 struct MeetingSession: Codable, Identifiable {
     var id = UUID()

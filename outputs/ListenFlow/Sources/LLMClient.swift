@@ -78,21 +78,38 @@ enum LLMClient {
         """], ["role": "user", "content": "<原始转写>\n\(SessionStore.transcript(excerpt))\n</原始转写>"]]
     }
 
+/// One finished batch of organized text together with the transcript lines it came
+/// from, so the caller can record exact provenance for incremental updates.
+struct OrganizedPart {
+    let text: String
+    let lines: [TranscriptLine]
+}
+
+    /// Organize the given lines, one request per size-bounded batch. Returns each
+    /// batch separately rather than pre-joined so callers can keep batch boundaries
+    /// addressable — that is what allows later runs to redo only the tail.
     static func organize(preferences: Preferences, key: String, session: MeetingSession,
-                         images: [ImageAttachment] = [], onText: @escaping @MainActor (String) -> Void) async throws -> String {
-        var completeParts: [String] = []
-        let batches = session.lines.isEmpty ? [[]] : organizationBatches(session.lines)
+                         lines: [TranscriptLine],
+                         images: [ImageAttachment] = [],
+                         settledPrefix: String = "",
+                         onText: @escaping @MainActor (String) -> Void) async throws -> [OrganizedPart] {
+        var parts: [OrganizedPart] = []
+        let batches = lines.isEmpty ? [[]] : organizationBatches(lines)
         for batch in batches {
             try Task.checkCancellation()
-            let prefix = completeParts.isEmpty ? "" : completeParts.joined(separator: "\n\n") + "\n\n"
+            // Stream the settled text plus everything produced so far, so the reader
+            // sees one continuous document while the tail regenerates.
+            let produced = parts.map(\.text).joined(separator: "\n\n")
+            let prefix = [settledPrefix, produced].filter { !$0.isEmpty }.joined(separator: "\n\n")
+            let separator = prefix.isEmpty ? "" : "\n\n"
             let payload = try organizationRequestMessages(session: session, lines: batch, images: images)
             let part = try await complete(preferences: preferences, key: key,
                 messages: payload, maxTokens: 16384) { text in
-                    onText(prefix + text)
+                    onText(prefix + separator + text)
                 }
-            completeParts.append(part)
+            parts.append(OrganizedPart(text: part, lines: batch))
         }
-        return completeParts.joined(separator: "\n\n")
+        return parts
     }
 
     static func organizationRequestMessages(session: MeetingSession, lines: [TranscriptLine], images: [ImageAttachment]) throws -> [[String: Any]] {

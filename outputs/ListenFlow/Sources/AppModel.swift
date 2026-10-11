@@ -376,17 +376,38 @@ final class AppModel: ObservableObject {
         showOrganized = true
         organizationPreview.text = ""
         lastOrganizationAttempt = Date()
+
+        // Incremental organizing: everything except the most recent batch is settled
+        // and never re-sent, so earlier wording stays stable. The last batch is redone
+        // together with the new lines, which gives the seam a natural overlap to
+        // re-flow instead of cutting mid-paragraph.
+        let existing = snapshot.organized?.segments ?? []
+        let settled = existing.count > 1 ? Array(existing.dropLast()) : []
+        let settledIDs = Set(settled.flatMap(\.sourceLineIDs))
+        let settledText = settled.map(\.text).joined(separator: "\n\n")
+        let pendingLines = snapshot.lines.filter { !settledIDs.contains($0.id) }
+        let through = snapshot.lines.map(\.end).max() ?? snapshot.created
+
         organizeTask = Task { [weak self] in
             guard let self else { return }
             do {
-                let text = try await LLMClient.organize(preferences: settings, key: key, session: snapshot, images: selectedImages) { [weak self] text in
-                    guard let self, self.session.id == snapshot.id else { return }
-                    self.organizationPreview.text = text
-                }
+                let parts = try await LLMClient.organize(preferences: settings, key: key,
+                    session: snapshot, lines: pendingLines, images: selectedImages,
+                    settledPrefix: settledText) { [weak self] text in
+                        guard let self, self.session.id == snapshot.id else { return }
+                        self.organizationPreview.text = text
+                    }
                 try Task.checkCancellation()
                 guard self.session.id == snapshot.id else { return }
-                self.session.organized = OrganizedTranscript(text: text, generatedAt: Date(),
-                    sourceLineIDs: snapshot.lines.map(\.id), through: snapshot.lines.map(\.end).max() ?? snapshot.created, imageIDs: selectedImages.map(\.id))
+                let fresh = parts.filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+                    .map { OrganizedSegment(text: $0.text,
+                                            sourceLineIDs: $0.lines.map(\.id),
+                                            started: $0.lines.map(\.start).min() ?? through,
+                                            through: $0.lines.map(\.end).max() ?? through) }
+                let segments = settled + fresh
+                guard !segments.isEmpty else { throw CaptureFailure.message("整理没有返回内容，已保留原文。") }
+                self.session.organized = OrganizedTranscript(generatedAt: Date(), segments: segments,
+                    imageIDs: selectedImages.map(\.id))
                 self.persist()
             } catch {
                 let cancelled = Task.isCancelled || error is CancellationError || (error as? URLError)?.code == .cancelled

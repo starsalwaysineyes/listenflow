@@ -89,10 +89,12 @@ enum CaptureFailure: LocalizedError {
                 TranscriptLine(start: start.addingTimeInterval(Double(i * 4)), end: start.addingTimeInterval(Double(i * 4 + 4)),
                                source: "测试 App", text: text, latency: 4.3)
             }
-            let text = try await LLMClient.organize(preferences: Preferences(), key: key, session: fixture) { _ in }
+            let parts = try await LLMClient.organize(preferences: Preferences(), key: key, session: fixture, lines: fixture.lines) { _ in }
+            let text = parts.map(\.text).joined(separator: "\n\n")
             print("Live cleanup result:\n\(text)")
             precondition(text.contains("小林") && text.contains("麦克风") && text.contains("App"))
             precondition(text.contains("五千") || text.contains("5000") || text.contains("5,000"))
+            precondition(parts.count == LLMClient.organizationBatches(fixture.lines).count, "One part per batch, so boundaries stay addressable")
             try JSONEncoder().encode(fixture).write(to: URL(fileURLWithPath: "work/organization-fixture.json"))
             try text.write(toFile: "work/organization-result.txt", atomically: true, encoding: .utf8)
             print("PASS: native live DeepSeek organization request; synthetic fixture saved for UI validation")
