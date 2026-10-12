@@ -49,7 +49,18 @@ try:
         latencies.append(latency)
         print(f'Chunk {i}: {duration:.2f}s audio, {result["inference_seconds"]:.3f}s inference, estimated first-sample latency {latency:.2f}s; {result["text"]}')
     assert max(latencies) < 10, 'Fixture exceeds latency target'
-    print('PASS: resident real-model ASR, malformed-input recovery, silence gate, ordered chunks, <10s fixture latency')
+    # Refinement windows join several chunks: a long window must come back whole,
+    # and anything past the 32 s protocol limit must be refused, not truncated.
+    window = np.tile(audio, int(np.ceil(20 * 16000 / len(audio))))[:20 * 16000].astype('<f4')
+    send(type='transcribe', id='window', audio=base64.b64encode(window.tobytes()).decode(), language='Chinese')
+    long_result = receive()
+    assert long_result['type'] == 'result' and long_result['audio_seconds'] == 20, long_result
+    short_chars = sum(len(r) for r in [long_result['text']])
+    print(f'20 s window: {long_result["inference_seconds"]:.2f}s inference, {short_chars} chars')
+    too_long = np.zeros(33 * 16000, dtype='<f4')
+    send(type='transcribe', id='too-long', audio=base64.b64encode(too_long.tobytes()).decode())
+    assert receive()['type'] == 'error', 'Audio beyond 32 s must be rejected'
+    print('PASS: resident real-model ASR, malformed-input recovery, silence gate, ordered chunks, <10s fixture latency, 20 s refinement window, 32 s limit')
 finally:
     if worker.poll() is None:
         send(type='shutdown')

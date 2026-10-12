@@ -37,3 +37,12 @@ work/icon-build/icon-raw.png
 .DS_Store
 *.swp
 *~
+
+# 识别实验的音频与输出（脚本与文本保留）
+work/asr-lab/**/*.wav
+work/asr-lab/**/*.aiff
+work/asr-lab/*.pcm
+work/asr-lab/out*.json
+work/asr-lab/results*.json
+work/asr-lab/__pycache__/
+work/dbg/

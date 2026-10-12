@@ -67,8 +67,13 @@ final class ASRBridge: @unchecked Sendable {
     }
 
     func submit(_ chunk: AudioChunk, language: String, hotwords: String) {
-        let bytes = chunk.samples.withUnsafeBytes { Data($0) }
-        let payload: [String: Any] = ["type": "transcribe", "id": chunk.id.uuidString,
+        submit(id: chunk.id, samples: chunk.samples, language: language, hotwords: hotwords)
+    }
+
+    /// Any mono 16 kHz window — a live chunk or a joined refinement window.
+    func submit(id: UUID, samples: [Float], language: String, hotwords: String) {
+        let bytes = samples.withUnsafeBytes { Data($0) }
+        let payload: [String: Any] = ["type": "transcribe", "id": id.uuidString,
             "audio": bytes.base64EncodedString(), "language": language,
             "hotwords": hotwords.split(whereSeparator: { $0 == "," || $0 == "，" || $0 == "\n" }).map(String.init)]
         guard let data = try? JSONSerialization.data(withJSONObject: payload) else { return }

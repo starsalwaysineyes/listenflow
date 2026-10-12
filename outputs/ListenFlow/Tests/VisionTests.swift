@@ -70,7 +70,9 @@ enum CaptureFailure: LocalizedError {
         if CommandLine.arguments.contains("--live-image-only") {
             let key = String(data: FileHandle.standardInput.readDataToEndOfFile(), encoding: .utf8)!.trimmingCharacters(in: .whitespacesAndNewlines)
             session.chat = []; session.lines = []
-            let result = try await LLMClient.organize(preferences: Preferences(), key: key, session: session, images: [image]) { _ in }
+            let result = try await LLMClient.organize(preferences: Preferences(), key: key, session: session,
+                                                      lines: session.lines, images: [image]) { _ in }
+                .map(\.text).joined(separator: "\n\n")
             precondition(result.contains("7426") && result.contains("图片"))
             precondition(result.range(of: #"\[\d+:\d\d\]"#, options: .regularExpression) == nil)
             try result.write(toFile: "work/vision-image-only-result.txt", atomically: true, encoding: .utf8)
@@ -85,7 +87,9 @@ enum CaptureFailure: LocalizedError {
             precondition(answer.contains("7426") && answer.contains("180") && answer.contains("120"))
             session.lines = [TranscriptLine(start: session.created, end: session.created.addingTimeInterval(4), source: "测试 App",
                 text: "今天讨论产品计划，收入与成本数据请参考图片。", latency: 4)]
-            let organized = try await LLMClient.organize(preferences: Preferences(), key: key, session: session, images: [image]) { _ in }
+            let organized = try await LLMClient.organize(preferences: Preferences(), key: key, session: session,
+                                                         lines: session.lines, images: [image]) { _ in }
+                .map(\.text).joined(separator: "\n\n")
             print("LIVE IMAGE + TRANSCRIPT ORGANIZATION:\n\(organized)")
             precondition(organized.contains("180") && organized.contains("120") && organized.contains("图片"))
             try JSONSerialization.data(withJSONObject: ["answer": answer, "organized": organized], options: [.prettyPrinted]).write(to: URL(fileURLWithPath: "work/vision-live-results.json"))

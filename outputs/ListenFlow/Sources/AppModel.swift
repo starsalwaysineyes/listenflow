@@ -87,9 +87,42 @@ final class AppModel: ObservableObject {
     /// What a running session is actually capturing, decided at start time so the
     /// user can change the picker freely while stopped.
     @Published var activeSource: AudioSource?
+    /// Whether the second recognition pass is running right now (the mode resolved
+    /// against the power source), and whether the Mac is on AC — for the status line.
+    @Published var qualityActive = false
+    @Published var onAC = true
+    @Published var isPostRefining = false
+    @Published var postRefineDone = 0
+    @Published var postRefineTotal = 0
+    /// A non-error outcome worth telling the user about, such as a finished refinement.
+    @Published var notice: String?
     private let capture = CaptureEngine()
     private let worker = ASRBridge()
     private var pending: [UUID: AudioChunk] = [:]
+    private var pendingAudio: [UUID: AudioRef] = [:]
+    /// A joined stretch of one source's lines waiting to be re-recognized as a whole.
+    private struct OpenWindow {
+        var lineIDs: [UUID]
+        var samples: [Float]
+        var start: Date
+        var end: Date
+        var text: String
+        var lastForced: Bool
+        var touched: Date
+    }
+    private struct RefineJob {
+        let id = UUID()
+        let sessionID: UUID
+        let lineIDs: [UUID]
+        let samples: [Float]
+        let original: String
+        let dropStop: Bool
+        let post: Bool
+    }
+    private var openWindows: [String: OpenWindow] = [:]
+    private var refineQueue: [RefineJob] = []
+    private var refineInFlight: RefineJob?
+    private var postRefineChanged = 0
     private var askTask: Task<Void, Never>?
     private var organizeTask: Task<Void, Never>?
     private var lastOrganizationAttempt = Date.distantPast
@@ -97,10 +130,10 @@ final class AppModel: ObservableObject {
     private var loadingSince: Date?
     private var lastAppSignal = Date.distantPast
     private var lastMicSignal = Date.distantPast
-    var canChangeSession: Bool { !isRecording && !isBusy && !isAsking && !isOrganizing && !isImportingImages && pendingCount == 0 }
+    var canChangeSession: Bool { !isRecording && !isBusy && !isAsking && !isOrganizing && !isImportingImages && pendingCount == 0 && !isPostRefining }
     /// A microphone session can start with no app selected.
     var canStartRecording: Bool {
-        guard modelReady, !isBusy, !isRecording else { return false }
+        guard modelReady, !isBusy, !isRecording, !isPostRefining else { return false }
         return source == .microphone || selectedPID != 0
     }
     /// Whether the start/pause control is actionable right now. Stopping must stay
@@ -118,6 +151,17 @@ final class AppModel: ObservableObject {
     var hasAskContext: Bool { !session.lines.isEmpty || !askImages.isEmpty || !session.chat.isEmpty }
     var hasOrganizationContext: Bool { !session.lines.isEmpty || !organizationImages.isEmpty }
     var organizationImagesChanged: Bool { Set(session.organized?.imageIDs ?? []) != organizationImageIDs }
+    /// The transcript was re-recognized after this draft was written.
+    var organizationStale: Bool {
+        guard let organized = session.organized, let refined = session.refinedAt else { return false }
+        return refined > organized.generatedAt
+    }
+    /// Audio for this session is kept and there is at least one multi-line window to redo.
+    var canRefineSession: Bool {
+        !isRecording && !isBusy && pending.isEmpty && !isPostRefining && modelReady
+            && session.lines.contains { $0.audio != nil }
+            && !Refinement.windows(session.lines, limit: Refinement.postWindow).isEmpty
+    }
     var selectedApp: AudioApp? { apps.first { $0.id == selectedPID } }
     var connectionLabel: String {
         guard !preferences.apiBase.isEmpty else { return "配置问答 API" }
@@ -141,6 +185,8 @@ final class AppModel: ObservableObject {
         worker.onEvent = { [weak self] event in self?.receive(event) }
         refreshApps()
         history = SessionStore.all()
+        DispatchQueue.global(qos: .utility).async { AudioStore.purgeExpired() }
+        updateRecognitionMode()
         // UI tests use a separate bundle identifier and a synthetic session, never a live recording.
         if Bundle.main.bundleIdentifier == "local.ListenFlow.preview",
            let path = ProcessInfo.processInfo.environment["LISTENFLOW_PREVIEW_SESSION"] ?? Bundle.main.path(forResource: "preview-session", ofType: "json"),
@@ -153,6 +199,10 @@ final class AppModel: ObservableObject {
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.tick() }
         }
+        runReplayIfRequested()
+        // Lets UI checks capture the settings sheet without synthesizing keystrokes.
+        if Bundle.main.bundleIdentifier == "local.ListenFlow.preview",
+           ProcessInfo.processInfo.environment["LISTENFLOW_PREVIEW_SETTINGS"] == "1" { showSettings = true }
     }
 
     func refreshApps() {
@@ -247,6 +297,9 @@ final class AppModel: ObservableObject {
         guard modelReady else { return }
         pending[chunk.id] = chunk
         pendingCount = pending.count
+        if preferences.keepAudioForRefine && (Bundle.main.bundleIdentifier != "local.ListenFlow.preview" || AudioStore.rootOverride != nil) {
+            pendingAudio[chunk.id] = AudioStore.append(chunk.samples, session: session.id, source: chunk.source)
+        }
         worker.submit(chunk, language: preferences.language, hotwords: preferences.hotwords)
         if pending.count >= 12 && isRecording && !isBusy {
             error = "识别暂时跟不上音频，已暂停采集以避免继续累积延迟。已采集的片段会继续处理。"
@@ -263,20 +316,170 @@ final class AppModel: ObservableObject {
             loadingSince = nil
             modelStatus = "本地模型已就绪"
         case "result", "error":
+            let failed = event["type"] as? String == "error"
+            if let id = event["id"] as? String, let uuid = UUID(uuidString: id), let job = refineInFlight, job.id == uuid {
+                // A refinement failing is harmless: the first-pass text stays.
+                finishRefine(job, text: failed ? "" : event["text"] as? String ?? "")
+                return
+            }
             if let id = event["id"] as? String, let uuid = UUID(uuidString: id), let chunk = pending.removeValue(forKey: uuid) {
-                if let text = event["text"] as? String, !text.isEmpty {
+                let audio = pendingAudio.removeValue(forKey: uuid)
+                let raw = event["text"] as? String ?? ""
+                let text = chunk.forced ? Refinement.dropTrailingStop(raw) : raw
+                if !text.isEmpty {
                     lastLatency = Date().timeIntervalSince(chunk.start)
                     session.lines.append(TranscriptLine(id: uuid, start: chunk.start, end: chunk.end,
-                                                       source: chunk.source, text: text, latency: lastLatency))
+                                                       source: chunk.source, text: text, latency: lastLatency, audio: audio))
                     session.lines.sort { $0.start < $1.start }
                     persist()
+                    if qualityActive { addToWindow(chunk, lineID: uuid, text: text) }
+                } else {
+                    closeWindow(chunk.source)     // nothing recognized: don't join across it
                 }
                 pendingCount = pending.count
+                if !isRecording && pending.isEmpty { closeAllWindows() }
+                pumpRefine()
             }
-            if event["type"] as? String == "error" { error = "一个音频片段识别失败：\(event["message"] as? String ?? "未知错误")" }
+            if failed { error = "一个音频片段识别失败：\(event["message"] as? String ?? "未知错误")" }
         case "fatal": failWorker(event["message"] as? String ?? "本地识别进程异常。")
         default: break
         }
+    }
+
+    // MARK: - Replay hooks
+    func submitForReplay(_ chunk: AudioChunk) { submit(chunk) }
+    func updateRecognitionModeForReplay() { updateRecognitionMode() }
+    var replayIdle: Bool { pending.isEmpty && refineQueue.isEmpty && refineInFlight == nil && openWindows.isEmpty }
+
+    // MARK: - Second-pass recognition
+
+    private func updateRecognitionMode() {
+        let ac = PowerSource.onAC
+        if ac != onAC { onAC = ac }
+        let quality = PowerSource.wantsQuality(preferences.recognitionMode)
+        if quality != qualityActive {
+            qualityActive = quality
+            // Switching to economy mid-session: stop joining, but let windows that
+            // are already queued finish, since that work is cheap and nearly done.
+            if !quality { openWindows.removeAll() }
+        }
+    }
+
+    private func addToWindow(_ chunk: AudioChunk, lineID: UUID, text: String) {
+        if var window = openWindows[chunk.source] {
+            let gap = chunk.start.timeIntervalSince(window.end)
+            if gap <= 3 && chunk.end.timeIntervalSince(window.start) <= Refinement.liveWindow {
+                // Pauses longer than this were dropped by the chunker; a short bridge
+                // of silence keeps the joined words from running together.
+                if gap > 0.02 { window.samples += [Float](repeating: 0, count: Int(min(gap, 0.3) * 16000)) }
+                window.samples += chunk.samples
+                window.lineIDs.append(lineID)
+                window.end = chunk.end
+                window.text += text
+                window.lastForced = chunk.forced
+                window.touched = Date()
+                openWindows[chunk.source] = window
+                // Long enough to benefit fully (gains flatten past ~20 s): go now.
+                if window.end.timeIntervalSince(window.start) >= 14 { closeWindow(chunk.source) }
+                return
+            }
+            closeWindow(chunk.source)
+        }
+        openWindows[chunk.source] = OpenWindow(lineIDs: [lineID], samples: chunk.samples, start: chunk.start,
+                                               end: chunk.end, text: text, lastForced: chunk.forced, touched: Date())
+    }
+
+    private func closeWindow(_ source: String) {
+        guard let window = openWindows.removeValue(forKey: source), window.lineIDs.count >= 2 else { return }
+        refineQueue.append(RefineJob(sessionID: session.id, lineIDs: window.lineIDs, samples: window.samples,
+                                     original: window.text, dropStop: window.lastForced, post: false))
+        pumpRefine()
+    }
+
+    private func closeAllWindows() {
+        for source in Array(openWindows.keys) { closeWindow(source) }
+    }
+
+    /// One refinement at a time, and only while no live chunk is waiting: live text
+    /// always comes first, refinement fills the idle gaps between chunks.
+    private func pumpRefine() {
+        guard modelReady, refineInFlight == nil, pending.isEmpty, !refineQueue.isEmpty else { return }
+        let job = refineQueue.removeFirst()
+        refineInFlight = job
+        worker.submit(id: job.id, samples: job.samples, language: preferences.language, hotwords: preferences.hotwords)
+    }
+
+    private func finishRefine(_ job: RefineJob, text raw: String) {
+        refineInFlight = nil
+        let text = job.dropStop ? Refinement.dropTrailingStop(raw) : raw
+        if job.sessionID == session.id, Refinement.plausible(original: job.original, refined: text) {
+            let ids = Set(job.lineIDs)
+            let lines = session.lines.filter { ids.contains($0.id) }.sorted { $0.start < $1.start }
+            if lines.count == job.lineIDs.count {
+                let merged = Refinement.merge(lines, text: text)
+                if Refinement.apply(merged, replacing: job.lineIDs, in: &session.lines) {
+                    if job.post && merged.text != job.original { postRefineChanged += 1 }
+                    persist()
+                }
+            }
+        }
+        // A job returning after the user stopped refinement must not complete it:
+        // that would delete audio the user was told is still there.
+        if job.post && isPostRefining {
+            postRefineDone += 1
+            if !refineQueue.contains(where: \.post) { finishPostRefine() }
+        }
+        pumpRefine()
+    }
+
+    private func resetRefinement() {
+        openWindows.removeAll()
+        refineQueue.removeAll()
+        // An in-flight job is left to return; its session check discards it.
+    }
+
+    /// Re-recognize the whole stored session in ~30 s windows — the most accurate
+    /// pass, meant for after a meeting recorded on battery.
+    func refineSession() {
+        guard canRefineSession else { return }
+        let groups = Refinement.windows(session.lines, limit: Refinement.postWindow)
+        var jobs: [RefineJob] = []
+        for group in groups {
+            guard let first = group.first?.audio, let last = group.last?.audio,
+                  let samples = AudioStore.read(session: session.id, source: group[0].source, offset: first.offset,
+                                                count: last.offset + last.count - first.offset) else { continue }
+            jobs.append(RefineJob(sessionID: session.id, lineIDs: group.map(\.id), samples: samples,
+                                  original: group.map(\.text).joined(), dropStop: false, post: true))
+        }
+        guard !jobs.isEmpty else { notice = "这段会话的暂存音频已不可用，无法精修。"; return }
+        error = nil
+        notice = nil
+        openWindows.removeAll()
+        refineQueue.removeAll { !$0.post }
+        refineQueue += jobs
+        postRefineDone = 0
+        postRefineTotal = jobs.count
+        postRefineChanged = 0
+        isPostRefining = true
+        pumpRefine()
+    }
+
+    func cancelRefineSession() {
+        guard isPostRefining else { return }
+        refineQueue.removeAll { $0.post }
+        isPostRefining = false
+        notice = "已停止精修，已完成的 \(postRefineDone) 处保留；暂存音频仍在，可以稍后继续。"
+    }
+
+    private func finishPostRefine() {
+        isPostRefining = false
+        session.refinedAt = Date()
+        // The audio served its purpose; keeping it longer than needed is not the deal.
+        AudioStore.delete(session.id)
+        for index in session.lines.indices { session.lines[index].audio = nil }
+        persist()
+        notice = "全文精修完成：重新识别 \(postRefineTotal) 段，其中 \(postRefineChanged) 段文字有改动。暂存音频已删除。"
+            + (session.organized != nil ? "整理稿下次更新时会按精修后的原文整篇重整。" : "")
     }
 
     private func failWorker(_ message: String) {
@@ -287,7 +490,10 @@ final class AppModel: ObservableObject {
         modelLoading = false
         modelStatus = "需要重新加载模型"
         pending.removeAll()
+        pendingAudio.removeAll()
         pendingCount = 0
+        resetRefinement()
+        if isPostRefining { isPostRefining = false; error = (error ?? "") + " 全文精修已中止，已完成的部分保留。" }
         if isRecording { Task { await stop() } }
     }
 
@@ -295,13 +501,18 @@ final class AppModel: ObservableObject {
         let current = Date()
         // The elapsed-time readout is driven by a TimelineView, so this timer never
         // publishes a clock value — only real state changes reach the views.
+        updateRecognitionMode()
+        // A speaker who paused for a while has finished a thought: refine it now
+        // rather than waiting for the next chunk to close the window.
+        for (source, window) in openWindows where current.timeIntervalSince(window.touched) > 4 { closeWindow(source) }
+        if !isRecording && pending.isEmpty { closeAllWindows() }
         let age = pending.values.map { current.timeIntervalSince($0.start) }.max() ?? 0
         if age != oldestPending { oldestPending = age }
         if current.timeIntervalSince(lastAppSignal) > 1 && levels.app != 0 { levels.app = 0 }
         if current.timeIntervalSince(lastMicSignal) > 1 && levels.mic != 0 { levels.mic = 0 }
         if oldestPending > 40 { failWorker("识别等待超时，已停止采集。") }
         if modelLoading, let since = loadingSince, current.timeIntervalSince(since) > 120 { failWorker("本地模型加载超时，请检查 Python 环境与模型路径。") }
-        if autoOrganize && !isOrganizing && !isImportingImages && hasOrganizationContext && (session.unorganizedCount > 0 || organizationImagesChanged) &&
+        if autoOrganize && !isOrganizing && !isImportingImages && hasOrganizationContext && (session.unorganizedCount > 0 || organizationImagesChanged || organizationStale) &&
             current.timeIntervalSince(lastOrganizationAttempt) >= 30 { organize() }
     }
 
@@ -391,7 +602,10 @@ final class AppModel: ObservableObject {
         // and never re-sent, so earlier wording stays stable. The last batch is redone
         // together with the new lines, which gives the seam a natural overlap to
         // re-flow instead of cutting mid-paragraph.
-        let existing = snapshot.organized?.segments ?? []
+        // After a whole-transcript refinement the old wording is gone, so nothing
+        // from the earlier draft can be treated as settled.
+        let stale = organizationStale
+        let existing = stale ? [] : snapshot.organized?.segments ?? []
         let settled = existing.count > 1 ? Array(existing.dropLast()) : []
         let settledIDs = Set(settled.flatMap(\.sourceLineIDs))
         let settledText = settled.map(\.text).joined(separator: "\n\n")
@@ -517,6 +731,7 @@ final class AppModel: ObservableObject {
         guard canChangeSession else { return }
         persist()
         session = MeetingSession()
+        resetRefinement()
         askImageIDs = []; organizationImageIDs = []
         showOrganized = false
         autoOrganize = false
@@ -526,6 +741,7 @@ final class AppModel: ObservableObject {
         guard canChangeSession else { return }
         persist()
         session = value
+        resetRefinement()
         askImageIDs = Set((value.chat.last(where: { $0.role == "user" })?.imageIDs ?? []).prefix(ImageAttachmentStore.maxSelected))
         organizationImageIDs = Set((value.organized?.imageIDs ?? []).prefix(ImageAttachmentStore.maxSelected))
         showOrganized = value.organized != nil
@@ -551,5 +767,65 @@ final class AppModel: ObservableObject {
         organizeTask?.cancel()
         persist()
         worker.shutdown()
+    }
+}
+
+// MARK: - Replay harness (preview builds only)
+
+extension AppModel {
+    /// Feeds raw 16 kHz mono PCM through the real chunker → worker → refinement path
+    /// at a fixed speed-up, then writes the session to JSON. Only the preview
+    /// bundle honours this, so a shipping build can never be driven by it.
+    func runReplayIfRequested() {
+        let env = ProcessInfo.processInfo.environment
+        guard Bundle.main.bundleIdentifier == "local.ListenFlow.preview", let path = env["LISTENFLOW_REPLAY"],
+              let out = env["LISTENFLOW_REPLAY_OUT"] else { return }
+        AudioStore.rootOverride = FileManager.default.temporaryDirectory.appendingPathComponent("listenflow-replay-audio")
+        Task { @MainActor in
+            let wav = (try? Data(contentsOf: URL(fileURLWithPath: path))) ?? Data()
+            // Raw 16 kHz mono Int16 LE, no header: WAV headers vary in length.
+            let samples = wav.withUnsafeBytes { Array($0.bindMemory(to: Int16.self)) }.map { Float($0) / 32768 }
+            loadModel()
+            while !modelReady { try? await Task.sleep(nanoseconds: 200_000_000) }
+            preferences.recognitionMode = RecognitionMode(rawValue: env["LISTENFLOW_REPLAY_MODE"] ?? "") ?? .economy
+            preferences.keepAudioForRefine = true
+            updateRecognitionModeForReplay()
+            session = MeetingSession(title: "replay", created: Date())
+            isRecording = true
+            let started = Date()
+            let speed = Double(env["LISTENFLOW_REPLAY_SPEED"] ?? "4") ?? 4
+            let chunker = AudioChunker(source: "回放") { [weak self] chunk in
+                MainActor.assumeIsolated { self?.submitForReplay(chunk) }
+            }
+            var offset = 0
+            while offset < samples.count {
+                let n = min(1024, samples.count - offset)
+                chunker.append(Array(samples[offset..<offset + n]),
+                               end: session.created.addingTimeInterval(Double(offset + n) / 16000))
+                offset += n
+                try? await Task.sleep(nanoseconds: UInt64(Double(n) / 16000 / speed * 1_000_000_000))
+            }
+            chunker.flush()
+            isRecording = false
+            let wall = Date().timeIntervalSince(started)
+            while !replayIdle { try? await Task.sleep(nanoseconds: 200_000_000) }
+            write(out + "-live.json", extra: ["wallSeconds": wall])
+            if env["LISTENFLOW_REPLAY_REFINE"] == "1" {
+                refineSession()
+                while isPostRefining { try? await Task.sleep(nanoseconds: 200_000_000) }
+                write(out + "-post.json", extra: ["notice": notice ?? ""])
+            }
+            AudioStore.delete(session.id)
+            NSApp.terminate(nil)
+        }
+    }
+
+    private func write(_ path: String, extra: [String: Any]) {
+        var object: [String: Any] = extra
+        object["lines"] = session.lines.map { ["text": $0.text, "start": $0.start.timeIntervalSince(session.created),
+                                                "end": $0.end.timeIntervalSince(session.created)] }
+        if let data = try? JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted]) {
+            try? data.write(to: URL(fileURLWithPath: path))
+        }
     }
 }

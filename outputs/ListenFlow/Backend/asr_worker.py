@@ -24,8 +24,9 @@ def emit(**event):
 def decode_audio(message):
     import numpy as np
     raw = base64.b64decode(message["audio"], validate=True)
-    if len(raw) % 4 or len(raw) > 16000 * 4 * 12:
-        raise ValueError("Invalid audio length (maximum 12 seconds)")
+    # Live chunks are at most 8 s; refinement windows join several, up to ~30 s.
+    if len(raw) % 4 or len(raw) > 16000 * 4 * 32:
+        raise ValueError("Invalid audio length (maximum 32 seconds)")
     samples = np.frombuffer(raw, dtype="<f4").copy()
     if not len(samples) or not np.isfinite(samples).all():
         raise ValueError("Invalid audio samples")
@@ -67,7 +68,10 @@ def main():
                 with contextlib.redirect_stdout(sys.stderr):
                     result = model.generate(
                         samples, language=message.get("language") or None,
-                        max_tokens=256, temperature=0, verbose=False,
+                        # Fast speech runs ~7 characters a second; leave ample room
+                        # so a long refinement window is never silently truncated.
+                        max_tokens=min(1024, 256 + int(len(samples) / 16000 * 16)),
+                        temperature=0, verbose=False,
                         hotwords=message.get("hotwords") or None,
                     )
                 text = result.text.strip()

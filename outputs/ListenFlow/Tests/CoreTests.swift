@@ -14,20 +14,50 @@ enum CaptureFailure: LocalizedError {
         chunker.flush()
         precondition(chunks.isEmpty, "Silence must not produce ASR requests")
 
-        let voice = [Float](repeating: 0.1, count: 16000 * 10)
-        chunker.append(voice, end: start.addingTimeInterval(10))
+        // Unbroken speech has no pause to cut in: bounded by the ceiling, cut late,
+        // flagged as forced, and nothing lost or duplicated across the seams.
+        let voice = [Float](repeating: 0.1, count: 16000 * 20)
+        chunker.append(voice, end: start.addingTimeInterval(20))
         chunker.flush()
-        precondition(chunks.count == 3, "Continuous speech must be bounded to four seconds")
+        precondition(chunks.count == 3, "20 s of gapless speech should give two ceiling cuts, got \(chunks.count)")
         precondition(chunks.map { $0.samples.count }.reduce(0, +) == voice.count, "No samples lost at boundaries")
-        precondition(chunks.allSatisfy { $0.samples.count <= 64000 })
+        precondition(chunks.allSatisfy { $0.samples.count <= 16000 * 8 }, "Ceiling must hold")
+        precondition(chunks[0].samples.count >= 16000 * 7, "Uniform audio should be cut late, near the ceiling")
+        precondition(chunks[0].forced && chunks[1].forced && !chunks[2].forced)
         precondition(abs(chunks[0].start.timeIntervalSince(start)) < 0.001)
-        precondition(abs(chunks[2].end.timeIntervalSince(start) - 10) < 0.001)
+        precondition(abs(chunks[1].start.timeIntervalSince(chunks[0].end)) < 0.001, "Seams must be contiguous")
+        precondition(abs(chunks[2].end.timeIntervalSince(start) - 20) < 0.001)
 
         chunks.removeAll()
-        chunker.append([Float](repeating: 0.1, count: 16000), end: start.addingTimeInterval(1))
-        chunker.append([Float](repeating: 0, count: 8000), end: start.addingTimeInterval(1.5))
-        precondition(chunks.count == 1, "Pause endpoint should flush before max chunk duration")
-        precondition(chunks[0].samples.count == 24000)
+        let pause = AudioChunker(source: "App") { chunks.append($0) }
+        pause.append([Float](repeating: 0.1, count: 16000), end: start.addingTimeInterval(1))
+        pause.append([Float](repeating: 0, count: 8000), end: start.addingTimeInterval(1.5))
+        precondition(chunks.count == 1, "A real pause should close a short chunk before the ceiling")
+        precondition(chunks[0].samples.count == 24000 && !chunks[0].forced)
+
+        // Words separated by short gaps over a steady noise floor that sits above the
+        // old fixed 0.003 gate: the cut must still land in a gap, not on a clock.
+        chunks.removeAll()
+        let noisy = AudioChunker(source: "App") { chunks.append($0) }
+        var meeting: [Float] = []
+        for i in 0..<20 {   // 20 × (0.4 s word + 0.2 s gap) = 12 s
+            meeting += (0..<6400).map { 0.1 + Float(($0 + i) % 7) * 0.001 }
+            meeting += (0..<3200).map { 0.006 * (($0 % 2 == 0) ? 1 : -1) }
+        }
+        noisy.append(meeting, end: start.addingTimeInterval(12))
+        precondition(!chunks.isEmpty && chunks.allSatisfy { !$0.forced }, "Gaps in noise must be found")
+        for chunk in chunks {
+            let seconds = Double(chunk.samples.count) / 16000
+            precondition(seconds >= 2.8 && seconds < 4, "Cut at the first gap once ~3 s long, got \(seconds)")
+            let cutInGap = chunk.samples.suffix(320).allSatisfy { abs($0) < 0.01 }
+            precondition(cutInGap, "Seam must fall inside a gap, never inside a word")
+        }
+        let emitted = chunks.count
+        noisy.append([Float](repeating: 0.006, count: 16000 * 2), end: start.addingTimeInterval(14))
+        noisy.flush()
+        precondition(chunks.count == emitted, "Trailing noise alone must not produce a chunk")
+        precondition(chunks.last!.end.timeIntervalSince(start) >= 11.6, "The last word is covered")
+        precondition(chunks.allSatisfy { $0.samples.contains { $0 > 0.05 } }, "Silence-only chunks are never sent")
 
         chunks.removeAll()
         chunker.append([Float](repeating: 0.1, count: 8000), end: start)
@@ -41,7 +71,9 @@ enum CaptureFailure: LocalizedError {
         mic.append([Float](repeating: 0.1, count: 16000), end: start)
         mic.flush()
         app.append([Float](repeating: 0.2, count: 32000), end: start.addingTimeInterval(2))
+        app.flush()
         precondition(chunks.map(\.source) == ["麦克风", "Browser"], "Mic flush must not reset App audio")
+        precondition(chunks[1].samples.count == 64000, "App audio continued across the mic flush")
 
         let ep = try LLMClient.endpoint("https://api.deepseek.com")
         precondition(ep.absoluteString == "https://api.deepseek.com/chat/completions")
@@ -79,8 +111,66 @@ enum CaptureFailure: LocalizedError {
         precondition(organizationMessages.count == 2 && !organizationMessages[1]["content"]!.contains("When?"), "Cleanup must use raw transcript, not prior answers")
         precondition(organizationMessages[1]["content"]!.contains("New late-arriving audio"))
 
+        // Settings written by 0.5.0 (no recognition fields) keep every saved value.
+        let oldPrefs = #"{"python":"/opt/py","asrModel":"m","language":"Chinese","hotwords":"小林","apiBase":"https://x.example","llmModel":"l"}"#
+        let prefs = try JSONDecoder().decode(Preferences.self, from: Data(oldPrefs.utf8))
+        precondition(prefs.python == "/opt/py" && prefs.hotwords == "小林" && prefs.apiBase == "https://x.example")
+        precondition(prefs.recognitionMode == .auto && prefs.keepAudioForRefine)
+        let roundPrefs = try JSONDecoder().decode(Preferences.self, from: JSONEncoder().encode(prefs))
+        precondition(roundPrefs.recognitionMode == .auto && roundPrefs.python == "/opt/py")
+        precondition(PowerSource.wantsQuality(.quality) && !PowerSource.wantsQuality(.economy))
+
+        // Refinement windows: same source, contiguous audio, capped length, no long silence.
+        func line(_ t: Double, _ d: Double, _ src: String, _ off: Int, _ text: String = "字") -> TranscriptLine {
+            TranscriptLine(start: start.addingTimeInterval(t), end: start.addingTimeInterval(t + d), source: src,
+                           text: text, latency: 1, audio: AudioRef(offset: off, count: Int(d * 16000)))
+        }
+        let rl = [line(0, 5, "A", 0), line(5, 5, "A", 80000), line(10, 5, "A", 160000), line(15, 5, "A", 240000),
+                  line(20, 5, "A", 320000), line(25, 5, "A", 400000), line(30, 5, "A", 480000),
+                  line(45, 4, "A", 560000),                                   // after 10 s of silence
+                  line(2, 3, "麦克风", 0), line(6, 3, "麦克风", 48000)]
+        let groups = Refinement.windows(rl, limit: 30)
+        precondition(groups.allSatisfy { Set($0.map(\.source)).count == 1 }, "Never mix sources")
+        precondition(groups.allSatisfy { $0.last!.end.timeIntervalSince($0.first!.start) <= 30 }, "Cap holds")
+        precondition(groups.allSatisfy { $0.count >= 2 }, "Single lines are not re-decoded")
+        precondition(!groups.contains { g in g.contains { $0.start == start.addingTimeInterval(45) } }, "No joining across long silence")
+        precondition(groups.map(\.count) == [6, 2], "Got \(groups.map(\.count))")
+        let merged = Refinement.merge(Array(groups[0]), text: "精修后的文字")
+        precondition(merged.id == groups[0][0].id && merged.audio == AudioRef(offset: 0, count: 480000))
+        var replaced = rl
+        precondition(Refinement.apply(merged, replacing: groups[0].map(\.id), in: &replaced))
+        precondition(replaced.count == rl.count - 5 && replaced.contains { $0.text == "精修后的文字" })
+        precondition(!Refinement.apply(merged, replacing: groups[0].map(\.id), in: &replaced), "Stale jobs are refused")
+        precondition(Refinement.plausible(original: "今天讨论发布安排。", refined: "今天讨论发布的安排"))
+        precondition(!Refinement.plausible(original: "今天讨论发布安排，小林负责周五", refined: "嗯。"), "Collapsed output refused")
+        precondition(!Refinement.plausible(original: "好的", refined: "好的好的好的好的好的好的"), "Hallucinated output refused")
+        precondition(Refinement.dropTrailingStop("被推向远处。") == "被推向远处" && Refinement.dropTrailingStop("真的？") == "真的？")
+
+        // Kept audio: ordered ranges, faithful round trip, removable.
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("lf-audio-\(UUID().uuidString)")
+        AudioStore.rootOverride = tmp
+        let sid = UUID()
+        let r1 = AudioStore.append([Float](repeating: 0.25, count: 1000), session: sid, source: "腾讯会议")
+        let r2 = AudioStore.append((0..<500).map { Float($0) / 1000 }, session: sid, source: "腾讯会议")
+        precondition(r1 == AudioRef(offset: 0, count: 1000) && r2 == AudioRef(offset: 1000, count: 500))
+        let back = AudioStore.read(session: sid, source: "腾讯会议", offset: 1000, count: 500)!
+        precondition(zip(back, (0..<500).map { Float($0) / 1000 }).allSatisfy { abs($0 - $1) < 0.0002 })
+        let perms = try FileManager.default.attributesOfItem(atPath: AudioStore.file(session: sid, source: "腾讯会议").path)[.posixPermissions] as! Int
+        precondition(perms == 0o600, "Kept audio must be private")
+        AudioStore.delete(sid)
+        precondition(!AudioStore.hasAudio(sid) && AudioStore.read(session: sid, source: "腾讯会议", offset: 0, count: 1) == nil)
+        try? FileManager.default.removeItem(at: tmp)
+
+        // A post-hoc refinement makes an older draft stale; sessions without the field still decode.
+        var refinedSession = MeetingSession(title: "R", created: start)
+        precondition(refinedSession.refinedAt == nil)
+        refinedSession.refinedAt = Date()
+        let refinedRound = try JSONDecoder().decode(MeetingSession.self, from: JSONEncoder().encode(refinedSession))
+        precondition(refinedRound.refinedAt != nil)
+
         print("PASS: silence, bounded chunks, lossless boundaries, endpointing, independent sources, discard, API URLs, context snapshots, session round-trip")
         print("PASS: old-session compatibility, organized draft persistence/export, late-arrival coverage, lossless cleanup batching, raw-only cleanup context")
+        print("PASS: pause-aware chunking under noise, forced-cut flags, settings migration, refinement windows/guards/merge, private audio store round trip")
         if CommandLine.arguments.contains("--organize-live") {
             let key = String(data: FileHandle.standardInput.readDataToEndOfFile(), encoding: .utf8)!.trimmingCharacters(in: .whitespacesAndNewlines)
             var fixture = MeetingSession(title: "整理功能测试（虚构记录）", created: start)

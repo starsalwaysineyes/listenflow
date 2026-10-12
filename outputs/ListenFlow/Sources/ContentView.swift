@@ -65,6 +65,13 @@ struct ContentView: View {
                         Button { model.error = nil } label: { Image(systemName: "xmark") }.buttonStyle(.plain)
                     }.padding(12).background(Color.orange.opacity(0.09))
                 }
+                if let notice = model.notice {
+                    HStack(alignment: .top, spacing: 9) {
+                        Image(systemName: "checkmark.circle.fill").foregroundStyle(teal)
+                        Text(notice).font(.system(size: 12)).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+                        Button { model.notice = nil } label: { Image(systemName: "xmark") }.buttonStyle(.plain)
+                    }.padding(12).background(teal.opacity(0.07))
+                }
                 HSplitView {
                     transcript.frame(minWidth: 310)
                     askPanel.frame(minWidth: 300, idealWidth: 380)
@@ -173,6 +180,8 @@ struct ContentView: View {
                 }
                 Text(model.preferences.asrModel.components(separatedBy: "/").last ?? "本地 ASR")
                     .font(.system(size: 9.5, design: .monospaced)).foregroundStyle(muted).lineLimit(1)
+                Text(recognitionStatus).font(.system(size: 10)).foregroundStyle(muted).lineLimit(1)
+                    .help(model.preferences.recognitionMode.detail)
                 if !model.modelReady && !model.modelLoading {
                     Button("重新加载模型") { model.loadModel() }.font(.system(size: 11))
                 }
@@ -185,6 +194,12 @@ struct ContentView: View {
         .background(
             LinearGradient(colors: [Look.sidebar, Look.sidebar.opacity(0.94)],
                            startPoint: .top, endPoint: .bottom))
+    }
+
+    private var recognitionStatus: String {
+        let level = model.qualityActive ? "高精度" : "省电"
+        guard model.preferences.recognitionMode == .auto else { return "识别：\(level)" }
+        return "识别：\(level) · 自动（\(model.onAC ? "接电源" : "电池")）"
     }
 
     /// Spoken guidance depends on what the session is actually listening to.
@@ -248,6 +263,7 @@ struct ContentView: View {
                     Text("整理稿").tag(true)
                 }.labelsHidden().pickerStyle(.segmented).frame(width: 180)
                 Spacer()
+                if !model.showOrganized { refineControl }
                 Text("\(model.session.lines.count) 段").font(.system(size: 11)).foregroundStyle(muted)
                 Button {
                     NSPasteboard.general.clearContents()
@@ -288,6 +304,25 @@ struct ContentView: View {
         }
     }
 
+    /// Whole-transcript re-recognition from kept audio, for sessions recorded in
+    /// economy mode. Hidden when there is nothing to redo.
+    @ViewBuilder private var refineControl: some View {
+        if model.isPostRefining {
+            HStack(spacing: 7) {
+                ProgressView(value: Double(model.postRefineDone), total: Double(max(model.postRefineTotal, 1)))
+                    .frame(width: 70).controlSize(.small)
+                Text("精修 \(model.postRefineDone)/\(model.postRefineTotal)").font(.system(size: 11)).foregroundStyle(teal)
+                    .monospacedDigit()
+                Button("停止") { model.cancelRefineSession() }.font(.system(size: 11))
+            }.padding(.trailing, 6)
+        } else if model.canRefineSession {
+            Button { model.refineSession() } label: {
+                Label("精修全文", systemImage: "wand.and.stars").font(.system(size: 11))
+            }.buttonStyle(.plain).foregroundStyle(teal).padding(.trailing, 6)
+                .help("用暂存的音频，以约 30 秒为一段重新识别全文，更准确；完成后删除暂存音频")
+        }
+    }
+
     private var organizationControls: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 12) {
@@ -309,7 +344,8 @@ struct ContentView: View {
                 Text((organized.sourceLineIDs.isEmpty ? "已整理图片资料" : "已整理至 \(SessionStore.timestamp(organized.through, relativeTo: model.session.created))") +
                      (model.session.unorganizedCount > 0 ? " · 另有 \(model.session.unorganizedCount) 段新内容" : "") +
                      ((organized.imageIDs?.isEmpty == false) ? " · 参考 \(organized.imageIDs!.count) 张图" : "") +
-                     (model.organizationImagesChanged ? " · 图片选择已变化" : ""))
+                     (model.organizationImagesChanged ? " · 图片选择已变化" : "") +
+                     (model.organizationStale ? " · 原文已精修，更新时整篇重整" : ""))
                     .font(.system(size: 10)).foregroundStyle(muted)
             } else {
                 Text("用已配置的 API 整理全文 · 自动更新间隔约 30 秒").font(.system(size: 10)).foregroundStyle(muted)
@@ -426,7 +462,8 @@ struct ContentView: View {
                     .font(.system(size: 10)).foregroundStyle(.orange)
             }
             Spacer()
-            Text(!model.session.imageLibrary.isEmpty ? "会话与图片已保存在本机" : model.session.lines.isEmpty ? "会话文字自动保存在本机" : "已自动保存 · 不保存原始音频")
+            Text(!model.session.imageLibrary.isEmpty ? "会话与图片已保存在本机" : model.session.lines.isEmpty ? "会话文字自动保存在本机"
+                 : model.session.lines.contains { $0.audio != nil } ? "已自动保存 · 音频暂存本机，精修后删除" : "已自动保存 · 不保存原始音频")
                 .font(.system(size: 10))
         }
         .foregroundStyle(muted)
@@ -651,6 +688,14 @@ struct SettingsView: View {
                             field("Python 路径", text: $draft.python)
                                 .disabled(model.isRecording || model.pendingCount > 0 || model.modelLoading)
                             field("人名、术语（逗号分隔，可选）", text: $draft.hotwords)
+                            Picker("识别档位", selection: $draft.recognitionMode) {
+                                ForEach(RecognitionMode.allCases) { Text($0.label).tag($0) }
+                            }.pickerStyle(.segmented)
+                            Text(draft.recognitionMode.detail + "。高精度约多用一半算力，错字约再少两到三成。")
+                                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                            Toggle("暂存录音，用于事后「精修全文」", isOn: $draft.keepAudioForRefine)
+                            Text("音频只保存在这台 Mac，精修完成后删除，最长保留 7 天。关闭后不保存任何原始音频。")
+                                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                             Text("复用本机模型缓存，模型加载和转写均为离线运行。").font(.caption).foregroundStyle(.secondary)
                         }.padding(12)
                     }

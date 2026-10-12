@@ -1,6 +1,28 @@
 import Foundation
 import Security
 
+/// How much compute live recognition may spend. Measured on a 2,224-character corpus:
+/// economy (one pass, cut in pauses) halves errors versus the old fixed cut at ~7.5%
+/// GPU time; quality adds a ~20 s re-decode for another ~20–30% fewer errors at ~13%.
+enum RecognitionMode: String, Codable, CaseIterable, Identifiable {
+    case auto, economy, quality
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .auto: "自动"
+        case .economy: "省电"
+        case .quality: "高精度"
+        }
+    }
+    var detail: String {
+        switch self {
+        case .auto: "接电源时用高精度；用电池或开启低电量模式时省电"
+        case .economy: "每段只识别一遍，在停顿处切分"
+        case .quality: "先实时出字，再把约 20 秒合起来重新识别并替换"
+        }
+    }
+}
+
 struct Preferences: Codable {
     var python = "/Users/aurora/Desktop/workspace/asr-realtime-lab/.venv/bin/python"
     var asrModel = "mlx-community/Qwen3-ASR-1.7B-8bit"
@@ -8,6 +30,28 @@ struct Preferences: Codable {
     var hotwords = ""
     var apiBase = "https://api.deepseek.com"
     var llmModel = "deepseek-flash"
+    var recognitionMode = RecognitionMode.auto
+    /// Keep the session's 16 kHz audio on this Mac so it can be re-recognized later;
+    /// deleted once refined, and after seven days regardless.
+    var keepAudioForRefine = true
+
+    init() {}
+
+    // Field-by-field so settings saved by an older build keep their values when a
+    // new field appears, instead of the whole decode failing back to defaults.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let d = Preferences()
+        python = try c.decodeIfPresent(String.self, forKey: .python) ?? d.python
+        asrModel = try c.decodeIfPresent(String.self, forKey: .asrModel) ?? d.asrModel
+        language = try c.decodeIfPresent(String.self, forKey: .language) ?? d.language
+        hotwords = try c.decodeIfPresent(String.self, forKey: .hotwords) ?? d.hotwords
+        apiBase = try c.decodeIfPresent(String.self, forKey: .apiBase) ?? d.apiBase
+        llmModel = try c.decodeIfPresent(String.self, forKey: .llmModel) ?? d.llmModel
+        recognitionMode = (try? c.decodeIfPresent(RecognitionMode.self, forKey: .recognitionMode)) ?? d.recognitionMode
+        keepAudioForRefine = try c.decodeIfPresent(Bool.self, forKey: .keepAudioForRefine) ?? d.keepAudioForRefine
+    }
+
     static func load() -> Preferences {
         guard let data = UserDefaults.standard.data(forKey: "preferences"),
               let value = try? JSONDecoder().decode(Preferences.self, from: data) else { return Preferences() }
@@ -54,6 +98,12 @@ enum SecretStore {
     }
 }
 
+/// Where a line's audio sits in the session's per-source audio file, in samples.
+struct AudioRef: Codable, Equatable {
+    let offset: Int
+    let count: Int
+}
+
 struct TranscriptLine: Identifiable, Codable {
     var id = UUID()
     let start: Date
@@ -61,6 +111,7 @@ struct TranscriptLine: Identifiable, Codable {
     let source: String
     let text: String
     let latency: Double
+    var audio: AudioRef? = nil
 }
 struct ChatMessage: Identifiable, Codable {
     var id = UUID()
@@ -145,6 +196,9 @@ struct MeetingSession: Codable, Identifiable {
     var chat: [ChatMessage] = []
     var organized: OrganizedTranscript?
     var images: [ImageAttachment]?
+    /// Set when the whole transcript was re-recognized after the fact. An organized
+    /// draft older than this was written from the earlier wording and is redone in full.
+    var refinedAt: Date?
     var imageLibrary: [ImageAttachment] { images ?? [] }
     var unorganizedCount: Int {
         let included = Set(organized?.sourceLineIDs ?? [])
