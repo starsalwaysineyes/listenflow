@@ -65,7 +65,7 @@ struct ListenFlowApp: App {
             CommandGroup(after: .newItem) {
                 Button(model.isRecording ? "暂停转写" : "开始转写") {
                     Task { await model.toggleRecording() }
-                }.keyboardShortcut("r").disabled(!model.canStartRecording && !model.isRecording)
+                }.keyboardShortcut("r").disabled(!model.canToggleRecording)
                 Divider()
                 Button("随时提问…") { model.showMainWindow(focusQuestion: true) }
                     .keyboardShortcut("k")
@@ -95,7 +95,7 @@ struct ListenFlowApp: App {
         Divider()
         Button(model.isRecording ? "暂停转写（⌥⌘R）" : "开始转写（⌥⌘R）") {
             Task { await model.toggleRecording() }
-        }.disabled(!model.canStartRecording && !model.isRecording)
+        }.disabled(!model.canToggleRecording)
         Button("随时提问…（⌘K）") { model.showMainWindow(focusQuestion: true) }
             .disabled(!model.hasAskContext)
         Button("截取屏幕加入提问（⌥⌘S）") { model.captureScreenshot() }

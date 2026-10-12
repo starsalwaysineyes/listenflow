@@ -103,6 +103,16 @@ final class AppModel: ObservableObject {
         guard modelReady, !isBusy, !isRecording else { return false }
         return source == .microphone || selectedPID != 0
     }
+    /// Whether the start/pause control is actionable right now. Stopping must stay
+    /// available while recording — `canStartRecording` is false then by definition,
+    /// so gating the button on it alone left the control dead exactly when it was
+    /// needed. `isBusy` and `micBusy` still block: both `stop()` and `toggleMic()`
+    /// bail out early in those states, so offering the action would do nothing.
+    var canToggleRecording: Bool {
+        guard !isBusy, !micBusy else { return false }
+        if isRecording { return true }
+        return canStartRecording
+    }
     var askImages: [ImageAttachment] { session.imageLibrary.filter { askImageIDs.contains($0.id) } }
     var organizationImages: [ImageAttachment] { session.imageLibrary.filter { organizationImageIDs.contains($0.id) } }
     var hasAskContext: Bool { !session.lines.isEmpty || !askImages.isEmpty || !session.chat.isEmpty }

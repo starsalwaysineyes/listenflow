@@ -234,8 +234,8 @@ struct ContentView: View {
                     Text(model.isBusy ? "请稍候" : model.isRecording ? "暂停转写" : "开始转写").fontWeight(.medium)
                 }.padding(.horizontal, 14).padding(.vertical, 10)
             }.buttonStyle(.plain).foregroundStyle(.white).background(teal, in: Capsule())
-                .opacity(model.modelReady && !model.isBusy ? 1 : 0.45)
-                .disabled(!model.canStartRecording || model.isBusy || model.micBusy)
+                .opacity(model.canToggleRecording ? 1 : 0.45)
+                .disabled(!model.canToggleRecording)
                 .keyboardShortcut("r", modifiers: [.command])
         }.padding(.horizontal, 26).padding(.vertical, 23)
     }
