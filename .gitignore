@@ -1,18 +1,20 @@
 # 构建产物与应用副本（可由 build.sh 重新生成）
 *.app/
 work/build/
-work/releases/
-work/preview/
-work/vision-candidate/
-work/paste-candidate/
-work/markdown-candidate/
-work/paste-preview/
+work/ui-preview/
 work/vision-export/
-work/TestPlayer.app/
+
+# 旧构建的归档备份（可回退用，不纳入版本控制）
+work/archive/
+
+# 测试与诊断二进制
 work/*-tests
 work/core-tests
 work/clipboard-tests
 work/vision-tests
+work/winid
+work/winid2
+work/disp
 work/organize-session
 work/export-session
 work/install_secret
@@ -25,6 +27,7 @@ work/inpaint
 # 大体积录制样本（数 MB，非源码）
 work/*.sample.txt
 work/*.wav
+work/*.png
 
 # 图标中间产物（保留 Assets/AppIcon.icns 与 Assets/icon-1024.png）
 work/icon-build/听流.iconset/
