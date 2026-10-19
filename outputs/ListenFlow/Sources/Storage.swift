@@ -112,6 +112,9 @@ struct TranscriptLine: Identifiable, Codable {
     let text: String
     let latency: Double
     var audio: AudioRef? = nil
+    /// Produced by re-recognizing several live lines as one window; absent on
+    /// live lines and on sessions saved before 0.6.2.
+    var refined: Bool? = nil
 }
 struct ChatMessage: Identifiable, Codable {
     var id = UUID()

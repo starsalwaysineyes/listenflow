@@ -46,3 +46,4 @@ work/asr-lab/out*.json
 work/asr-lab/results*.json
 work/asr-lab/__pycache__/
 work/dbg/
+work/asr-lab/*.log

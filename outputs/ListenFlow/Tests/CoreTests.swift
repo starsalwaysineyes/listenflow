@@ -9,6 +9,12 @@ enum CaptureFailure: LocalizedError {
     static func main() async throws {
         var chunks: [AudioChunk] = []
         let start = Date(timeIntervalSince1970: 1000)
+        // Stand-in for speech: a 400 Hz tone (exactly 8 cycles per 20 ms frame, so
+        // every frame has the same energy). The chunker judges speech above 200 Hz,
+        // so a DC level would rightly read as silence.
+        func tone(_ count: Int, _ amplitude: Float = 0.14, phase: Int = 0) -> [Float] {
+            (0..<count).map { amplitude * sin(2 * Float.pi * 400 * Float($0 + phase) / 16000) }
+        }
         let chunker = AudioChunker(source: "App") { chunks.append($0) }
         chunker.append([Float](repeating: 0, count: 16000), end: start)
         chunker.flush()
@@ -16,7 +22,7 @@ enum CaptureFailure: LocalizedError {
 
         // Unbroken speech has no pause to cut in: bounded by the ceiling, cut late,
         // flagged as forced, and nothing lost or duplicated across the seams.
-        let voice = [Float](repeating: 0.1, count: 16000 * 20)
+        let voice = tone(16000 * 20)
         chunker.append(voice, end: start.addingTimeInterval(20))
         chunker.flush()
         precondition(chunks.count == 3, "20 s of gapless speech should give two ceiling cuts, got \(chunks.count)")
@@ -30,10 +36,26 @@ enum CaptureFailure: LocalizedError {
 
         chunks.removeAll()
         let pause = AudioChunker(source: "App") { chunks.append($0) }
-        pause.append([Float](repeating: 0.1, count: 16000), end: start.addingTimeInterval(1))
+        pause.append(tone(16000), end: start.addingTimeInterval(1))
         pause.append([Float](repeating: 0, count: 8000), end: start.addingTimeInterval(1.5))
+        precondition(chunks.isEmpty, "A short phrase waits through a brief pause for more context")
+        pause.append([Float](repeating: 0, count: 16000), end: start.addingTimeInterval(2.5))
         precondition(chunks.count == 1, "A real pause should close a short chunk before the ceiling")
-        precondition(chunks[0].samples.count == 24000 && !chunks[0].forced)
+        precondition(chunks[0].samples.count == 40000 && !chunks[0].forced)
+
+        // A lecturer: 1 s phrases separated by 1 s pauses join into one chunk
+        // instead of being sent as fragments.
+        chunks.removeAll()
+        let lecturer = AudioChunker(source: "麦克风") { chunks.append($0) }
+        for k in 0..<3 {
+            lecturer.append(tone(16000, phase: k), end: start.addingTimeInterval(Double(k) * 2 + 1))
+            lecturer.append([Float](repeating: 0, count: 16000), end: start.addingTimeInterval(Double(k) * 2 + 2))
+        }
+        lecturer.append([Float](repeating: 0, count: 32000), end: start.addingTimeInterval(8))
+        // Old behaviour sent each phrase alone (3 chunks). Now the first two join until
+        // the chunk reaches 3 s, and only the last phrase stands alone.
+        precondition(chunks.count == 2, "Phrases with ~1 s pauses are joined, got \(chunks.count)")
+        precondition(Double(chunks[0].samples.count) / 16000 >= 3, "The first chunk carries two phrases")
 
         // Words separated by short gaps over a steady noise floor that sits above the
         // old fixed 0.003 gate: the cut must still land in a gap, not on a clock.
@@ -41,7 +63,7 @@ enum CaptureFailure: LocalizedError {
         let noisy = AudioChunker(source: "App") { chunks.append($0) }
         var meeting: [Float] = []
         for i in 0..<20 {   // 20 × (0.4 s word + 0.2 s gap) = 12 s
-            meeting += (0..<6400).map { 0.1 + Float(($0 + i) % 7) * 0.001 }
+            meeting += tone(6400, phase: i * 7)
             meeting += (0..<3200).map { 0.006 * (($0 % 2 == 0) ? 1 : -1) }
         }
         noisy.append(meeting, end: start.addingTimeInterval(12))
@@ -59,18 +81,33 @@ enum CaptureFailure: LocalizedError {
         precondition(chunks.last!.end.timeIntervalSince(start) >= 11.6, "The last word is covered")
         precondition(chunks.allSatisfy { $0.samples.contains { $0 > 0.05 } }, "Silence-only chunks are never sent")
 
+        // Far-field room: a 60 Hz rumble louder than the soft voice. Judged on raw
+        // energy every frame reads as speech and no gap is ever found; judged above
+        // 200 Hz the gaps between words reappear and the cut lands in one.
         chunks.removeAll()
-        chunker.append([Float](repeating: 0.1, count: 8000), end: start)
+        let room = AudioChunker(source: "麦克风") { chunks.append($0) }
+        var lecture: [Float] = []
+        for _ in 0..<20 {   // 20 × (0.4 s soft word + 0.2 s gap) = 12 s
+            lecture += tone(6400, 0.012)
+            lecture += [Float](repeating: 0, count: 3200)
+        }
+        lecture = lecture.enumerated().map { $1 + 0.03 * sin(2 * Float.pi * 60 * Float($0) / 16000) }
+        room.append(lecture, end: start.addingTimeInterval(12))
+        precondition(!chunks.isEmpty && chunks.allSatisfy { !$0.forced }, "Pauses under low-frequency rumble must be found")
+        precondition(chunks.allSatisfy { Double($0.samples.count) / 16000 < 4 }, "Cut at the first pause, not the ceiling")
+
+        chunks.removeAll()
+        chunker.append(tone(8000), end: start)
         chunker.discard()
         chunker.flush()
         precondition(chunks.isEmpty, "Discard must clear in-flight audio")
 
         let app = AudioChunker(source: "Browser") { chunks.append($0) }
         let mic = AudioChunker(source: "麦克风") { chunks.append($0) }
-        app.append([Float](repeating: 0.2, count: 32000), end: start)
-        mic.append([Float](repeating: 0.1, count: 16000), end: start)
+        app.append(tone(32000, 0.28), end: start)
+        mic.append(tone(16000), end: start)
         mic.flush()
-        app.append([Float](repeating: 0.2, count: 32000), end: start.addingTimeInterval(2))
+        app.append(tone(32000, 0.28, phase: 32000), end: start.addingTimeInterval(2))
         app.flush()
         precondition(chunks.map(\.source) == ["麦克风", "Browser"], "Mic flush must not reset App audio")
         precondition(chunks[1].samples.count == 64000, "App audio continued across the mic flush")
@@ -137,6 +174,10 @@ enum CaptureFailure: LocalizedError {
         precondition(groups.map(\.count) == [6, 2], "Got \(groups.map(\.count))")
         let merged = Refinement.merge(Array(groups[0]), text: "精修后的文字")
         precondition(merged.id == groups[0][0].id && merged.audio == AudioRef(offset: 0, count: 480000))
+        precondition(merged.refined == true && groups[0].allSatisfy { $0.refined == nil }, "Only merged lines are marked as re-recognized")
+        let legacyLine = #"{"id":"6F9619FF-8B86-D011-B42D-00CF4FC964FF","start":0,"end":4,"source":"麦克风","text":"旧","latency":1}"#
+        let legacy = try JSONDecoder().decode(TranscriptLine.self, from: Data(legacyLine.utf8))
+        precondition(legacy.refined == nil, "Older lines still decode")
         var replaced = rl
         precondition(Refinement.apply(merged, replacing: groups[0].map(\.id), in: &replaced))
         precondition(replaced.count == rl.count - 5 && replaced.contains { $0.text == "精修后的文字" })

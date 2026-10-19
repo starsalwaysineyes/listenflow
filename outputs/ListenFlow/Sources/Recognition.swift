@@ -161,7 +161,7 @@ enum Refinement {
             return AudioRef(offset: first.offset, count: last.offset + last.count - first.offset)
         }()
         return TranscriptLine(id: lines[0].id, start: lines.map(\.start).min()!, end: lines.map(\.end).max()!,
-                              source: lines[0].source, text: text, latency: lines[0].latency, audio: audio)
+                              source: lines[0].source, text: text, latency: lines[0].latency, audio: audio, refined: true)
     }
 
     /// Replace the lines in `ids` with `merged`, only if all are still present.

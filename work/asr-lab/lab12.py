@@ -1,0 +1,55 @@
+"""Chunker detection under low SNR: high-pass, smoothing, hysteresis. All followed by gain."""
+import sys, re, glob, numpy as np
+exec(open("lab5.py").read().split("clips = sorted")[0])        # model, asr, degrade, gain, cut_swift, noise
+from scipy.signal import butter, sosfilt
+SOS = butter(2, 200, btype="highpass", fs=SR, output="sos")
+
+def chunk(a, short_end=None, hp=False, smooth=1, lo=None, ratio=2.5, min_s=3.0, max_s=8.0, gap_f=8, end_f=25, win=150, search_s=2.5):
+    x = sosfilt(SOS, a) if hp else a                    # causal: only affects the decision signal
+    n = len(x)//F; r = np.sqrt(np.mean(x[:n*F].reshape(n, F)**2, axis=1))
+    if smooth > 1: r = np.convolve(r, np.ones(smooth)/smooth)[:n]   # causal moving average
+    hist, out = [], []; active, start, quiet, pre, seg, was = False, 0, 0, 0, [], False
+    for i in range(n):
+        hist.append(r[i]); hist = hist[-win:]
+        fl = float(np.sort(hist)[len(hist)//10])
+        hi = min(max(0.003 if not hp else 0.0015, fl*ratio), 0.03)
+        thr = (max(fl*lo, 0.0008) if (lo and was) else hi)
+        speech = r[i] > thr; was = speech
+        off = i*F
+        if not active:
+            if not speech: pre = min(pre+1, 10); continue
+            active, start, quiet, seg = True, off - pre*F, 0, [0.0]*pre; pre = 0
+        seg.append(r[i]); quiet = 0 if speech else quiet+1
+        length = len(seg)*F/SR; end = off+F
+        if quiet >= (short_end if (short_end and length < min_s) else end_f) and length >= 0.8: out.append((start, end)); active = False; continue
+        if length >= min_s and quiet >= gap_f:
+            cut = end - (quiet//2)*F; out.append((start, cut))
+            carry = (end-cut)//F; start, seg = cut, seg[-carry:] if carry else []; continue
+        if length >= max_s:
+            lo_i = len(seg) - int(search_s*SR/F); t = np.convolve(seg[lo_i:], np.ones(5)/5, mode="same")
+            k = lo_i + int(np.argmin(t[2:-2])) + 2; cut = start + k*F
+            out.append((start, cut)); start, seg = cut, seg[k:]
+    if active and len(seg)*F >= 1600: out.append((start, len(a)))
+    return out
+
+
+import os
+clips = sorted(glob.glob("corpus/t*-*.wav"))
+refs = {p: open(re.sub(r"-\d+\.wav$", ".txt", p)).read() for p in clips}
+VARIANTS = {
+    "新切分(停0.5s即收)":   dict(hp=True, ratio=2.0),
+    
+    "不足3s时停1.5s才收":   dict(hp=True, ratio=2.0, short_end=75),
+}
+for lname, lev in {"正常电平": 0.08, "实录(-44)": REAL_SPEECH_P90}.items():
+    tot = {k: [0, 0, []] for k in VARIANTS}; n = 0
+    for i, p in enumerate(clips):
+        a = degrade(load(p), lev, i); n += len(re.sub(r"[^\w]|_", "", refs[p]))
+        for k, kw in VARIANTS.items():
+            segs = chunk(a, **kw)
+            tot[k][0] += edits(refs[p], "".join(asr(a[s:e]) for s, e in segs))[0]
+            tot[k][1] += len(segs); tot[k][2] += [(e-s)/SR for s, e in segs]
+        print(lname, p, {k: v[0] for k, v in tot.items()}, file=sys.stderr, flush=True)
+    print(f"\n=== 连续朗读 · {lname} ===", flush=True)
+    for k, (ed, ns, L) in tot.items():
+        print(f"  {k:<18} 错字 {ed:>4}  CER {ed/n*100:5.2f}%  片段 {ns}  平均 {np.mean(L):.1f}s  <2s 占 {np.mean(np.array(L)<2):.0%}", flush=True)

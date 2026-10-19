@@ -151,6 +151,16 @@ final class AppModel: ObservableObject {
     var hasAskContext: Bool { !session.lines.isEmpty || !askImages.isEmpty || !session.chat.isEmpty }
     var hasOrganizationContext: Bool { !session.lines.isEmpty || !organizationImages.isEmpty }
     var organizationImagesChanged: Bool { Set(session.organized?.imageIDs ?? []) != organizationImageIDs }
+    /// While live text is still arriving in quality mode, the first line after the
+    /// last re-recognized one: everything above it is settled, everything from it
+    /// down is short live chunks that may still be merged and replaced.
+    var liveTailStart: UUID? {
+        guard isRecording || pendingCount > 0,
+              let last = session.lines.lastIndex(where: { $0.refined == true }),
+              last + 1 < session.lines.count else { return nil }
+        return session.lines[last + 1].id
+    }
+
     /// The transcript was re-recognized after this draft was written.
     var organizationStale: Bool {
         guard let organized = session.organized, let refined = session.refinedAt else { return false }
@@ -195,6 +205,8 @@ final class AppModel: ObservableObject {
             session = fixture
             preferences.apiBase = ProcessInfo.processInfo.environment["LISTENFLOW_PREVIEW_API"] ?? "http://127.0.0.1:18764/v1"
             preferences.llmModel = "preview"
+            // Screenshot checks of recording-only UI; no capture is started.
+            if ProcessInfo.processInfo.environment["LISTENFLOW_PREVIEW_RECORDING"] == "1" { isRecording = true }
         }
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.tick() }

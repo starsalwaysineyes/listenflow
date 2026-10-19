@@ -290,7 +290,9 @@ struct ContentView: View {
                 ScrollViewReader { proxy in
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 24) {
+                            let tailStart = model.liveTailStart
                             ForEach(model.session.lines) { line in
+                                if line.id == tailStart { LiveTailDivider() }
                                 TranscriptRow(line: line, sessionCreated: model.session.created)
                             }
                             if model.pendingCount > 0 {
@@ -740,6 +742,26 @@ struct SettingsView: View {
         VStack(alignment: .leading, spacing: 5) {
             Text(title).font(.system(size: 11)).foregroundStyle(.secondary)
             TextField(prompt, text: text).textFieldStyle(.roundedBorder)
+        }
+    }
+}
+
+/// Faint seam between re-recognized text (above) and live chunks still waiting
+/// to be merged (below), so it is clear which part may still change.
+private struct LiveTailDivider: View {
+    var body: some View {
+        HStack(spacing: 8) {
+            dash
+            Text("以下为实时片段，稍后合并重识别").font(.system(size: 9.5)).foregroundStyle(muted.opacity(0.75)).fixedSize()
+            dash
+        }.padding(.vertical, -8)
+    }
+    private var dash: some View {
+        Line().stroke(muted.opacity(0.35), style: StrokeStyle(lineWidth: 1, dash: [3, 4])).frame(height: 1)
+    }
+    private struct Line: Shape {
+        func path(in rect: CGRect) -> Path {
+            Path { $0.move(to: CGPoint(x: 0, y: rect.midY)); $0.addLine(to: CGPoint(x: rect.maxX, y: rect.midY)) }
         }
     }
 }
