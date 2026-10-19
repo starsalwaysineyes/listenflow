@@ -29,6 +29,12 @@ final class ASRBridge: @unchecked Sendable {
         env["HF_HUB_OFFLINE"] = "1"
         env["HF_HUB_DISABLE_TELEMETRY"] = "1"
         env["TOKENIZERS_PARALLELISM"] = "false"
+        // The worker never touches the network. A proxy inherited from a terminal
+        // (e.g. socks5) made huggingface_hub build a client needing an uninstalled
+        // package, and model loading failed before HF_HUB_OFFLINE was consulted.
+        for key in ["ALL_PROXY", "all_proxy", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"] {
+            env.removeValue(forKey: key)
+        }
         process.environment = env
         process.standardInput = stdin
         process.standardOutput = stdout
