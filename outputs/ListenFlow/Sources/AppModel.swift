@@ -210,6 +210,18 @@ final class AppModel: ObservableObject {
             preferences.llmModel = "preview"
             // Screenshot checks of recording-only UI; no capture is started.
             if ProcessInfo.processInfo.environment["LISTENFLOW_PREVIEW_RECORDING"] == "1" { isRecording = true }
+            // README screenshots: a meeting app plus the microphone, model ready.
+            // Uses a stand-in app entry so no real running app names are shown.
+            if ProcessInfo.processInfo.environment["LISTENFLOW_PREVIEW_DEMO"] == "1" {
+                apps = [AudioApp(id: 1, name: "腾讯会议", bundleID: "com.tencent.meeting")]
+                selectedPID = 1
+                source = .app
+                activeSource = .app
+                micEnabled = true
+                modelReady = true
+                modelStatus = "本地模型已就绪"
+                preferences.llmModel = "deepseek-flash"
+            }
         }
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.tick() }
