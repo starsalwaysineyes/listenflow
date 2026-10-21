@@ -706,9 +706,19 @@ struct SettingsView: View {
                             Text("刘海灵动岛").font(.headline)
                             Toggle("在刘海显示实时转写", isOn: $draft.islandEnabled)
                             Toggle("收起时常亮显示最新一句", isOn: $draft.islandShowLatest).disabled(!draft.islandEnabled)
-                            Button("恢复默认高度") { draft.islandHeight = Preferences().islandHeight }
-                                .disabled(!draft.islandEnabled || draft.islandHeight == Preferences().islandHeight)
-                            Text("鼠标移到刘海处展开，移开后收起；点图钉可固定展开。拖动灵动岛底部的横条可以调整高度，会记住。灵动岛不会出现在屏幕共享和截图里。")
+                            HStack(spacing: 10) {
+                                Text("宽度")
+                                Slider(value: $draft.islandWidth, in: 480...1100, step: 20)
+                                Text("\(Int(draft.islandWidth)) pt").font(.system(size: 11, design: .monospaced))
+                                    .foregroundStyle(.secondary).frame(width: 52, alignment: .trailing)
+                            }.disabled(!draft.islandEnabled)
+                            HStack {
+                                Button("恢复默认宽度") { draft.islandWidth = Preferences().islandWidth }
+                                    .disabled(!draft.islandEnabled || draft.islandWidth == Preferences().islandWidth)
+                                Button("恢复默认高度") { draft.islandHeight = Preferences().islandHeight }
+                                    .disabled(!draft.islandEnabled || draft.islandHeight == Preferences().islandHeight)
+                            }
+                            Text("鼠标移到刘海处展开，移开后收起；点图钉可固定展开。拖动灵动岛底部的横条可以调整高度，会记住；14 寸屏幕可以把宽度调窄一些。灵动岛不会出现在屏幕共享和截图里。")
                                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                         }.padding(12)
                     }

@@ -221,6 +221,9 @@ final class AppModel: ObservableObject {
                 if let h = ProcessInfo.processInfo.environment["LISTENFLOW_PREVIEW_ISLAND_HEIGHT"].flatMap(Double.init) {
                     self.preferences.islandHeight = h
                 }
+                if let w = ProcessInfo.processInfo.environment["LISTENFLOW_PREVIEW_ISLAND_WIDTH"].flatMap(Double.init) {
+                    self.preferences.islandWidth = w
+                }
                 self.island = NotchIslandController(model: self)
             }
         }

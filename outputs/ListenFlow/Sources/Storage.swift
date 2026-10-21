@@ -40,6 +40,9 @@ struct Preferences: Codable {
     var islandEnabled = true
     var islandShowLatest = false
     var islandHeight: Double = 300
+    /// 720 pt suits a 16-inch screen at its larger text sizes; a 14-inch screen
+    /// (1512 pt wide by default) may want it narrower.
+    var islandWidth: Double = 720
 
     init() {}
 
@@ -59,6 +62,7 @@ struct Preferences: Codable {
         islandEnabled = try c.decodeIfPresent(Bool.self, forKey: .islandEnabled) ?? d.islandEnabled
         islandShowLatest = try c.decodeIfPresent(Bool.self, forKey: .islandShowLatest) ?? d.islandShowLatest
         islandHeight = try c.decodeIfPresent(Double.self, forKey: .islandHeight) ?? d.islandHeight
+        islandWidth = try c.decodeIfPresent(Double.self, forKey: .islandWidth) ?? d.islandWidth
     }
 
     static func load() -> Preferences {

@@ -19,7 +19,6 @@ final class IslandState: ObservableObject {
 /// what is being transcribed.
 @MainActor
 final class NotchIslandController {
-    static let width: CGFloat = 720
     /// Body height bounds for dragging. For scale, measured on a real lecture in
     /// quality mode (merged lines of 63–113 characters): 300 pt shows about 4 of
     /// them, 520 pt about 8.
@@ -35,6 +34,7 @@ final class NotchIslandController {
     private var hoverSince: Date?
     private var outsideSince: Date?
     private var laidOutHeight: Double = 0
+    private var laidOutWidth: Double = 0
     private var liveBody: CGFloat = 0
     private var bag: Set<AnyCancellable> = []
     private let preview = ProcessInfo.processInfo.environment["LISTENFLOW_PREVIEW_ISLAND"]
@@ -91,6 +91,7 @@ final class NotchIslandController {
         if state.notch != notch { state.notch = notch }
         if state.hasNotch != hasNotch { state.hasNotch = hasNotch }
         laidOutHeight = model.preferences.islandHeight
+        laidOutWidth = model.preferences.islandWidth
         liveBody = min(max(CGFloat(laidOutHeight), Self.minBody), Self.maxBody(on: screen))
         place(panel, on: screen)
         notchRect = NSRect(x: frame.midX - notch.width / 2, y: frame.maxY - notch.height,
@@ -110,7 +111,7 @@ final class NotchIslandController {
             panel = makePanel(model)
             layout()
         }
-        if laidOutHeight != model.preferences.islandHeight && !state.resizing { layout() }
+        if (laidOutHeight != model.preferences.islandHeight || laidOutWidth != model.preferences.islandWidth) && !state.resizing { layout() }
         if panel?.isVisible == false { panel?.orderFrontRegardless() }
         if poll == nil {
             poll = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
@@ -135,7 +136,9 @@ final class NotchIslandController {
 
     private func place(_ panel: NSPanel, on screen: NSScreen) {
         let frame = screen.frame
-        let width = max(Self.width, state.notch.width + 300)
+        // Never narrower than the notch plus room for the controls beside it,
+        // never wider than the screen.
+        let width = min(max(CGFloat(laidOutWidth), state.notch.width + 300), frame.width - 40)
         let height = state.notch.height + liveBody
         panel.setFrame(NSRect(x: frame.midX - width / 2, y: frame.maxY - height, width: width, height: height), display: true)
     }
@@ -307,7 +310,9 @@ struct NotchIslandView: View {
         let tags = showSources
         return ScrollViewReader { proxy in
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 12) {
+                // Eager on purpose: 40 rows are cheap, and a lazy stack measured late
+                // left the newest line below the fold when the island opened.
+                VStack(alignment: .leading, spacing: 12) {
                     if lines.isEmpty {
                         Text(model.isRecording ? "正在听，第一句识别出来后会显示在这里。" : "开始转写后，最近的内容会显示在这里。")
                             .font(.system(size: 13)).foregroundStyle(.white.opacity(0.5))
@@ -336,7 +341,10 @@ struct NotchIslandView: View {
             // Older lines fade into the top edge, like scrolling lyrics.
             .mask(LinearGradient(stops: [.init(color: .clear, location: 0), .init(color: .black, location: 0.08),
                                          .init(color: .black, location: 1)], startPoint: .top, endPoint: .bottom))
-            .onAppear { proxy.scrollTo("end", anchor: .bottom) }
+            .onAppear {
+                proxy.scrollTo("end", anchor: .bottom)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { proxy.scrollTo("end", anchor: .bottom) }
+            }
             .onChange(of: scrollKey(lines)) { _, _ in
                 withAnimation(.easeOut(duration: 0.25)) { proxy.scrollTo("end", anchor: .bottom) }
             }
