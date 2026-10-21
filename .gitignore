@@ -51,3 +51,4 @@ work/asr-lab/*.log
 # 真实会议转写，只留在本地
 work/meeting-*.json
 outputs/*-整理记录.md
+work/release/
