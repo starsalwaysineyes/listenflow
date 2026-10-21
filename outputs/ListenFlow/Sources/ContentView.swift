@@ -703,6 +703,20 @@ struct SettingsView: View {
                     }
                     GroupBox {
                         VStack(alignment: .leading, spacing: 12) {
+                            Text("刘海灵动岛").font(.headline)
+                            Toggle("在刘海显示实时转写", isOn: $draft.islandEnabled)
+                            Toggle("收起时常亮显示最新一句", isOn: $draft.islandShowLatest).disabled(!draft.islandEnabled)
+                            Picker("展开高度", selection: $draft.islandLines) {
+                                Text("约 4 条").tag(4)
+                                Text("约 8 条").tag(8)
+                                Text("约 12 条").tag(12)
+                            }.pickerStyle(.segmented).disabled(!draft.islandEnabled)
+                            Text("鼠标移到刘海处展开，移开后收起；点图钉可固定展开。灵动岛不会出现在屏幕共享和截图里。")
+                                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                        }.padding(12)
+                    }
+                    GroupBox {
+                        VStack(alignment: .leading, spacing: 12) {
                             Text("上下文问答").font(.headline)
                             field("API Base URL", text: $draft.apiBase, prompt: "https://api.deepseek.com/v1")
                                 .onChange(of: draft.apiBase) { _, _ in if initialized { key = "" } }

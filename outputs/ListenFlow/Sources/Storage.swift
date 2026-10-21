@@ -34,6 +34,11 @@ struct Preferences: Codable {
     /// Keep the session's 16 kHz audio on this Mac so it can be re-recognized later;
     /// deleted once refined, and after seven days regardless.
     var keepAudioForRefine = true
+    /// Live transcript in the notch; the panel's height is sized for about this
+    /// many recent lines and scrolls for more.
+    var islandEnabled = true
+    var islandShowLatest = false
+    var islandLines = 8
 
     init() {}
 
@@ -50,6 +55,9 @@ struct Preferences: Codable {
         llmModel = try c.decodeIfPresent(String.self, forKey: .llmModel) ?? d.llmModel
         recognitionMode = (try? c.decodeIfPresent(RecognitionMode.self, forKey: .recognitionMode)) ?? d.recognitionMode
         keepAudioForRefine = try c.decodeIfPresent(Bool.self, forKey: .keepAudioForRefine) ?? d.keepAudioForRefine
+        islandEnabled = try c.decodeIfPresent(Bool.self, forKey: .islandEnabled) ?? d.islandEnabled
+        islandShowLatest = try c.decodeIfPresent(Bool.self, forKey: .islandShowLatest) ?? d.islandShowLatest
+        islandLines = try c.decodeIfPresent(Int.self, forKey: .islandLines) ?? d.islandLines
     }
 
     static func load() -> Preferences {

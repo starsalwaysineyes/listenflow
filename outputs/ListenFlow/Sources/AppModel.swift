@@ -96,6 +96,9 @@ final class AppModel: ObservableObject {
     @Published var postRefineTotal = 0
     /// A non-error outcome worth telling the user about, such as a finished refinement.
     @Published var notice: String?
+    /// The notch island stays open while pinned; otherwise it follows the mouse.
+    @Published var islandPinned = ProcessInfo.processInfo.environment["LISTENFLOW_PREVIEW_ISLAND"] == "expanded"
+    private var island: NotchIslandController?
     private let capture = CaptureEngine()
     private let worker = ASRBridge()
     private var pending: [UUID: AudioChunk] = [:]
@@ -212,6 +215,15 @@ final class AppModel: ObservableObject {
             Task { @MainActor in self?.tick() }
         }
         runReplayIfRequested()
+        if ProcessInfo.processInfo.environment["LISTENFLOW_REPLAY"] == nil {
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                if let n = ProcessInfo.processInfo.environment["LISTENFLOW_PREVIEW_ISLAND_LINES"].flatMap(Int.init) {
+                    self.preferences.islandLines = n
+                }
+                self.island = NotchIslandController(model: self)
+            }
+        }
         // Lets UI checks capture the settings sheet without synthesizing keystrokes.
         if Bundle.main.bundleIdentifier == "local.ListenFlow.preview",
            ProcessInfo.processInfo.environment["LISTENFLOW_PREVIEW_SETTINGS"] == "1" { showSettings = true }

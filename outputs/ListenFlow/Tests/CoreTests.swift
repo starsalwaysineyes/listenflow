@@ -153,6 +153,7 @@ enum CaptureFailure: LocalizedError {
         let prefs = try JSONDecoder().decode(Preferences.self, from: Data(oldPrefs.utf8))
         precondition(prefs.python == "/opt/py" && prefs.hotwords == "小林" && prefs.apiBase == "https://x.example")
         precondition(prefs.recognitionMode == .auto && prefs.keepAudioForRefine)
+        precondition(prefs.islandEnabled && !prefs.islandShowLatest && prefs.islandLines == 8, "Island defaults for older settings")
         let roundPrefs = try JSONDecoder().decode(Preferences.self, from: JSONEncoder().encode(prefs))
         precondition(roundPrefs.recognitionMode == .auto && roundPrefs.python == "/opt/py")
         precondition(PowerSource.wantsQuality(.quality) && !PowerSource.wantsQuality(.economy))

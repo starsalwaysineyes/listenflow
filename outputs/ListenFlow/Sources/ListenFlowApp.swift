@@ -101,6 +101,9 @@ struct ListenFlowApp: App {
         Button("截取屏幕加入提问（⌥⌘S）") { model.captureScreenshot() }
             .disabled(model.isAsking || model.isImportingImages)
         Button("打开听流窗口") { model.showMainWindow() }
+        if model.preferences.islandEnabled {
+            Button(model.islandPinned ? "取消固定灵动岛" : "固定展开灵动岛") { model.islandPinned.toggle() }
+        }
         Divider()
         Button("模型与 API 设置…") { model.showSettings = true; model.showMainWindow() }
         Button("退出听流") {
