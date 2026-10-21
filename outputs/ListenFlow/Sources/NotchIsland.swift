@@ -10,6 +10,7 @@ final class IslandState: ObservableObject {
     @Published var mode: Mode = .hidden
     @Published var notch = CGSize(width: 190, height: 32)
     @Published var hasNotch = true
+    @Published var resizing = false
 }
 
 /// Live transcript in the MacBook notch. Collapsed it is invisible and lets every
@@ -19,17 +20,11 @@ final class IslandState: ObservableObject {
 @MainActor
 final class NotchIslandController {
     static let width: CGFloat = 720
-    /// Panel body heights for the "about N lines" setting, calibrated by screenshots
-    /// of real sessions at this width: in a lecture recorded in quality mode, merged
-    /// lines run 63–113 characters and 520 pt shows 8 of them; 360 pt showed only 5.
-    /// Short economy-mode lines fit more than the label says, never fewer.
-    static func bodyHeight(lines: Int) -> CGFloat {
-        switch lines {
-        case ...4: 270
-        case 5...8: 520
-        default: 740
-        }
-    }
+    /// Body height bounds for dragging. For scale, measured on a real lecture in
+    /// quality mode (merged lines of 63–113 characters): 300 pt shows about 4 of
+    /// them, 520 pt about 8.
+    static let minBody: CGFloat = 120
+    static func maxBody(on screen: NSScreen) -> CGFloat { screen.visibleFrame.height * 0.75 }
 
     let state = IslandState()
     private weak var model: AppModel?
@@ -39,7 +34,8 @@ final class NotchIslandController {
     private var hoverExpanded = false
     private var hoverSince: Date?
     private var outsideSince: Date?
-    private var laidOutLines = 0
+    private var laidOutHeight: Double = 0
+    private var liveBody: CGFloat = 0
     private var bag: Set<AnyCancellable> = []
     private let preview = ProcessInfo.processInfo.environment["LISTENFLOW_PREVIEW_ISLAND"]
 
@@ -70,7 +66,10 @@ final class NotchIslandController {
         // Preview builds stay capturable so the layout can be checked in screenshots.
         panel.sharingType = Bundle.main.bundleIdentifier == "local.ListenFlow.preview" ? .readOnly : .none
         panel.ignoresMouseEvents = true
-        let host = FirstMouseHostingView(rootView: NotchIslandView(model: model, levels: model.levels, state: state))
+        let view = NotchIslandView(model: model, levels: model.levels, state: state,
+                                   onResize: { [weak self] in self?.resize(toScreenY: $0) },
+                                   onResizeEnd: { [weak self] in self?.endResize() })
+        let host = FirstMouseHostingView(rootView: view)
         host.sizingOptions = []
         panel.contentView = host
         return panel
@@ -91,10 +90,9 @@ final class NotchIslandController {
         }
         if state.notch != notch { state.notch = notch }
         if state.hasNotch != hasNotch { state.hasNotch = hasNotch }
-        laidOutLines = model.preferences.islandLines
-        let width = max(Self.width, notch.width + 300)
-        let height = notch.height + Self.bodyHeight(lines: laidOutLines)
-        panel.setFrame(NSRect(x: frame.midX - width / 2, y: frame.maxY - height, width: width, height: height), display: true)
+        laidOutHeight = model.preferences.islandHeight
+        liveBody = min(max(CGFloat(laidOutHeight), Self.minBody), Self.maxBody(on: screen))
+        place(panel, on: screen)
         notchRect = NSRect(x: frame.midX - notch.width / 2, y: frame.maxY - notch.height,
                            width: notch.width, height: notch.height + 2)
     }
@@ -112,7 +110,7 @@ final class NotchIslandController {
             panel = makePanel(model)
             layout()
         }
-        if laidOutLines != model.preferences.islandLines { layout() }
+        if laidOutHeight != model.preferences.islandHeight && !state.resizing { layout() }
         if panel?.isVisible == false { panel?.orderFrontRegardless() }
         if poll == nil {
             poll = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
@@ -135,6 +133,32 @@ final class NotchIslandController {
         panel?.ignoresMouseEvents = mode != .expanded
     }
 
+    private func place(_ panel: NSPanel, on screen: NSScreen) {
+        let frame = screen.frame
+        let width = max(Self.width, state.notch.width + 300)
+        let height = state.notch.height + liveBody
+        panel.setFrame(NSRect(x: frame.midX - width / 2, y: frame.maxY - height, width: width, height: height), display: true)
+    }
+
+    /// Follows the pointer's screen position rather than the gesture's translation:
+    /// the panel's top edge is fixed, so its bottom edge simply goes where the mouse is.
+    private func resize(toScreenY y: CGFloat) {
+        guard let panel, let screen = targetScreen() else { return }
+        if !state.resizing { state.resizing = true }
+        liveBody = min(max(screen.frame.maxY - y - state.notch.height, Self.minBody), Self.maxBody(on: screen))
+        place(panel, on: screen)
+    }
+
+    /// Saved once on release, so dragging never republishes settings to the main window.
+    private func endResize() {
+        guard let model, state.resizing else { return }
+        state.resizing = false
+        let height = Double(liveBody.rounded())
+        laidOutHeight = height
+        model.preferences.islandHeight = height
+        model.preferences.save()
+    }
+
     /// Polled rather than tracked: the panel ignores the mouse while collapsed, and
     /// a global monitor would need more permissions than a 10 Hz position check.
     private func trackMouse() {
@@ -149,7 +173,8 @@ final class NotchIslandController {
                 } else { hoverSince = now }
             } else { hoverSince = nil }
         } else {
-            let inside = (state.mode == .expanded && panel.frame.contains(point)) || notchRect.contains(point)
+            // Mid-drag the pointer can briefly run past the bottom edge.
+            let inside = state.resizing || (state.mode == .expanded && panel.frame.contains(point)) || notchRect.contains(point)
             if inside { outsideSince = nil }
             else if let since = outsideSince {
                 if now.timeIntervalSince(since) > 0.5 { hoverExpanded = false; outsideSince = nil; update() }
@@ -173,6 +198,8 @@ struct NotchIslandView: View {
     @ObservedObject var model: AppModel
     let levels: AudioLevels
     @ObservedObject var state: IslandState
+    var onResize: (CGFloat) -> Void = { _ in }
+    var onResizeEnd: () -> Void = {}
 
     var body: some View {
         GeometryReader { geo in
@@ -212,7 +239,20 @@ struct NotchIslandView: View {
         VStack(spacing: 0) {
             header.frame(height: state.notch.height)
             transcript
+            resizeHandle
         }
+    }
+
+    /// Drag the bottom edge to set the height; it is remembered.
+    private var resizeHandle: some View {
+        Capsule().fill(.white.opacity(state.resizing ? 0.55 : 0.25)).frame(width: 38, height: 4)
+            .frame(maxWidth: .infinity).frame(height: 14)
+            .contentShape(Rectangle())
+            .onHover { inside in inside ? NSCursor.resizeUpDown.push() : NSCursor.pop() }
+            .gesture(DragGesture(minimumDistance: 1, coordinateSpace: .global)
+                .onChanged { _ in onResize(NSEvent.mouseLocation.y) }
+                .onEnded { _ in onResizeEnd() })
+            .help("拖动调整高度")
     }
 
     /// Status on the left of the notch, controls on the right; nothing under the camera.
@@ -287,7 +327,7 @@ struct NotchIslandView: View {
                     }
                     Color.clear.frame(height: 1).id("end")
                 }
-                .padding(.horizontal, 22).padding(.top, 8).padding(.bottom, 18)
+                .padding(.horizontal, 22).padding(.top, 8).padding(.bottom, 6)
             }
             .scrollIndicators(.never)
             // Lazy rows are measured late; anchoring keeps the newest line in view

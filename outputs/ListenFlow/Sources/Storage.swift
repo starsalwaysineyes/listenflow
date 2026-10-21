@@ -34,11 +34,12 @@ struct Preferences: Codable {
     /// Keep the session's 16 kHz audio on this Mac so it can be re-recognized later;
     /// deleted once refined, and after seven days regardless.
     var keepAudioForRefine = true
-    /// Live transcript in the notch; the panel's height is sized for about this
-    /// many recent lines and scrolls for more.
+    /// Live transcript in the notch. The body height is set by dragging the
+    /// island's bottom edge; 0.7.0's line-count presets are not carried over,
+    /// since even its default was too tall.
     var islandEnabled = true
     var islandShowLatest = false
-    var islandLines = 8
+    var islandHeight: Double = 300
 
     init() {}
 
@@ -57,7 +58,7 @@ struct Preferences: Codable {
         keepAudioForRefine = try c.decodeIfPresent(Bool.self, forKey: .keepAudioForRefine) ?? d.keepAudioForRefine
         islandEnabled = try c.decodeIfPresent(Bool.self, forKey: .islandEnabled) ?? d.islandEnabled
         islandShowLatest = try c.decodeIfPresent(Bool.self, forKey: .islandShowLatest) ?? d.islandShowLatest
-        islandLines = try c.decodeIfPresent(Int.self, forKey: .islandLines) ?? d.islandLines
+        islandHeight = try c.decodeIfPresent(Double.self, forKey: .islandHeight) ?? d.islandHeight
     }
 
     static func load() -> Preferences {

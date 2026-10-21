@@ -218,8 +218,8 @@ final class AppModel: ObservableObject {
         if ProcessInfo.processInfo.environment["LISTENFLOW_REPLAY"] == nil {
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
-                if let n = ProcessInfo.processInfo.environment["LISTENFLOW_PREVIEW_ISLAND_LINES"].flatMap(Int.init) {
-                    self.preferences.islandLines = n
+                if let h = ProcessInfo.processInfo.environment["LISTENFLOW_PREVIEW_ISLAND_HEIGHT"].flatMap(Double.init) {
+                    self.preferences.islandHeight = h
                 }
                 self.island = NotchIslandController(model: self)
             }
