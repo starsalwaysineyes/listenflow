@@ -187,6 +187,28 @@ enum CaptureFailure: LocalizedError {
         precondition(!Refinement.plausible(original: "今天讨论发布安排，小林负责周五", refined: "嗯。"), "Collapsed output refused")
         precondition(!Refinement.plausible(original: "好的", refined: "好的好的好的好的好的好的"), "Hallucinated output refused")
         precondition(Refinement.dropTrailingStop("被推向远处。") == "被推向远处" && Refinement.dropTrailingStop("真的？") == "真的？")
+        // A line whose audio is gone (a dropped echo) breaks the window: its audio must not be read back in.
+        let gapped = [line(0, 3, "麦克风", 0), line(3, 3, "麦克风", 48000), line(9, 3, "麦克风", 144000), line(12, 3, "麦克风", 192000)]
+        precondition(Refinement.windows(gapped, limit: 30).map(\.count) == [2, 2], "Never read across dropped audio")
+
+        // Echo: a microphone line repeating the app at the same time is dropped.
+        func spoken(_ t: Double, _ d: Double, _ src: String, _ text: String) -> TranscriptLine {
+            TranscriptLine(start: start.addingTimeInterval(t), end: start.addingTimeInterval(t + d), source: src, text: text, latency: 1)
+        }
+        let appLines = [spoken(0, 6, "腾讯会议", "哎，你上次说的那家火锅店我去了，真的挺好吃的，"),
+                   spoken(6, 5, "腾讯会议", "就是排队排得太久了。我们六点到的。"),
+                   spoken(30, 2, "腾讯会议", "好的。")]
+        // Measured: the microphone's copy of that speech, cut at different points, with recognition differences.
+        let echo = spoken(0.2, 8, "麦克风", "你上次说的那家火锅店，我去了，真的挺好吃的，就是排队排得太久了")
+        precondition(EchoFilter.isEcho(echo, among: appLines), "Echo dropped")
+        precondition(!EchoFilter.isEcho(spoken(1, 5, "麦克风", "我们开始今天的周会，先同步一下进度。"), among: appLines), "Own speech kept")
+        precondition(!EchoFilter.isEcho(spoken(40, 6, "麦克风", "你上次说的那家火锅店我去了"), among: appLines), "Only the same time counts")
+        precondition(!EchoFilter.isEcho(appLines[0], among: appLines + [echo]), "App lines are never dropped")
+        precondition(EchoFilter.isEcho(spoken(30.1, 1.5, "麦克风", "好的"), among: appLines), "Short echo aligned in time")
+        precondition(!EchoFilter.isEcho(spoken(32.4, 1, "麦克风", "好的"), among: appLines), "A short reply after the app's is the user's own")
+        precondition(!EchoFilter.isEcho(spoken(2, 4, "麦克风", "对"), among: appLines), "A one-word reply is not matched by chance")
+        // Talking over the other side: the line is mostly the user's, so it stays.
+        precondition(!EchoFilter.isEcho(spoken(6, 5, "麦克风", "我觉得周四之前修不完，排队的问题先放一放"), among: appLines), "Double talk kept")
 
         // Kept audio: ordered ranges, faithful round trip, removable.
         let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("lf-audio-\(UUID().uuidString)")
@@ -212,7 +234,7 @@ enum CaptureFailure: LocalizedError {
 
         print("PASS: silence, bounded chunks, lossless boundaries, endpointing, independent sources, discard, API URLs, context snapshots, session round-trip")
         print("PASS: old-session compatibility, organized draft persistence/export, late-arrival coverage, lossless cleanup batching, raw-only cleanup context")
-        print("PASS: pause-aware chunking under noise, forced-cut flags, settings migration, refinement windows/guards/merge, private audio store round trip")
+        print("PASS: pause-aware chunking under noise, forced-cut flags, settings migration, refinement windows/guards/merge, echo filter, private audio store round trip")
         if CommandLine.arguments.contains("--organize-live") {
             let key = String(data: FileHandle.standardInput.readDataToEndOfFile(), encoding: .utf8)!.trimmingCharacters(in: .whitespacesAndNewlines)
             var fixture = MeetingSession(title: "整理功能测试（虚构记录）", created: start)

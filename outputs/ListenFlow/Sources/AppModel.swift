@@ -65,6 +65,8 @@ final class AppModel: ObservableObject {
     @Published var modelStatus = "模型尚未加载"
     @Published var error: String?
     @Published var pendingCount = 0
+    /// Microphone lines dropped this session because they repeated the app's sound.
+    @Published var echoDropped = 0
     let levels = AudioLevels()
     @Published var lastLatency: Double = 0
     @Published var oldestPending: Double = 0
@@ -103,6 +105,16 @@ final class AppModel: ObservableObject {
     private let worker = ASRBridge()
     private var pending: [UUID: AudioChunk] = [:]
     private var pendingAudio: [UUID: AudioRef] = [:]
+    /// Microphone lines waiting for the app source to catch up, so they can be
+    /// compared with what the app said at the same time (see `EchoFilter`).
+    private struct HeldLine {
+        let line: TranscriptLine
+        let chunk: AudioChunk
+        let since: Date
+    }
+    private var heldMic: [HeldLine] = []
+    /// The replay harness's app chunker, standing in for live capture.
+    private var replayAppChunker: AudioChunker?
     /// A joined stretch of one source's lines waiting to be re-recognized as a whole.
     private struct OpenWindow {
         var lineIDs: [UUID]
@@ -335,7 +347,7 @@ final class AppModel: ObservableObject {
     private func submit(_ chunk: AudioChunk) {
         guard modelReady else { return }
         pending[chunk.id] = chunk
-        pendingCount = pending.count
+        refreshPending()
         if preferences.keepAudioForRefine && (Bundle.main.bundleIdentifier != "local.ListenFlow.preview" || AudioStore.rootOverride != nil) {
             pendingAudio[chunk.id] = AudioStore.append(chunk.samples, session: session.id, source: chunk.source)
         }
@@ -366,17 +378,20 @@ final class AppModel: ObservableObject {
                 let raw = event["text"] as? String ?? ""
                 let text = chunk.forced ? Refinement.dropTrailingStop(raw) : raw
                 if !text.isEmpty {
-                    lastLatency = Date().timeIntervalSince(chunk.start)
-                    session.lines.append(TranscriptLine(id: uuid, start: chunk.start, end: chunk.end,
-                                                       source: chunk.source, text: text, latency: lastLatency, audio: audio))
-                    session.lines.sort { $0.start < $1.start }
-                    persist()
-                    if qualityActive { addToWindow(chunk, lineID: uuid, text: text) }
+                    let line = TranscriptLine(id: uuid, start: chunk.start, end: chunk.end, source: chunk.source,
+                                              text: text, latency: Date().timeIntervalSince(chunk.start), audio: audio)
+                    // Every microphone line goes through the echo check; with no app
+                    // audio in play it is released straight away.
+                    if chunk.source == EchoFilter.micSource {
+                        heldMic.append(HeldLine(line: line, chunk: chunk, since: Date()))
+                    } else {
+                        accept(line, chunk: chunk)
+                    }
                 } else {
                     closeWindow(chunk.source)     // nothing recognized: don't join across it
                 }
-                pendingCount = pending.count
-                if !isRecording && pending.isEmpty { closeAllWindows() }
+                settleHeldMic()
+                if !isRecording && pending.isEmpty && heldMic.isEmpty { closeAllWindows() }
                 pumpRefine()
             }
             if failed { error = "一个音频片段识别失败：\(event["message"] as? String ?? "未知错误")" }
@@ -385,10 +400,46 @@ final class AppModel: ObservableObject {
         }
     }
 
+    private func accept(_ line: TranscriptLine, chunk: AudioChunk) {
+        lastLatency = Date().timeIntervalSince(chunk.start)
+        session.lines.append(line)
+        session.lines.sort { $0.start < $1.start }
+        persist()
+        if qualityActive { addToWindow(chunk, lineID: line.id, text: line.text) }
+    }
+
+    private func refreshPending() {
+        let count = pending.count + heldMic.count
+        if pendingCount != count { pendingCount = count }
+    }
+
+    /// Drop held microphone lines that repeat the app, and release the rest once
+    /// every piece of app audio that began before they ended has been recognized.
+    /// Normally that is well under a second; 12 s is only a backstop.
+    private func settleHeldMic(force: Bool = false) {
+        guard !heldMic.isEmpty else { return }
+        let buffered = replayAppChunker?.bufferedSince ?? capture.appBufferedSince()
+        let now = Date()
+        var waiting: [HeldLine] = []
+        for held in heldMic {
+            if EchoFilter.isEcho(held.line, among: session.lines) { echoDropped += 1; continue }
+            let end = held.line.end
+            let appPending = pending.values.contains { $0.source != EchoFilter.micSource && $0.start < end }
+            let appBuffering = buffered.map { $0 < end } ?? false
+            if force || (!appPending && !appBuffering) || now.timeIntervalSince(held.since) > 12 {
+                accept(held.line, chunk: held.chunk)
+            } else {
+                waiting.append(held)
+            }
+        }
+        heldMic = waiting
+        refreshPending()
+    }
+
     // MARK: - Replay hooks
     func submitForReplay(_ chunk: AudioChunk) { submit(chunk) }
     func updateRecognitionModeForReplay() { updateRecognitionMode() }
-    var replayIdle: Bool { pending.isEmpty && refineQueue.isEmpty && refineInFlight == nil && openWindows.isEmpty }
+    var replayIdle: Bool { pending.isEmpty && heldMic.isEmpty && refineQueue.isEmpty && refineInFlight == nil && openWindows.isEmpty }
 
     // MARK: - Second-pass recognition
 
@@ -530,7 +581,8 @@ final class AppModel: ObservableObject {
         modelStatus = "需要重新加载模型"
         pending.removeAll()
         pendingAudio.removeAll()
-        pendingCount = 0
+        settleHeldMic(force: true)     // already recognized: keep them
+        refreshPending()
         resetRefinement()
         if isPostRefining { isPostRefining = false; error = (error ?? "") + " 全文精修已中止，已完成的部分保留。" }
         if isRecording { Task { await stop() } }
@@ -541,10 +593,11 @@ final class AppModel: ObservableObject {
         // The elapsed-time readout is driven by a TimelineView, so this timer never
         // publishes a clock value — only real state changes reach the views.
         updateRecognitionMode()
+        settleHeldMic()
         // A speaker who paused for a while has finished a thought: refine it now
         // rather than waiting for the next chunk to close the window.
         for (source, window) in openWindows where current.timeIntervalSince(window.touched) > 4 { closeWindow(source) }
-        if !isRecording && pending.isEmpty { closeAllWindows() }
+        if !isRecording && pending.isEmpty && heldMic.isEmpty { closeAllWindows() }
         let age = pending.values.map { current.timeIntervalSince($0.start) }.max() ?? 0
         if age != oldestPending { oldestPending = age }
         if current.timeIntervalSince(lastAppSignal) > 1 && levels.app != 0 { levels.app = 0 }
@@ -770,6 +823,7 @@ final class AppModel: ObservableObject {
         guard canChangeSession else { return }
         persist()
         session = MeetingSession()
+        echoDropped = 0
         resetRefinement()
         askImageIDs = []; organizationImageIDs = []
         showOrganized = false
@@ -780,6 +834,7 @@ final class AppModel: ObservableObject {
         guard canChangeSession else { return }
         persist()
         session = value
+        echoDropped = 0
         resetRefinement()
         askImageIDs = Set((value.chat.last(where: { $0.role == "user" })?.imageIDs ?? []).prefix(ImageAttachmentStore.maxSelected))
         organizationImageIDs = Set((value.organized?.imageIDs ?? []).prefix(ImageAttachmentStore.maxSelected))
@@ -836,19 +891,31 @@ extension AppModel {
             let chunker = AudioChunker(source: "回放") { [weak self] chunk in
                 MainActor.assumeIsolated { self?.submitForReplay(chunk) }
             }
+            // Optional second track played as the microphone alongside the first
+            // (the app), to exercise the echo filter end to end.
+            let micData = env["LISTENFLOW_REPLAY_MIC"].flatMap { try? Data(contentsOf: URL(fileURLWithPath: $0)) } ?? Data()
+            let mic = micData.withUnsafeBytes { Array($0.bindMemory(to: Int16.self)) }.map { Float($0) / 32768 }
+            let micChunker = AudioChunker(source: EchoFilter.micSource) { [weak self] chunk in
+                MainActor.assumeIsolated { self?.submitForReplay(chunk) }
+            }
+            replayAppChunker = chunker
             var offset = 0
-            while offset < samples.count {
-                let n = min(1024, samples.count - offset)
-                chunker.append(Array(samples[offset..<offset + n]),
-                               end: session.created.addingTimeInterval(Double(offset + n) / 16000))
+            let total = max(samples.count, mic.count)
+            while offset < total {
+                let n = min(1024, total - offset)
+                let end = session.created.addingTimeInterval(Double(offset + n) / 16000)
+                if offset < samples.count { chunker.append(Array(samples[offset..<min(offset + n, samples.count)]), end: end) }
+                if offset < mic.count { micChunker.append(Array(mic[offset..<min(offset + n, mic.count)]), end: end) }
                 offset += n
                 try? await Task.sleep(nanoseconds: UInt64(Double(n) / 16000 / speed * 1_000_000_000))
             }
             chunker.flush()
+            micChunker.flush()
+            replayAppChunker = nil
             isRecording = false
             let wall = Date().timeIntervalSince(started)
             while !replayIdle { try? await Task.sleep(nanoseconds: 200_000_000) }
-            write(out + "-live.json", extra: ["wallSeconds": wall])
+            write(out + "-live.json", extra: ["wallSeconds": wall, "echoDropped": echoDropped])
             if env["LISTENFLOW_REPLAY_REFINE"] == "1" {
                 refineSession()
                 while isPostRefining { try? await Task.sleep(nanoseconds: 200_000_000) }
@@ -861,7 +928,7 @@ extension AppModel {
 
     private func write(_ path: String, extra: [String: Any]) {
         var object: [String: Any] = extra
-        object["lines"] = session.lines.map { ["text": $0.text, "start": $0.start.timeIntervalSince(session.created),
+        object["lines"] = session.lines.map { ["text": $0.text, "source": $0.source, "start": $0.start.timeIntervalSince(session.created),
                                                 "end": $0.end.timeIntervalSince(session.created)] }
         if let data = try? JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted]) {
             try? data.write(to: URL(fileURLWithPath: path))

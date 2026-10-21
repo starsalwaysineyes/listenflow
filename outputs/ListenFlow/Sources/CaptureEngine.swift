@@ -148,6 +148,12 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         }
     }
 
+    /// Start of app speech the chunker is still holding: a chunk covering it has
+    /// not been emitted yet. Nil when nothing is buffered or the app is not captured.
+    func appBufferedSince() -> Date? {
+        queue.sync { acceptingApp ? appChunker?.bufferedSince : nil }
+    }
+
     @MainActor
     func stop() async {
         try? await setMicrophone(false)

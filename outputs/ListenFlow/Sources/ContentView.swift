@@ -140,8 +140,8 @@ struct ContentView: View {
             .surfaceCard()
 
             if model.source == .app, model.isRecording {
-                // Mixing an open microphone with speaker output re-records the app's
-                // own sound; the option exists, but only as an explicit choice.
+                // With speakers, the microphone re-records the app's own sound; those
+                // repeated lines are dropped (EchoFilter), so the switch is safe to use.
                 VStack(alignment: .leading, spacing: 10) {
                     HStack {
                         Image(systemName: model.micEnabled ? "mic.fill" : "mic.slash.fill")
@@ -155,8 +155,9 @@ struct ContentView: View {
                     }
                     AudioLevelMeter(levels: model.levels, microphone: true)
                     if model.micEnabled {
-                        Text("外放时会重复录入 App 的声音，建议戴耳机")
-                            .font(.system(size: 10)).foregroundStyle(.orange)
+                        Text(model.echoDropped > 0 ? "外放录到的 App 声音会自动去掉，本次已去掉 \(model.echoDropped) 句"
+                                                   : "外放录到的 App 声音会自动去掉，你自己的话照常保留")
+                            .font(.system(size: 10)).foregroundStyle(muted)
                             .fixedSize(horizontal: false, vertical: true)
                     }
                 }.padding(14).surfaceCard()

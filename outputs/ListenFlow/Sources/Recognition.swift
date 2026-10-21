@@ -123,11 +123,12 @@ enum Refinement {
             var current: [TranscriptLine] = []
             for line in lines.filter({ $0.source == source && $0.audio != nil }).sorted(by: { $0.start < $1.start }) {
                 // The window is read as one contiguous range of the audio file, so
-                // it must never run backwards in that file.
+                // it must never run backwards, nor skip audio whose line is gone —
+                // a microphone echo dropped by `EchoFilter` would be read back in.
                 if let first = current.first, let last = current.last,
                    line.end.timeIntervalSince(first.start) > limit
                     || line.start.timeIntervalSince(last.end) > maxGap
-                    || line.audio!.offset < last.audio!.offset + last.audio!.count {
+                    || line.audio!.offset != last.audio!.offset + last.audio!.count {
                     groups.append(current); current = []
                 }
                 current.append(line)
@@ -172,5 +173,59 @@ enum Refinement {
         lines.append(merged)
         lines.sort { $0.start < $1.start }
         return true
+    }
+}
+
+/// With the microphone open next to speakers, the app's own sound is recorded a
+/// second time. Apple's voice processing removes it completely, but while it runs
+/// every other app's plain microphone input goes silent — measured with Tencent
+/// Meeting, whose level meter stopped — so it is not usable here. A linear echo
+/// canceller left ~15–24 dB of echo, which the model still transcribed (85–125 of
+/// 193 characters). Echo is instead removed as text: a microphone line that
+/// repeats what the app source said at the same time is dropped, keeping the
+/// app's copy, which was recorded digitally and is the cleaner of the two.
+enum EchoFilter {
+    /// Share of the line's character pairs found in the app text. Measured: an
+    /// echo scores 0.95–1.0 against the app's recognition of the same speech;
+    /// unrelated lines of six characters or more never exceeded 0.25 (2,000 pairs).
+    static let threshold = 0.6
+    /// Search margin around the line: the two sources cut at slightly different points.
+    static let margin: TimeInterval = 2
+    static let micSource = "麦克风"
+
+    static func characters(_ text: String) -> [Character] {
+        text.filter { !$0.isPunctuation && !$0.isWhitespace && !$0.isSymbol }.map { $0 }
+    }
+
+    static func overlap(_ line: String, in reference: String) -> Double {
+        let a = characters(line), b = characters(reference)
+        guard !a.isEmpty, !b.isEmpty else { return 0 }
+        guard a.count >= 2 else { return b.contains(a[0]) ? 1 : 0 }
+        var pairs = Set<String>()
+        for i in 0..<(b.count - 1) { pairs.insert(String(b[i...i + 1])) }
+        var hits = 0
+        for i in 0..<(a.count - 1) where pairs.contains(String(a[i...i + 1])) { hits += 1 }
+        return Double(hits) / Double(a.count - 1)
+    }
+
+    /// Whether `line` (from the microphone) repeats app lines spoken at the same time.
+    /// Short replies such as「好的」match by chance far more easily, so they only
+    /// count when an app line overlaps them closely in time.
+    static func isEcho(_ line: TranscriptLine, among lines: [TranscriptLine]) -> Bool {
+        guard line.source == micSource else { return false }
+        let short = characters(line.text).count < 4
+        let duration = line.end.timeIntervalSince(line.start)
+        let near = lines.filter { other in
+            guard other.source != micSource else { return false }
+            if short {
+                // Most of the reply must lie inside the app line, not merely near it.
+                let shared = min(other.end, line.end).timeIntervalSince(max(other.start, line.start))
+                return shared >= duration / 2
+            }
+            return other.end > line.start.addingTimeInterval(-margin) && other.start < line.end.addingTimeInterval(margin)
+        }.sorted { $0.start < $1.start }
+        guard !near.isEmpty else { return false }
+        let score = overlap(line.text, in: near.map(\.text).joined())
+        return short ? score >= 1 : score >= threshold
     }
 }

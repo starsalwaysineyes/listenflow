@@ -79,6 +79,8 @@ final class AudioChunker {
     }
 
     private var sampleCount: Int { frames.reduce(0) { $0 + $1.samples.count } }
+    /// Start of speech buffered but not yet emitted, if any.
+    var bufferedSince: Date? { active && hasSpeech ? started : nil }
     private var hasSpeech: Bool { frames.contains { $0.speech } }
 
     private func consume(_ part: [Float], end: Date) {
