@@ -311,23 +311,21 @@ struct SpeechGate {
     }
 }
 
-/// Tables kept in the Volcengine console and named in a request by ID: hot
-/// words, and replacements applied to the finished text. Empty means unused.
+/// A hot word table kept in the Volcengine console and named in a request by
+/// ID. Empty means unused.
 struct VolcTables: Equatable, Sendable {
     var boosting = ""
-    var correct = ""
 
     /// The request's `corpus`: hot words sent along (they take precedence over
-    /// a table's), and whichever tables are set. Nil when there is nothing.
+    /// a table's), and the table when one is set. Nil when there is nothing.
     func corpus(hotwords: [String]) -> [String: Any]? {
         var corpus: [String: Any] = [:]
         if !hotwords.isEmpty,
            let context = try? JSONSerialization.data(withJSONObject: ["hotwords": hotwords.map { ["word": $0] }]) {
             corpus["context"] = String(decoding: context, as: UTF8.self)
         }
-        let boostingID = boosting.trimmingCharacters(in: .whitespaces), correctID = correct.trimmingCharacters(in: .whitespaces)
+        let boostingID = boosting.trimmingCharacters(in: .whitespaces)
         if !boostingID.isEmpty { corpus["boosting_table_id"] = boostingID }
-        if !correctID.isEmpty { corpus["correct_table_id"] = correctID }
         return corpus.isEmpty ? nil : corpus
     }
 }

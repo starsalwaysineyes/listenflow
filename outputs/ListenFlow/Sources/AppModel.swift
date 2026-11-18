@@ -555,7 +555,7 @@ final class AppModel: ObservableObject {
         guard activeStreams[source] == nil else { return }
         let id = UUID()
         var settings = VolcStream.Settings(key: cloudKey, resourceID: preferences.volcResourceID, hotwords: hotwords,
-                                           tables: VolcTables(boosting: preferences.volcBoostingTableID, correct: preferences.volcCorrectTableID))
+                                           tables: VolcTables(boosting: preferences.volcBoostingTableID))
         // A microphone running next to an app hears the app through the speakers.
         // Measured: with the usual 1 s window an echo ran straight into the user's
         // reply as one 20 s sentence, and the service's final text kept only the
@@ -985,7 +985,7 @@ final class AppModel: ObservableObject {
         let settings = preferences
         let limit = cloudChunkSeconds
         let words = hotwords
-        let tables = VolcTables(boosting: preferences.volcBoostingTableID, correct: preferences.volcCorrectTableID)
+        let tables = VolcTables(boosting: preferences.volcBoostingTableID)
         error = nil
         notice = nil
         postRefineDone = 0
@@ -1122,7 +1122,7 @@ final class AppModel: ObservableObject {
         let settings = preferences
         let limit = cloudChunkSeconds
         let words = hotwords
-        let tables = VolcTables(boosting: preferences.volcBoostingTableID, correct: preferences.volcCorrectTableID)
+        let tables = VolcTables(boosting: preferences.volcBoostingTableID)
         storedRefine = StoredRefine(session: stored)
         Task { [weak self] in
             let key = await Task.detached { AppModel.volcKey() }.value
@@ -1231,7 +1231,6 @@ final class AppModel: ObservableObject {
         preferences = value
         preferences.volcResourceID = value.volcResourceID.trimmingCharacters(in: .whitespaces)
         preferences.volcBoostingTableID = value.volcBoostingTableID.trimmingCharacters(in: .whitespaces)
-        preferences.volcCorrectTableID = value.volcCorrectTableID.trimmingCharacters(in: .whitespaces)
         let fileResource = value.volcFileResourceID.trimmingCharacters(in: .whitespaces)
         preferences.volcFileResourceID = fileResource.isEmpty ? Preferences().volcFileResourceID : fileResource
         preferences.save()

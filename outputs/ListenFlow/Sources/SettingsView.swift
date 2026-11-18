@@ -41,11 +41,8 @@ struct SettingsView: View {
                                 if draft.keepAudioForRefine {
                                     field("录音文件识别的资源 ID", text: $draft.volcFileResourceID, prompt: "volc.seedasr.auc")
                                 }
-                                HStack(alignment: .top, spacing: 12) {
-                                    field("热词表 ID（可选）", text: $draft.volcBoostingTableID)
-                                    field("替换词表 ID（可选）", text: $draft.volcCorrectTableID)
-                                }
-                                Text("在火山引擎控制台建的词表，填它的 ID。替换词表能把一种写法强制改成另一种（比如把「苏七」改成「SU7」），这只有控制台的词表做得到；下面的热词不需要建表。")
+                                field("火山引擎控制台的热词表 ID（可选）", text: $draft.volcBoostingTableID)
+                                Text("已经在火山引擎控制台建过热词表的话，填它的 ID，和上面的热词一起生效。没建过不用填。")
                                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                                 Text("识别档位和合并重识别只用于本地模型；豆包自带二遍识别。没有网络时可以切换到本地模型。")
                                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)

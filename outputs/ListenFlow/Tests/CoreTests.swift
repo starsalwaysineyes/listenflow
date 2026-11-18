@@ -813,16 +813,16 @@ enum CaptureFailure: LocalizedError {
             precondition(liveWords == Array(manyWords.prefix(liveWords.count)) && liveWords.joined().count <= HotwordStore.liveCharacters
                          && (liveWords + [manyWords[liveWords.count]]).joined().count > HotwordStore.liveCharacters, "The top of the list, as much as fits")
             let liveConfig = try JSONSerialization.jsonObject(with: VolcFrame.configuration(uid: "u", hotwords: manyWords,
-                                tables: VolcTables(boosting: " tb-1 ", correct: "ct-9"))) as! [String: Any]
+                                tables: VolcTables(boosting: " tb-1 "))) as! [String: Any]
             let liveCorpus = (liveConfig["request"] as! [String: Any])["corpus"] as! [String: Any]
             let liveContext = try JSONSerialization.jsonObject(with: Data((liveCorpus["context"] as! String).utf8)) as! [String: [[String: String]]]
             precondition(liveContext["hotwords"]?.compactMap { $0["word"] } == liveWords && liveCorpus["boosting_table_id"] as? String == "tb-1"
-                         && liveCorpus["correct_table_id"] as? String == "ct-9", "Streaming sends what fits, and names the console tables")
+                         && liveCorpus["correct_table_id"] == nil, "Streaming sends what fits, and names the console's hot word table; never a replacement table")
             let fileBody = try JSONSerialization.jsonObject(with: VolcRecording.submitBody(wav: Data(), uid: "u", hotwords: manyWords,
-                                tables: VolcTables(correct: "ct-9"), splitOnPauses: false)) as! [String: Any]
+                                tables: VolcTables(), splitOnPauses: false)) as! [String: Any]
             let fileCorpus = (fileBody["request"] as! [String: Any])["corpus"] as! [String: Any]
             let fileContext = try JSONSerialization.jsonObject(with: Data((fileCorpus["context"] as! String).utf8)) as! [String: [[String: String]]]
-            precondition(fileContext["hotwords"]?.count == 30 && fileCorpus["correct_table_id"] as? String == "ct-9" && fileCorpus["boosting_table_id"] == nil,
+            precondition(fileContext["hotwords"]?.count == 30 && fileCorpus["correct_table_id"] == nil && fileCorpus["boosting_table_id"] == nil,
                          "Refining from the recording uses the whole list")
             precondition(VolcTables().corpus(hotwords: []) == nil && VolcTables(boosting: "tb").corpus(hotwords: [])?.count == 1)
             let hotCommands = try [["hotword"], ["hotwords", "list", "--json"], ["hotword", "add", "小林", "梯度下降，损失函数"], ["hotword", "rm", "小林"],

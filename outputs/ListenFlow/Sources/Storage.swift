@@ -40,11 +40,11 @@ struct Preferences: Codable {
     var volcResourceID = "volc.seedasr.sauc.duration"
     /// Doubao recording-file recognition, used to refine a finished session.
     var volcFileResourceID = "volc.seedasr.auc"
-    /// Tables made in the Volcengine console, by ID; empty when not used. The
-    /// replacement table rewrites one spelling as another after recognition,
-    /// which only a console table can do.
+    /// A hot word table made in the Volcengine console, by ID; empty when not
+    /// used. The console's replacement tables are deliberately not supported:
+    /// rewriting one spelling as another after recognition changes words that
+    /// were heard correctly too.
     var volcBoostingTableID = ""
-    var volcCorrectTableID = ""
     var python = "/Users/aurora/Desktop/workspace/asr-realtime-lab/.venv/bin/python"
     var asrModel = "mlx-community/Qwen3-ASR-1.7B-8bit"
     var language = ""
@@ -79,7 +79,6 @@ struct Preferences: Codable {
         volcResourceID = try c.decodeIfPresent(String.self, forKey: .volcResourceID) ?? d.volcResourceID
         volcFileResourceID = try c.decodeIfPresent(String.self, forKey: .volcFileResourceID) ?? d.volcFileResourceID
         volcBoostingTableID = try c.decodeIfPresent(String.self, forKey: .volcBoostingTableID) ?? d.volcBoostingTableID
-        volcCorrectTableID = try c.decodeIfPresent(String.self, forKey: .volcCorrectTableID) ?? d.volcCorrectTableID
         python = try c.decodeIfPresent(String.self, forKey: .python) ?? d.python
         asrModel = try c.decodeIfPresent(String.self, forKey: .asrModel) ?? d.asrModel
         language = try c.decodeIfPresent(String.self, forKey: .language) ?? d.language
