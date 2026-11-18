@@ -45,6 +45,16 @@ private enum Format {
         return dayFormat.string(from: date)
     }
     static func time(_ date: Date) -> String { timeFormat.string(from: date) }
+    private static let monthDayFormat = formatter("M月d日")
+    private static let yearFormat = formatter("yyyy/M/d")
+    /// When a session was recorded, as short as it can be said: the time for
+    /// today's, the date for older ones.
+    static func when(_ date: Date, now: Date = Date()) -> String {
+        let calendar = Calendar.current
+        if calendar.isDate(date, inSameDayAs: now) { return timeFormat.string(from: date) }
+        if let yesterday = calendar.date(byAdding: .day, value: -1, to: now), calendar.isDate(date, inSameDayAs: yesterday) { return "昨天" }
+        return (calendar.isDate(date, equalTo: now, toGranularity: .year) ? monthDayFormat : yearFormat).string(from: date)
+    }
     static func length(_ seconds: TimeInterval) -> String {
         let minutes = Int((seconds / 60).rounded())
         if seconds < 45 { return "不到 1 分钟" }
@@ -82,7 +92,7 @@ private struct NameField: View {
         guard !finished else { return }
         finished = true
         // Unchanged is not a rename: the session keeps the name the app gave it.
-        let name = value.flatMap(SessionStore.cleanName)
+        let name = value.flatMap { SessionStore.cleanName($0) }
         done(name == initial ? nil : name)
     }
 }
@@ -101,6 +111,8 @@ private struct Pulse: ViewModifier {
 
 struct ContentView: View {
     @ObservedObject var model: AppModel
+    @State private var groupPrompt: AppModel.GroupPrompt?
+    @State private var groupName = ""
     var body: some View {
         HStack(spacing: 0) {
             SessionRail(model: model).frame(width: 236)
@@ -127,6 +139,28 @@ struct ContentView: View {
             Button("取消", role: .cancel) {}
         } message: { row in
             Text(model.deleteDetail(row))
+        }
+        .alert(groupPrompt.map { if case .rename = $0 { return "给分组改名" } else { return "新建分组" } } ?? "",
+               isPresented: Binding(get: { model.groupPrompt != nil }, set: { if !$0 { model.groupPrompt = nil } })) {
+            TextField("分组的名字", text: $groupName)
+            Button("好") {
+                let problem: String?
+                switch groupPrompt {
+                case let .new(id)?: problem = model.setGroup(id, to: groupName)
+                case let .rename(old)?: problem = model.renameGroup(old, to: groupName)
+                case nil: problem = nil
+                }
+                if let problem { model.error = problem }
+            }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text(groupPrompt.map { if case .rename = $0 { return "分组里的会话都跟着换到新名字下。" } else { return "这场会话会放进新分组；它仍然在「最近」里。" } } ?? "")
+        }
+        // The alert's buttons run after the model's copy is cleared, so the view keeps its own.
+        .onChange(of: model.groupPrompt) { _, prompt in
+            guard let prompt else { return }
+            groupPrompt = prompt
+            if case let .rename(old) = prompt { groupName = old } else { groupName = "" }
         }
         .task { if !ListenFlowHome.isPreview { model.prepareEngine() } }
         // The app list is only looked at before a session starts.
@@ -214,26 +248,32 @@ struct ContentView: View {
 /// session with one click instead of opening a sheet to look for it.
 private struct SessionRail: View {
     @ObservedObject var model: AppModel
+    /// Group names, one per line: which groups are folded away, and which show all their sessions.
+    @AppStorage("collapsedGroups") private var collapsedNames = ""
+    @State private var expanded: Set<String> = []
 
-    private struct Day: Identifiable {
-        let id: String
-        var sessions: [SessionSummary]
+    private var collapsed: Set<String> { Set(collapsedNames.split(separator: "\n").map(String.init)) }
+    private func toggle(_ name: String) {
+        var names = collapsed
+        if names.contains(name) { names.remove(name) } else { names.insert(name) }
+        collapsedNames = names.sorted().joined(separator: "\n")
     }
 
-    private var days: [Day] {
+    private var recent: [SessionSummary] {
         var rows = model.history
         // A session with nothing in it yet has no file, but it is still the one open.
         if !rows.contains(where: { $0.id == model.session.id }) { rows.insert(SessionSummary(model.session), at: 0) }
-        var out: [Day] = []
-        for row in rows {
-            let label = Format.day(row.created)
-            if out.last?.id == label { out[out.count - 1].sessions.append(row) }
-            else { out.append(Day(id: label, sessions: [row])) }
-        }
-        return out
+        return rows
+    }
+
+    private func heading(_ text: String) -> some View {
+        Text(text).font(.system(size: 11, weight: .medium)).foregroundStyle(Palette.muted)
+            .padding(.horizontal, 10).padding(.top, 14).padding(.bottom, 4)
     }
 
     var body: some View {
+        let groups = SessionGroups.groups(model.history)
+        let names = groups.map(\.name)
         VStack(alignment: .leading, spacing: 0) {
             Button { model.newSession() } label: {
                 HStack(spacing: 8) {
@@ -251,11 +291,27 @@ private struct SessionRail: View {
 
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 1) {
-                    ForEach(days) { day in
-                        Text(day.id).font(.system(size: 11, weight: .medium)).foregroundStyle(Palette.muted)
-                            .padding(.horizontal, 10).padding(.top, 14).padding(.bottom, 4)
-                        ForEach(day.sessions) { row in SessionRow(model: model, row: row) }
+                    // Groups first: the sessions someone filed away on purpose. Each is
+                    // also in the list of recent ones below, so nothing is ever hidden.
+                    ForEach(groups) { group in
+                        let folded = collapsed.contains(group.name), all = expanded.contains(group.name)
+                        GroupHeader(model: model, group: group, folded: folded) { toggle(group.name) }
+                            .padding(.top, 6)
+                        if !folded {
+                            ForEach(all ? group.sessions : Array(group.sessions.prefix(SessionGroups.shown))) { row in
+                                SessionRow(model: model, row: row, groups: names, compact: true)
+                            }
+                            if group.sessions.count > SessionGroups.shown {
+                                Button(all ? "收起" : "展开显示全部 \(group.sessions.count) 场") {
+                                    if all { expanded.remove(group.name) } else { expanded.insert(group.name) }
+                                }
+                                .buttonStyle(.plain).font(.system(size: 12)).foregroundStyle(Palette.muted)
+                                .padding(.leading, 34).frame(height: 26)
+                            }
+                        }
                     }
+                    heading("最近")
+                    ForEach(recent) { row in SessionRow(model: model, row: row, groups: names, compact: false) }
                 }.padding(.horizontal, 10).padding(.bottom, 12)
             }
 
@@ -266,9 +322,47 @@ private struct SessionRail: View {
     }
 }
 
+/// A group's name. Clicking folds it away or brings it back.
+private struct GroupHeader: View {
+    @ObservedObject var model: AppModel
+    let group: SessionGroup
+    let folded: Bool
+    let toggle: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: toggle) {
+            HStack(spacing: 8) {
+                Image(systemName: "folder").font(.system(size: 12)).frame(width: 16)
+                Text(group.name).font(.system(size: 13, weight: .medium)).lineLimit(1)
+                Spacer(minLength: 4)
+                if folded || hovering {
+                    Text("\(group.sessions.count)").font(.system(size: 11)).monospacedDigit().foregroundStyle(Palette.muted)
+                    Image(systemName: folded ? "chevron.right" : "chevron.down").font(.system(size: 9, weight: .semibold)).foregroundStyle(Palette.muted)
+                }
+            }
+            .padding(.horizontal, 10).frame(height: 28)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+        .help(folded ? "展开「\(group.name)」" : "收起「\(group.name)」")
+        .accessibilityLabel("分组 \(group.name)，\(group.sessions.count) 场会话，\(folded ? "已收起" : "已展开")")
+        .contextMenu {
+            Button("改名…") { model.groupPrompt = .rename(group.name) }
+            Button("解散分组（会话保留）") { if let problem = model.dissolveGroup(group.name) { model.error = problem } }
+        }
+    }
+}
+
+/// One session in the list. Under a group it is one line; among the recent
+/// ones it also says how long it is.
 private struct SessionRow: View {
     @ObservedObject var model: AppModel
     let row: SessionSummary
+    /// The groups there are, for the menu that files this session under one.
+    let groups: [String]
+    let compact: Bool
 
     private var detail: String {
         if row.lineCount == 0 { return row.imageCount > 0 ? "\(row.imageCount) 张图" : "还没有内容" }
@@ -291,13 +385,13 @@ private struct SessionRow: View {
                 } else {
                     Text(row.name).font(.system(size: 13, weight: current ? .semibold : .regular)).lineLimit(1)
                     Spacer(minLength: 4)
-                    Text(Format.time(row.created)).font(.system(size: 11)).monospacedDigit().foregroundStyle(Palette.muted)
+                    Text(Format.when(row.created)).font(.system(size: 11)).monospacedDigit().foregroundStyle(Palette.muted)
                 }
             }
             .frame(height: 16)
-            Text(detail).font(.system(size: 11)).foregroundStyle(Palette.muted).lineLimit(1)
+            if !compact { Text(detail).font(.system(size: 11)).foregroundStyle(Palette.muted).lineLimit(1) }
         }
-        .padding(.horizontal, 10).padding(.vertical, 7)
+        .padding(.leading, compact ? 34 : 10).padding(.trailing, 10).padding(.vertical, compact ? 6 : 7)
         .background(current || renaming ? Palette.ink.opacity(0.08) : .clear, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
         .contentShape(Rectangle())
     }
@@ -312,14 +406,31 @@ private struct SessionRow: View {
                 .buttonStyle(.plain)
                 .disabled(!current && !model.canChangeSession)
                 .opacity(current || model.canChangeSession ? 1 : 0.5)
-                .help(current || model.canChangeSession ? row.title : "暂停转写并等识别完成后，才能换到别的会话")
-                // Outside `disabled`: a session can be renamed while another one is recording.
+                .help(current || model.canChangeSession ? row.title + (compact ? "，" + detail : "") : "暂停转写并等识别完成后，才能换到别的会话")
+                // Outside `disabled`: a session can be renamed or filed while another one is recording.
                 .contextMenu {
                     Button("改名…") { renaming = true }
+                    // A session with nothing in it yet has no file to keep a group in.
+                    if row.lineCount > 0 || row.imageCount > 0 {
+                        Menu("移到分组") {
+                            ForEach(groups, id: \.self) { name in
+                                Button { file(under: name) } label: {
+                                    if row.group == name { Label(name, systemImage: "checkmark") } else { Text(name) }
+                                }
+                            }
+                            if !groups.isEmpty { Divider() }
+                            Button("新建分组…") { model.groupPrompt = .new(row.id) }
+                        }
+                        if row.group != nil { Button("移出分组") { file(under: nil) } }
+                    }
                     Divider()
                     Button("删除…", role: .destructive) { model.askToDelete(row.id) }
                 }
         }
+    }
+
+    private func file(under name: String?) {
+        if let problem = model.setGroup(row.id, to: name) { model.error = problem }
     }
 }
 

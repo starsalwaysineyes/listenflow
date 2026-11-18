@@ -561,7 +561,7 @@ enum CaptureFailure: LocalizedError {
         func cli(_ arguments: [String]) -> Lstf.Command? { try? Lstf.parse(arguments) }
         precondition(cli([]) == .help && cli(["--help"]) == .help && cli(["read", "-h"]) == .help && cli(["help"]) == .help)
         precondition(cli(["status"]) == .status(json: false) && cli(["status", "--json"]) == .status(json: true))
-        precondition(cli(["list"]) == .list(limit: 20, json: false) && cli(["list", "--limit", "5", "--json"]) == .list(limit: 5, json: true))
+        precondition(cli(["list"]) == .list(limit: 20, group: nil, json: false) && cli(["list", "--limit", "5", "--json"]) == .list(limit: 5, group: nil, json: true))
         precondition(cli(["read"]) == .read(Lstf.Read()))
         precondition(cli(["read", "3F2A", "--offset", "41", "--limit", "20"]) == .read(Lstf.Read(session: "3F2A", offset: 41, limit: 20)))
         precondition(cli(["read", "--tail", "30", "latest", "--json"]) == .read(Lstf.Read(session: "latest", tail: 30, json: true)), "Options before the session")
@@ -983,6 +983,55 @@ enum CaptureFailure: LocalizedError {
         print("PASS: recording refinement (span index, upload planning and cutting, clock mapping, WAV, request, replacement guards, paragraphs, when to cut on pauses), kept speech store, key file")
         print("PASS: lstf (arguments, choosing a session, paging, output, search), app/tool request files, refinement applied to a stored session")
         print("PASS: session list summaries, saving off the main thread, paragraphs on the page, screenshots kept by time and shown to lstf, hot word file and lstf hotword, console tables, kept-audio files held open")
+        // --- 0.12.0: sessions filed under groups ---
+        do {
+            let groupRoot = FileManager.default.temporaryDirectory.appendingPathComponent("lf-groups-\(UUID().uuidString)")
+            defer { try? FileManager.default.removeItem(at: groupRoot) }
+            SessionStore.folderOverride = groupRoot.appendingPathComponent("Sessions")
+            defer { SessionStore.folderOverride = nil }
+            let began = Date(timeIntervalSince1970: 1_800_000_000)
+            func made(_ title: String, _ daysAgo: Double, _ group: String?) -> MeetingSession {
+                var session = MeetingSession(title: title, created: began.addingTimeInterval(-daysAgo * 86400))
+                session.lines = [TranscriptLine(start: session.created, end: session.created.addingTimeInterval(5), source: "电脑声音", text: "一句", latency: 1)]
+                session.group = group
+                return session
+            }
+            let sessions = [made("周会三", 1, "周会"), made("散会", 2, nil), made("第 9 讲", 3, "课程 10"), made("周会二", 8, "周会"),
+                            made("第 2 讲", 9, "课程 2"), made("周会一", 15, "周会")]
+            for session in sessions { try SessionStore.save(session) }
+            let ungroupedFile = try Data(contentsOf: SessionStore.folder.appendingPathComponent(sessions[1].id.uuidString + ".json"))
+            precondition(!String(decoding: ungroupedFile, as: UTF8.self).contains("\"group\""), "A session in no group is stored as before")
+            let rows = SessionStore.summaries()
+            precondition(rows.map(\.group) == ["周会", nil, "课程 10", "周会", "课程 2", "周会"] && rows == sessions.map(SessionSummary.init),
+                         "The list reads the group without reading the lines")
+            let groups = SessionGroups.groups(rows)
+            precondition(groups.map(\.name) == ["课程 2", "课程 10", "周会"], "Groups in name order, numbers as numbers, so they stay put")
+            precondition(groups[2].sessions.map(\.title) == ["周会三", "周会二", "周会一"] && groups[0].sessions.count == 1, "Newest first inside a group")
+            precondition(rows.count == 6 && groups.reduce(0) { $0 + $1.sessions.count } == 5, "Grouped sessions are still in the recent list; an ungrouped one is in no group")
+            precondition(SessionGroups.groups([]).isEmpty && SessionGroups.shown == 5)
+
+            // Filing and unfiling a stored session.
+            let moved = try SessionStore.update(sessions[1].id) { $0.group = "周会" }
+            precondition(moved.group == "周会" && SessionStore.load(sessions[1].id)?.group == "周会" && moved.lines.count == 1 && moved.title == "散会")
+            try SessionStore.update(sessions[1].id) { $0.group = nil }
+            precondition(SessionStore.load(sessions[1].id)?.group == nil)
+            var missing = false
+            do { try SessionStore.update(UUID()) { $0.group = "周会" } } catch { missing = true }
+            precondition(missing)
+            precondition(SessionStore.cleanName("  产品\n周会  ", limit: SessionStore.groupLimit) == "产品 周会"
+                         && SessionStore.cleanName(String(repeating: "组", count: 80), limit: SessionStore.groupLimit)?.count == 30)
+
+            // What `lstf` shows of it.
+            let listed = try [["list", "--group", "周会"], ["ls", "--group", " 课程 2 ", "--limit", "3", "--json"]].map(Lstf.parse)
+            precondition(listed == [.list(limit: 20, group: "周会", json: false), .list(limit: 3, group: "课程 2", json: true)])
+            var badGroup = false
+            do { _ = try Lstf.parse(["list", "--group", "  "]) } catch let error as LstfError { badGroup = error.usage }
+            precondition(badGroup)
+            precondition(Lstf.describe(Lstf.Info(session: sessions[0])).hasSuffix("分组「周会」") && !Lstf.describe(Lstf.Info(session: sessions[1])).contains("分组"))
+            precondition(Lstf.json(Lstf.Info(session: sessions[0]))["group"] as? String == "周会" && Lstf.json(Lstf.Info(session: sessions[1]))["group"] == nil)
+            precondition(Lstf.help.contains("lstf list --group 分组名"))
+        }
+
         // --- 0.11.4: kept audio outlives refinement ---
         do {
             let keepRoot = FileManager.default.temporaryDirectory.appendingPathComponent("lf-keep-\(UUID().uuidString)")
@@ -1119,6 +1168,7 @@ enum CaptureFailure: LocalizedError {
                          && Lstf.help.contains("这是全文整理，不是摘要"))
         }
 
+        print("PASS: groups (stored with the session, order, every session still in the recent list, filing a stored session, lstf list --group)")
         print("PASS: kept audio outlives refinement (what is still to refine, nothing sent twice, no clearing out by age, what lstf reports)")
         print("PASS: a draft handed in by an agent (how far it reaches, replacing only when asked, what the app leaves alone on update), lstf draft write")
         print("PASS: deleting a session (its file and pictures, nothing else; refused when it cannot be moved away; not from lstf)")

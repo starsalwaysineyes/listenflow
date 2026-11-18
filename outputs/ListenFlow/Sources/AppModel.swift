@@ -122,6 +122,10 @@ final class AppModel: ObservableObject {
     @Published var renameToken = 0
     /// The session the window is asking about deleting.
     @Published var deleteCandidate: SessionSummary?
+    /// The window is asking for a group's name: a new group for a session, or
+    /// a new name for a group there is.
+    enum GroupPrompt: Equatable { case new(UUID), rename(String) }
+    @Published var groupPrompt: GroupPrompt?
     @Published var source: AudioSource = .all
     /// What a running session is actually capturing, decided at start time so the
     /// user can change the picker freely while stopped.
@@ -356,6 +360,9 @@ final class AppModel: ObservableObject {
         // answer requests for this many seconds, then quit as a user would.
         if ListenFlowHome.isPreview, let seconds = ProcessInfo.processInfo.environment["LISTENFLOW_PREVIEW_SERVE"].flatMap(Double.init) {
             DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { NSApp.terminate(nil) }
+        }
+        if ListenFlowHome.isPreview, let path = ProcessInfo.processInfo.environment["LISTENFLOW_PREVIEW_GROUPCHECK"] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.groupCheck(to: path) }
         }
         if ListenFlowHome.isPreview, let path = ProcessInfo.processInfo.environment["LISTENFLOW_PREVIEW_DELETECHECK"] {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.deleteCheck(to: path) }
@@ -1484,6 +1491,57 @@ final class AppModel: ObservableObject {
         catch { return error.localizedDescription }
         return nil
     }
+    // MARK: - Groups
+
+    /// Changes something about a session other than its transcript, wherever
+    /// it is: open in the window, being refined in the background, or on disk.
+    private func amend(_ id: UUID, _ change: (inout MeetingSession) -> Void) -> String? {
+        if id == session.id {
+            change(&session)
+            persist()
+            return nil
+        }
+        if var run = storedRefine, run.session.id == id {
+            change(&run.session)
+            storedRefine = run
+            do { try SessionStore.save(run.session) } catch { return "没有保存下来：\(error.localizedDescription)" }
+            remember(SessionSummary(run.session))
+            return nil
+        }
+        guard SessionStore.writes else { return "找不到这场会话。" }
+        writer.flush()      // a session left a moment ago may still be on its way to disk
+        do { remember(SessionSummary(try SessionStore.update(id, change))) }
+        catch { return "没有保存下来：\(error.localizedDescription)" }
+        return nil
+    }
+    /// Files a session under a group, or with nil takes it out of the one it is
+    /// in. The group comes into being with its first session and is gone with its last.
+    @discardableResult
+    func setGroup(_ id: UUID, to raw: String?) -> String? {
+        var name: String?
+        if let raw {
+            guard let clean = SessionStore.cleanName(raw, limit: SessionStore.groupLimit) else { return "分组的名字不能是空的。" }
+            name = clean
+        }
+        return amend(id) { $0.group = name }
+    }
+    /// Every session of the group moves to the new name; an existing group of that name takes them in.
+    @discardableResult
+    func renameGroup(_ old: String, to raw: String) -> String? {
+        guard let name = SessionStore.cleanName(raw, limit: SessionStore.groupLimit) else { return "分组的名字不能是空的。" }
+        guard name != old else { return nil }
+        return regroup(old, to: name)
+    }
+    /// The sessions stay, in the list of recent ones; only the group goes.
+    @discardableResult
+    func dissolveGroup(_ name: String) -> String? { regroup(name, to: nil) }
+    private func regroup(_ old: String, to name: String?) -> String? {
+        var members = history.filter { $0.group == old }.map(\.id)
+        if session.group == old && !members.contains(session.id) { members.append(session.id) }
+        for id in members { if let problem = amend(id, { $0.group = name }) { return problem } }
+        return nil
+    }
+
     /// Why a session cannot be deleted at the moment; nil when it can.
     func deleteBlocker(_ id: UUID) -> String? {
         if id == session.id {
@@ -1773,15 +1831,24 @@ extension AppModel {
         preferences.engine = .volc
         // A made-up list: a preview build never reads the real sessions.
         let now = Date()
-        history = [SessionSummary(fixture)] + [(0.9, 52.0, 410, "腾讯会议"), (1.2, 95.0, 902, "全局声音"), (2.4, 7.0, 61, "我的麦克风"), (6.1, 48.0, 377, "Safari")]
-            .map { days, minutes, lines, name in
-                var past = MeetingSession(title: "\(name) · 合成", created: now.addingTimeInterval(-days * 86400))
-                past.lines = (0..<lines).map { index in
-                    TranscriptLine(start: past.created, end: past.created.addingTimeInterval(minutes * 60 * Double(index + 1) / Double(lines)),
-                                   source: name, text: "", latency: 0)
-                }
-                return SessionSummary(past)
+        // Some filed under groups, one group with more than it shows at once.
+        var open = SessionSummary(fixture)
+        open.group = "产品周会"
+        let made: [(Double, Double, Int, String, String?)] = [
+            (0.9, 52.0, 410, "腾讯会议", nil), (1.2, 95.0, 902, "操作系统 第 9 讲", "课程"), (2.4, 7.0, 61, "我的麦克风", nil),
+            (6.1, 48.0, 377, "周会 11 月第二周", "产品周会"), (8.2, 90.0, 840, "操作系统 第 8 讲", "课程"), (13.1, 44.0, 350, "周会 11 月第一周", "产品周会"),
+            (20.3, 51.0, 402, "周会 10 月第四周", "产品周会"), (27.2, 39.0, 311, "周会 10 月第三周", "产品周会"),
+            (34.4, 47.0, 365, "周会 10 月第二周", "产品周会"), (41.0, 58.0, 455, "Safari", nil)]
+        history = [open] + made.map { days, minutes, lines, name, group in
+            var past = MeetingSession(title: group == nil ? "\(name) · 合成" : name, created: now.addingTimeInterval(-days * 86400))
+            past.renamed = group == nil ? nil : true
+            past.group = group
+            past.lines = (0..<lines).map { index in
+                TranscriptLine(start: past.created, end: past.created.addingTimeInterval(minutes * 60 * Double(index + 1) / Double(lines)),
+                               source: name, text: "", latency: 0)
             }
+            return SessionSummary(past)
+        }
         main("main-volc")
 
         // In the middle of a session: both sources live, a sentence still being heard.
@@ -1893,6 +1960,41 @@ extension AppModel {
         }
         isRecording = false
         NSApp.terminate(nil)
+    }
+
+    /// Filing sessions under groups, checked without a window in a store of the
+    /// check's own that holds at least three sessions. One of them is open in
+    /// the window, so both ways a session is changed are used. What the list
+    /// and the files say after each step is written out. Preview builds only.
+    func groupCheck(to path: String) {
+        var result: [String: Any] = [:]
+        func finish() {
+            if let data = try? JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys]) {
+                try? data.write(to: URL(fileURLWithPath: path))
+            }
+            NSApp.terminate(nil)
+        }
+        let stored = SessionStore.all()
+        guard SessionStore.folderOverride != nil, stored.count >= 3 else { result["error"] = "needs LISTENFLOW_PREVIEW_STORE with three sessions"; finish(); return }
+        history = SessionStore.summaries()
+        let a = stored[2], b = stored[1], c = stored[0]
+        func state() -> [String: Any] {
+            writer.flush()
+            let onDisk = SessionStore.all()
+            return ["list": SessionGroups.groups(history).map { "\($0.name): " + $0.sessions.map(\.name).joined(separator: ", ") },
+                    "disk": SessionGroups.groups(onDisk.map(SessionSummary.init)).map { "\($0.name): " + $0.sessions.map(\.name).joined(separator: ", ") },
+                    "recent": history.count, "lines kept": onDisk.map(\.lines.count).reduce(0, +)]
+        }
+        openSession(b.id)
+        result["0 start"] = state()
+        result["1 problems"] = [setGroup(a.id, to: " 周会 "), setGroup(b.id, to: "周会"), setGroup(c.id, to: "课程")].compactMap { $0 }
+        result["1 two in 周会 (one of them open), one in 课程"] = state()
+        result["2 problems"] = [renameGroup("周会", to: "产品周会")].compactMap { $0 }
+        result["2 周会 renamed"] = state()
+        result["3 problems"] = [dissolveGroup("课程"), setGroup(a.id, to: nil), setGroup(c.id, to: "  ")].compactMap { $0 }
+        result["3 课程 dissolved, one taken out"] = state()
+        result["open session's group"] = session.group ?? ""
+        finish()
     }
 
     /// Deleting sessions, checked without a window in a store of the check's

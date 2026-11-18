@@ -424,6 +424,9 @@ struct MeetingSession: Codable, Identifiable {
     /// The title was given by a person or an agent, not made up from what was
     /// recorded and when. Such a title is shown whole and never replaced.
     var renamed: Bool?
+    /// The group the user filed it under, by name; nil when it is in none. A
+    /// group is nothing more than the sessions that carry its name.
+    var group: String?
     var imageLibrary: [ImageAttachment] { images ?? [] }
     /// Puts a draft written outside the app in place of whatever draft there
     /// was. It stands for the first `count` lines; later ones stay unorganized.
@@ -451,12 +454,14 @@ struct SessionSummary: Identifiable, Equatable, Decodable {
     var hasDraft: Bool
     var imageCount: Int
     var renamed = false
+    var group: String?
     var name: String { SessionStore.name(title: title, renamed: renamed) }
 
     init(_ session: MeetingSession) {
         id = session.id
         title = session.title
         renamed = session.renamed == true
+        group = session.group
         created = session.created
         lineCount = session.lines.count
         seconds = max(0, (session.lines.map(\.end).max() ?? session.created).timeIntervalSince(session.created))
@@ -464,7 +469,7 @@ struct SessionSummary: Identifiable, Equatable, Decodable {
         imageCount = session.imageLibrary.count
     }
 
-    private enum CodingKeys: String, CodingKey { case id, title, created, lines, organized, images, renamed }
+    private enum CodingKeys: String, CodingKey { case id, title, created, lines, organized, images, renamed, group }
     private struct LineEnd: Decodable { let end: Date }
     private struct Present: Decodable { init(from decoder: Decoder) throws {} }
 
@@ -474,12 +479,35 @@ struct SessionSummary: Identifiable, Equatable, Decodable {
         id = try c.decode(UUID.self, forKey: .id)
         title = try c.decode(String.self, forKey: .title)
         renamed = try c.decodeIfPresent(Bool.self, forKey: .renamed) ?? false
+        group = try c.decodeIfPresent(String.self, forKey: .group)
         created = try c.decode(Date.self, forKey: .created)
         let ends = try c.decodeIfPresent([LineEnd].self, forKey: .lines) ?? []
         lineCount = ends.count
         seconds = max(0, (ends.map(\.end).max() ?? created).timeIntervalSince(created))
         hasDraft = (try c.decodeIfPresent(Present.self, forKey: .organized)) != nil
         imageCount = (try c.decodeIfPresent([Present].self, forKey: .images))?.count ?? 0
+    }
+}
+
+/// The groups down the side of the window: each one a name and the sessions
+/// filed under it. Every session is also in the list of recent ones below,
+/// so filing a session away never hides it.
+struct SessionGroup: Identifiable, Equatable {
+    let name: String
+    var sessions: [SessionSummary]
+    var id: String { name }
+}
+enum SessionGroups {
+    /// A group shows this many sessions until it is asked to show them all.
+    static let shown = 5
+    /// `rows` newest first; so are the sessions inside each group. The groups
+    /// themselves are in name order, so each stays where it was when a new
+    /// session is recorded into another.
+    static func groups(_ rows: [SessionSummary]) -> [SessionGroup] {
+        var byName: [String: [SessionSummary]] = [:]
+        for row in rows { if let name = row.group { byName[name, default: []].append(row) } }
+        return byName.map { SessionGroup(name: $0.key, sessions: $0.value) }
+            .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
     }
 }
 
@@ -620,12 +648,23 @@ enum SessionStore {
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
     }
     static let nameLimit = 60
+    static let groupLimit = 30
     /// A name as it will be stored: one line, no stray space, not endless.
     /// Nil when nothing is left of it.
-    static func cleanName(_ raw: String) -> String? {
+    static func cleanName(_ raw: String, limit: Int = nameLimit) -> String? {
         let words = raw.components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }
-        let name = String(words.joined(separator: " ").prefix(nameLimit)).trimmingCharacters(in: .whitespaces)
+        let name = String(words.joined(separator: " ").prefix(limit)).trimmingCharacters(in: .whitespaces)
         return name.isEmpty ? nil : name
+    }
+    /// Changes something about a session that is on disk and that nothing has
+    /// open. The app changes the one it has open itself, or its next save
+    /// would undo this.
+    @discardableResult
+    static func update(_ id: UUID, _ change: (inout MeetingSession) -> Void) throws -> MeetingSession {
+        guard var session = load(id) else { throw CaptureFailure.message("找不到这场会话，或它的文件读不出来。") }
+        change(&session)
+        try save(session)
+        return session
     }
     /// A title the app made up is "<what was recorded> · <date>", and the date
     /// is dropped wherever it is shown beside the name; a given name is kept whole.

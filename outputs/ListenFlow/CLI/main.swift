@@ -83,8 +83,16 @@ enum Tool {
                 print("上次精修（会话 \(Lstf.shortID(last.sessionID))，\(Lstf.stamp(last.finished))）\(last.ok ? "" : "失败")：\(last.message)")
             }
 
-        case let .list(limit, json):
-            let sessions = SessionStore.all()
+        case let .list(limit, group, json):
+            var sessions = SessionStore.all()
+            if let group {
+                let names = Set(sessions.compactMap(\.group))
+                sessions = sessions.filter { $0.group == group }
+                if sessions.isEmpty {
+                    throw LstfError(message: names.isEmpty ? "还没有任何分组。分组由用户在听流的会话列表里建。"
+                                    : "没有叫「\(group)」的分组。现有的分组：\(names.sorted().map { "「\($0)」" }.joined(separator: "、"))")
+                }
+            }
             let shown = sessions.prefix(limit).map { info($0, state) }
             if json { emit(["total": sessions.count, "sessions": shown.map(Lstf.json)]); return }
             if sessions.isEmpty { print("还没有任何会话。"); return }

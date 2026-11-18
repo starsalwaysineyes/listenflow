@@ -13,7 +13,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return Bundle.main.bundleIdentifier == "local.ListenFlow.preview"
             && (env["LISTENFLOW_REPLAY"] != nil || env["LISTENFLOW_PREVIEW_SNAPSHOT"] != nil
                 || env["LISTENFLOW_PREVIEW_SCROLLCHECK"] != nil || env["LISTENFLOW_PREVIEW_SERVE"] != nil
-                || env["LISTENFLOW_PREVIEW_DELETECHECK"] != nil)
+                || env["LISTENFLOW_PREVIEW_DELETECHECK"] != nil || env["LISTENFLOW_PREVIEW_GROUPCHECK"] != nil)
     }()
 
     func applicationDidFinishLaunching(_ notification: Notification) {

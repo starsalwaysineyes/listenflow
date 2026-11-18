@@ -23,7 +23,8 @@ enum Lstf {
 
     用法
       lstf status                      听流是否在运行、是否在录、当前是哪一场
-      lstf list [--limit N]            历史会话，新的在前（默认 20 场）
+      lstf list [--limit N] [--group 分组]
+                                       历史会话，新的在前（默认 20 场）；--group 只列某个分组里的
       lstf read [会话] [选项]           读一场会话的转写
       lstf search 关键词 [--session 会话] [--limit N]
                                        在全部（或一场）会话里找包含关键词的句子
@@ -79,6 +80,10 @@ enum Lstf {
       顺序有用：豆包实时识别只收得下约 80 个字的热词，排在后面的只在精修时用；list 会标出是哪些。
       不要把会议里出现的每个词都加进去，只加确实识别错、而且之后还会出现的。
 
+    分组
+      用户可以在听流里把会话归到分组（比如「产品周会」「操作系统课」）。list 的每一行会写出它在哪个分组；
+      用户说「周会那几场」「这门课的录音」时，用 lstf list --group 分组名 找。分组只能由用户在听流里调整。
+
     rename：给会话改名
       会话默认叫「录的是什么 · 日期」（比如「全局声音 · 2026年11月18日 22:52」），不好找。改成说明内容的短名字，
       之后在 lstf list、听流的会话列表和导出的文件名里都是它。日期不用写进名字，列表里本来就有。
@@ -121,7 +126,7 @@ enum Lstf {
     enum Command: Equatable {
         case help
         case status(json: Bool)
-        case list(limit: Int, json: Bool)
+        case list(limit: Int, group: String?, json: Bool)
         case read(Read)
         case search(text: String, session: String?, limit: Int, json: Bool)
         case refine(session: String?, wait: Bool)
@@ -135,7 +140,7 @@ enum Lstf {
     static func parse(_ arguments: [String]) throws -> Command {
         guard let name = arguments.first, !arguments.contains("--help"), !arguments.contains("-h"), name != "help" else { return .help }
         var words: [String] = [], flags: Set<String> = [], values: [String: String] = [:]
-        let valued: Set<String> = ["--offset", "--limit", "--tail", "--minutes", "--session", "--file", "--through"]
+        let valued: Set<String> = ["--offset", "--limit", "--tail", "--minutes", "--session", "--file", "--through", "--group"]
         let plain: Set<String> = ["--json", "--wait", "--organized", "--replace"]
         var rest = arguments.dropFirst()[...]
         while let word = rest.popFirst() {
@@ -169,8 +174,15 @@ enum Lstf {
             try allow(["--json"], words: 0)
             return .status(json: json)
         case "list", "ls":
-            try allow(["--json", "--limit"], words: 0)
-            return .list(limit: try number("--limit", atLeast: 1) ?? 20, json: json)
+            try allow(["--json", "--limit", "--group"], words: 0)
+            var group: String?
+            if let raw = values["--group"] {
+                guard let name = SessionStore.cleanName(raw, limit: SessionStore.groupLimit) else {
+                    throw LstfError(message: "--group 后面要跟分组的名字。", usage: true)
+                }
+                group = name
+            }
+            return .list(limit: try number("--limit", atLeast: 1) ?? 20, group: group, json: json)
         case "read", "cat":
             try allow(["--json", "--offset", "--limit", "--tail", "--minutes", "--organized"], words: 1)
             var read = Read(session: words.first, offset: try number("--offset", atLeast: 1), limit: try number("--limit", atLeast: 1),
@@ -353,6 +365,7 @@ enum Lstf {
         case .none: parts.append("未精修，没有录音")
         }
         if info.session.organized != nil { parts.append("有整理稿") }
+        if let group = info.session.group { parts.append("分组「\(group)」") }
         let shots = info.session.imageLibrary.filter(\.isShot).count, others = info.session.imageLibrary.count - shots
         if shots > 0 { parts.append("截屏 \(shots) 张") }
         if others > 0 { parts.append("图片 \(others) 张") }
@@ -489,6 +502,7 @@ enum Lstf {
             "lines": session.lines.count, "recording": info.recording, "open": info.open,
             "refinement": refinement(info).rawValue, "keptAudioSeconds": Int(info.keptSeconds), "savedAudioSeconds": Int(max(info.savedSeconds, info.keptSeconds)),
             "organized": session.organized != nil, "images": session.imageLibrary.count]
+        if let group = session.group { object["group"] = group }
         if let refining = info.refining, refining.sessionID == session.id {
             object["refineProgress"] = ["done": refining.done, "total": refining.total]
         }
