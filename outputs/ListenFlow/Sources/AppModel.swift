@@ -191,7 +191,9 @@ final class AppModel: ObservableObject {
     private var refineInFlight: RefineJob?
     private var postRefineChanged = 0
     /// Seconds of streamed speech kept on disk for this session (cloud engine).
+    /// Kept speech that no finished refinement has covered yet, and all of it.
     @Published var keptStreamSeconds: Double = 0
+    @Published var savedStreamSeconds: Double = 0
     private var cloudRefineTask: Task<Void, Never>?
     /// Audio per upload; the replay harness shortens it to exercise the cutting.
     private var cloudChunkSeconds = VolcRecording.chunkSeconds
@@ -263,7 +265,7 @@ final class AppModel: ObservableObject {
     }
     /// For the footer: this session has audio on disk, or is about to.
     var keepsAudio: Bool {
-        session.lines.contains { $0.audio != nil } || keptStreamSeconds > 0
+        session.lines.contains { $0.audio != nil } || savedStreamSeconds > 0
             || (isRecording && usesCloud && preferences.keepAudioForRefine)
     }
     var selectedApp: AudioApp? { apps.first { $0.id == selectedPID } }
@@ -300,9 +302,9 @@ final class AppModel: ObservableObject {
         if HotwordStore.modified() == nil, !preferences.hotwordList.isEmpty { try? HotwordStore.save(preferences.hotwordList) }
         reloadHotwords()
         loadHistory()
+        // Kept audio is no longer cleared out after a week: it stays with its session.
         DispatchQueue.global(qos: .utility).async {
             if !ListenFlowHome.isPreview { AudioStore.adoptLegacy() }
-            AudioStore.purgeExpired()
         }
         updateRecognitionMode()
         // UI tests use a separate bundle identifier and a synthetic session, never a live recording.
@@ -651,10 +653,11 @@ final class AppModel: ObservableObject {
     private func refreshKeptAudio() {
         let id = session.id
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            let seconds = AudioStore.streamSeconds(id)
+            let seconds = AudioStore.unrefinedStreamSeconds(id), saved = AudioStore.streamSeconds(id)
             DispatchQueue.main.async {
-                guard let self, self.session.id == id, self.keptStreamSeconds != seconds else { return }
-                self.keptStreamSeconds = seconds
+                guard let self, self.session.id == id else { return }
+                if self.keptStreamSeconds != seconds { self.keptStreamSeconds = seconds }
+                if self.savedStreamSeconds != saved { self.savedStreamSeconds = saved }
             }
         }
     }
@@ -895,7 +898,7 @@ final class AppModel: ObservableObject {
             jobs.append(RefineJob(sessionID: session.id, lineIDs: group.map(\.id), samples: samples,
                                   original: group.map(\.text).joined(), dropStop: false, post: true))
         }
-        guard !jobs.isEmpty else { notice = "这段会话的暂存音频已不可用，无法精修。"; return }
+        guard !jobs.isEmpty else { notice = "这段会话的录音已不可用，无法精修。"; return }
         error = nil
         notice = nil
         openWindows.removeAll()
@@ -913,17 +916,15 @@ final class AppModel: ObservableObject {
         refineQueue.removeAll { $0.post }
         cloudRefineTask?.cancel()
         isPostRefining = false
-        notice = "已停止精修，已完成的 \(postRefineDone) 处保留；暂存音频仍在，可以稍后继续。"
+        notice = "已停止精修，已完成的 \(postRefineDone) 处保留，可以稍后继续。"
     }
 
     private func finishPostRefine() {
         isPostRefining = false
         session.refinedAt = Date()
-        // The audio served its purpose; keeping it longer than needed is not the deal.
-        AudioStore.deleteChunks(session.id)
-        for index in session.lines.indices { session.lines[index].audio = nil }
+        // The audio stays, and the lines keep pointing into it: a better model may want it one day.
         persist()
-        notice = "全文精修完成：重新识别 \(postRefineTotal) 段，其中 \(postRefineChanged) 段文字有改动。暂存音频已删除。"
+        notice = "全文精修完成：重新识别 \(postRefineTotal) 段，其中 \(postRefineChanged) 段文字有改动。录音保留在本机。"
             + (session.organized != nil ? "整理稿下次更新时会按精修后的原文整篇重整。" : "")
     }
 
@@ -942,10 +943,12 @@ final class AppModel: ObservableObject {
     /// long for one upload is cut at its quietest moment, which means reading
     /// the audio, so this runs off the main thread.
     nonisolated private static func cloudUploads(session: UUID, limit: TimeInterval) -> [CloudUpload] {
-        let spans = AudioStore.streamSpans(session)
+        let all = AudioStore.streamSpans(session)
+        let done = AudioStore.refinedSamples(session)
+        let spans = VolcRecording.remaining(all, after: done)
         // App sources first: the microphone's echo check reads their text.
         let sources = spans.keys.sorted { ($0 == EchoFilter.micSource ? 1 : 0, $0) < ($1 == EchoFilter.micSource ? 1 : 0, $1) }
-        let played = spans.filter { $0.key != EchoFilter.micSource }.flatMap(\.value)
+        let played = all.filter { $0.key != EchoFilter.micSource }.flatMap(\.value)
         return sources.flatMap { source in
             VolcRecording.plan(spans[source] ?? [], limit: Int(limit * 16000),
                                search: Int(VolcRecording.cutSearchSeconds * 16000)) { range in
@@ -973,7 +976,7 @@ final class AppModel: ObservableObject {
                         for span in upload.spans {
                             guard let pcm = AudioStore.readStream(session: session, source: upload.source,
                                                                   offset: span.offset, count: span.count) else {
-                                throw VolcFileError.failed("暂存的音频读不出来了。")
+                                throw VolcFileError.failed("保存的录音读不出来了。")
                             }
                             parts.append(pcm)
                         }
@@ -1033,18 +1036,18 @@ final class AppModel: ObservableObject {
             guard self.isPostRefining, self.session.id == sessionID, !Task.isCancelled else { return }
             self.isPostRefining = false
             if let failure {
-                self.error = "精修中断：\(failure) 已完成的 \(self.postRefineDone) 段保留，暂存音频仍在，可以稍后再点「精修全文」继续。"
+                self.error = "精修中断：\(failure) 已完成的 \(self.postRefineDone) 段保留，可以稍后再点「精修全文」继续。"
                 return
             }
-            AudioStore.deleteStream(sessionID)
+            AudioStore.markStreamRefined(sessionID)
             self.keptStreamSeconds = 0
             // The service answers sentence by sentence; show paragraphs.
             self.session.lines = VolcRecording.paragraphs(self.session.lines)
             if self.postRefineChanged > 0 { self.session.refinedAt = Date() }
             self.persist()
-            self.notice = planned.isEmpty ? "这段会话没有可用的暂存音频。"
-                : uploads.isEmpty ? "这段会话已经精修过，暂存音频已删除。"
-                : "全文精修完成：\(uploads.count) 段、约 \(Self.minutes(seconds))的音频由豆包录音文件识别重新识别，其中 \(self.postRefineChanged) 段文字有改动。暂存音频已删除。"
+            self.notice = planned.isEmpty ? "这段会话没有还没精修的录音。"
+                : uploads.isEmpty ? "这段会话已经精修过。"
+                : "全文精修完成：\(uploads.count) 段、约 \(Self.minutes(seconds))的音频由豆包录音文件识别重新识别，其中 \(self.postRefineChanged) 段文字有改动。录音保留在本机。"
                     + (self.session.organized != nil && self.postRefineChanged > 0 ? "整理稿下次更新时会按精修后的原文整篇重整。" : "")
         }
     }
@@ -1115,11 +1118,11 @@ final class AppModel: ObservableObject {
         if request.session == session.id {
             if isRecording { refuse("这场会话还在录制，暂停转写后才能精修。"); return }
             if isBusy || pendingCount > 0 { refuse("还有句子在识别，稍后再试。"); return }
-            if usesCloud { keptStreamSeconds = AudioStore.streamSeconds(session.id) }
+            if usesCloud { keptStreamSeconds = AudioStore.unrefinedStreamSeconds(session.id) }
             guard canRefineSession else {
                 refuse(usesCloud && !volcKeyPresent ? "还没有填写豆包语音识别的 API Key，无法精修。"
                        : !usesCloud && !modelReady ? "本地模型还没有就绪，无法精修。"
-                       : "这场会话没有可以精修的内容：没有暂存录音，或已经精修过。")
+                       : "这场会话没有可以精修的内容：没有录音，或已经精修过。")
                 return
             }
             refineSession()
@@ -1129,10 +1132,11 @@ final class AppModel: ObservableObject {
         }
         writer.flush()
         guard let stored = SessionStore.load(request.session) else { refuse("找不到这场会话。"); return }
-        guard AudioStore.streamSeconds(stored.id) > 0 else {
-            refuse(AudioStore.hasAudio(stored.id)
-                   ? "这场会话是用本地模型录的，需要先在听流的「历史记录」里打开它，再点「精修全文」。"
-                   : "这场会话没有暂存录音：已经精修过，或录制时关闭了「暂存录音」。")
+        guard AudioStore.unrefinedStreamSeconds(stored.id) > 0 else {
+            refuse(AudioStore.streamSeconds(stored.id) > 0 ? "这场会话已经精修过（录音还保留着）。"
+                   : AudioStore.hasAudio(stored.id)
+                   ? "这场会话是用本地模型录的，需要先在听流的会话列表里打开它，再点「精修全文」。"
+                   : "这场会话没有录音：录制时关闭了「保存录音」，或录音是旧版本精修后删掉的。")
             return
         }
         guard volcKeyPresent else { refuse("还没有填写豆包语音识别的 API Key，无法精修。"); return }
@@ -1176,15 +1180,15 @@ final class AppModel: ObservableObject {
             guard var run = self.storedRefine else { return }
             self.storedRefine = nil
             if let failure {
-                self.lastRefine = .init(sessionID: id, ok: false, message: "精修中断：\(failure) 已完成的 \(run.done) 段保留，暂存录音仍在，可以再试一次。", finished: Date())
+                self.lastRefine = .init(sessionID: id, ok: false, message: "精修中断：\(failure) 已完成的 \(run.done) 段保留，可以再试一次。", finished: Date())
             } else {
-                AudioStore.deleteStream(id)
+                AudioStore.markStreamRefined(id)
                 run.session.lines = VolcRecording.paragraphs(run.session.lines)
                 if run.changed > 0 { run.session.refinedAt = Date() }
                 try? SessionStore.save(run.session)
                 let seconds = uploads.reduce(0) { $0 + $1.seconds }
-                self.lastRefine = .init(sessionID: id, ok: true, message: uploads.isEmpty ? "这场会话已经精修过，暂存音频已删除。"
-                    : "全文精修完成：\(uploads.count) 段、约 \(Self.minutes(seconds))的音频由豆包录音文件识别重新识别，其中 \(run.changed) 段文字有改动。暂存音频已删除。", finished: Date())
+                self.lastRefine = .init(sessionID: id, ok: true, message: uploads.isEmpty ? "这场会话已经精修过。"
+                    : "全文精修完成：\(uploads.count) 段、约 \(Self.minutes(seconds))的音频由豆包录音文件识别重新识别，其中 \(run.changed) 段文字有改动。录音保留在本机。", finished: Date())
             }
             self.remember(SessionSummary(run.session))
         }
@@ -1423,6 +1427,7 @@ final class AppModel: ObservableObject {
     private func startFresh() {
         session = MeetingSession()
         keptStreamSeconds = 0
+        savedStreamSeconds = 0
         echoDropped = 0
         resetRefinement()
         organizationImageIDs = []
@@ -1494,7 +1499,7 @@ final class AppModel: ObservableObject {
         if row.hasDraft { parts.append("整理稿") }
         if row.imageCount > 0 { parts.append("\(row.imageCount) 张图片") }
         return parts.joined(separator: "、") + "会移到废纸篓。"
-            + (AudioStore.hasAudio(row.id) ? "暂存的录音直接删除，之后不能再精修。" : "")
+            + (AudioStore.hasAudio(row.id) ? "它的录音直接删除，找不回来。" : "")
     }
     /// The window asks first; this only raises the question.
     func askToDelete(_ id: UUID) {
@@ -1723,7 +1728,7 @@ extension AppModel {
                                           "events": replayLog ?? [], "error": error ?? ""])
         replayLog = nil
         guard refine else { return }
-        keptStreamSeconds = AudioStore.streamSeconds(session.id)
+        keptStreamSeconds = AudioStore.unrefinedStreamSeconds(session.id)
         let kept = keptStreamSeconds
         let began = Date()
         refineSession()
@@ -1731,7 +1736,12 @@ extension AppModel {
         write(out + "-post.json", extra: ["notice": notice ?? "", "error": error ?? "", "keptSeconds": kept,
                                           "uploads": postRefineTotal, "changed": postRefineChanged,
                                           "refineSeconds": Date().timeIntervalSince(began),
-                                          "audioLeft": AudioStore.streamSeconds(session.id)])
+                                          "audioLeft": AudioStore.streamSeconds(session.id),
+                                          // The audio stays; nothing of it is left to refine, so a second
+                                          // refinement has nothing to send.
+                                          "unrefinedLeft": AudioStore.unrefinedStreamSeconds(session.id),
+                                          "canRefineAgain": canRefineSession,
+                                          "uploadsIfAskedAgain": AppModel.cloudUploads(session: session.id, limit: cloudChunkSeconds).count])
         AudioStore.delete(session.id)
     }
 

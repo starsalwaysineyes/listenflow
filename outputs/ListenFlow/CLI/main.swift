@@ -34,9 +34,9 @@ enum Tool {
     }
 
     static func info(_ session: MeetingSession, _ state: AgentBridge.State?) -> Lstf.Info {
-        let kept = AudioStore.streamSeconds(session.id)
+        let kept = AudioStore.unrefinedStreamSeconds(session.id), saved = AudioStore.streamSeconds(session.id)
         let open = state?.sessionID == session.id
-        return Lstf.Info(session: session, keptSeconds: kept, localAudio: kept == 0 && AudioStore.hasAudio(session.id),
+        return Lstf.Info(session: session, keptSeconds: kept, savedSeconds: saved, localAudio: saved == 0 && AudioStore.hasAudio(session.id),
                          open: open, recording: open && state?.recording == true, refining: state?.refining)
     }
 

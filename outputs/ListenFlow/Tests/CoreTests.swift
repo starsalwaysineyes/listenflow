@@ -626,7 +626,7 @@ enum CaptureFailure: LocalizedError {
                      && Lstf.page(Lstf.Info(session: cliOther), range: 0..<0, note: nil).contains("还没有转写内容"))
         precondition(Lstf.refinement(Lstf.Info(session: cliOld)) == .none && Lstf.refinement(Lstf.Info(session: cliOld, keptSeconds: 700)) == .possible
                      && Lstf.refinement(Lstf.Info(session: cliOld, localAudio: true)) == .windowOnly)
-        precondition(Lstf.describe(Lstf.Info(session: cliOld, keptSeconds: 700)) == "可精修（暂存录音约 12 分钟）")
+        precondition(Lstf.describe(Lstf.Info(session: cliOld, keptSeconds: 700)) == "可精修（还没精修的录音约 12 分钟）")
         var cliDone = cliNew
         cliDone.refinedAt = recT0
         precondition(Lstf.refinement(Lstf.Info(session: cliDone)) == .done
@@ -983,6 +983,58 @@ enum CaptureFailure: LocalizedError {
         print("PASS: recording refinement (span index, upload planning and cutting, clock mapping, WAV, request, replacement guards, paragraphs, when to cut on pauses), kept speech store, key file")
         print("PASS: lstf (arguments, choosing a session, paging, output, search), app/tool request files, refinement applied to a stored session")
         print("PASS: session list summaries, saving off the main thread, paragraphs on the page, screenshots kept by time and shown to lstf, hot word file and lstf hotword, console tables, kept-audio files held open")
+        // --- 0.11.4: kept audio outlives refinement ---
+        do {
+            let keepRoot = FileManager.default.temporaryDirectory.appendingPathComponent("lf-keep-\(UUID().uuidString)")
+            defer { try? FileManager.default.removeItem(at: keepRoot) }
+            AudioStore.rootOverride = keepRoot.appendingPathComponent("audio")
+            defer { AudioStore.rootOverride = nil }
+            let fm = FileManager.default
+            let kept = UUID(), began = Date(timeIntervalSince1970: 1_800_000_000)
+            let second = Data(repeating: 1, count: 32000)       // one second of 16 kHz, 16-bit
+            AudioStore.appendStream(second + second, session: kept, source: "电脑声音", spanStart: began)
+            AudioStore.appendStream(second, session: kept, source: "麦克风", spanStart: began.addingTimeInterval(1))
+            precondition(AudioStore.streamSeconds(kept) == 3 && AudioStore.unrefinedStreamSeconds(kept) == 3 && AudioStore.refinedSamples(kept) == ["电脑声音": 0, "麦克风": 0],
+                         "Nothing refined yet: all of it is still to do")
+            let before = AudioStore.streamSpans(kept)
+            precondition(VolcRecording.remaining(before, after: AudioStore.refinedSamples(kept)).mapValues(\.count) == ["电脑声音": 1, "麦克风": 1])
+
+            AudioStore.markStreamRefined(kept)
+            precondition(AudioStore.streamSeconds(kept) == 3 && AudioStore.unrefinedStreamSeconds(kept) == 0
+                         && AudioStore.refinedSamples(kept) == ["电脑声音": 32000, "麦克风": 16000], "Refined, and the audio is still there")
+            precondition(AudioStore.streamSpans(kept).mapValues(\.count) == before.mapValues(\.count), "Its stretches can still be read back")
+            precondition(VolcRecording.remaining(AudioStore.streamSpans(kept), after: AudioStore.refinedSamples(kept)).isEmpty, "Nothing is sent, or paid for, twice")
+            let marks = try fm.contentsOfDirectory(atPath: AudioStore.folder(kept).path).filter { $0.hasSuffix(".done") }
+            let markMode = try fm.attributesOfItem(atPath: AudioStore.folder(kept).appendingPathComponent(marks[0]).path)[.posixPermissions] as? Int
+            precondition(marks.count == 2 && markMode == 0o600)
+
+            // Recording goes on in the same session: only the new speech is still to do.
+            AudioStore.appendStream(second + second + second, session: kept, source: "电脑声音", spanStart: began.addingTimeInterval(60))
+            let later = VolcRecording.remaining(AudioStore.streamSpans(kept), after: AudioStore.refinedSamples(kept))
+            precondition(AudioStore.streamSeconds(kept) == 6 && AudioStore.unrefinedStreamSeconds(kept) == 3
+                         && later.keys.sorted() == ["电脑声音"] && later["电脑声音"]?.map(\.offset) == [32000] && later["电脑声音"]?.map(\.count) == [48000])
+            precondition(AudioStore.totalBytes() >= 6 * 32000, "What the settings report as kept")
+
+            // No longer cleared out by age.
+            let folder = AudioStore.folder(kept)
+            try fm.setAttributes([.modificationDate: Date().addingTimeInterval(-400 * 86400)], ofItemAtPath: folder.path)
+            precondition(AudioStore.hasAudio(kept) && AudioStore.streamSeconds(kept) == 6, "A year-old recording is still there")
+
+            // What `lstf` says of such a session.
+            var heard = MeetingSession(title: "合成", created: began)
+            heard.lines = [TranscriptLine(start: began, end: began.addingTimeInterval(2), source: "电脑声音", text: "一句", latency: 0, refined: true)]
+            heard.refinedAt = began.addingTimeInterval(100)
+            precondition(Lstf.describe(Lstf.Info(session: heard, keptSeconds: 0, savedSeconds: 700)) == "已精修（录音保留约 12 分钟）"
+                         && Lstf.describe(Lstf.Info(session: heard, keptSeconds: 0, savedSeconds: 0)) == "已精修"
+                         && Lstf.describe(Lstf.Info(session: heard, keptSeconds: 180, savedSeconds: 700)) == "可精修（还没精修的录音约 3 分钟）")
+            let heardJSON = Lstf.json(Lstf.Info(session: heard, keptSeconds: 0, savedSeconds: 700))
+            precondition(heardJSON["refinement"] as? String == "done" && heardJSON["keptAudioSeconds"] as? Int == 0 && heardJSON["savedAudioSeconds"] as? Int == 700)
+
+            // Deleting the session's audio takes the marks with it.
+            AudioStore.deleteStream(kept)
+            precondition(!AudioStore.hasAudio(kept) && AudioStore.refinedSamples(kept).isEmpty && AudioStore.unrefinedStreamSeconds(kept) == 0)
+        }
+
         // --- 0.11.3: an agent hands in the organized draft ---
         do {
             let draftRoot = FileManager.default.temporaryDirectory.appendingPathComponent("lf-draft-\(UUID().uuidString)")
@@ -1067,6 +1119,7 @@ enum CaptureFailure: LocalizedError {
                          && Lstf.help.contains("这是全文整理，不是摘要"))
         }
 
+        print("PASS: kept audio outlives refinement (what is still to refine, nothing sent twice, no clearing out by age, what lstf reports)")
         print("PASS: a draft handed in by an agent (how far it reaches, replacing only when asked, what the app leaves alone on update), lstf draft write")
         print("PASS: deleting a session (its file and pictures, nothing else; refused when it cannot be moved away; not from lstf)")
         print("PASS: naming a session (clean names, the stored file, the list, the export), lstf rename (arguments, the request, output)")

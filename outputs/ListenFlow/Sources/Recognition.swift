@@ -19,9 +19,11 @@ enum PowerSource {
     }
 }
 
-/// The session's audio, one Int16 file per source, kept only so the session can be
-/// re-recognized later. With the local engine it never leaves this Mac; with the
-/// cloud engine it is what was streamed to Doubao, and refinement sends it again.
+/// The session's audio, one Int16 file per source, kept so the session can be
+/// recognized again: by "refine" after the meeting, or one day by a better
+/// model. It stays until the session is deleted — an hour of speech from one
+/// source is about 115 MB. With the local engine it never leaves this Mac; with
+/// the cloud engine it is what was streamed to Doubao, and refinement sends it again.
 enum AudioStore {
     /// Tests point this at a temporary folder so they never touch real sessions.
     nonisolated(unsafe) static var rootOverride: URL?
@@ -38,7 +40,6 @@ enum AudioStore {
             if (try? fm.contentsOfDirectory(atPath: old.path))?.isEmpty == true { try? fm.removeItem(at: old) }
         }
     }
-    static let retention: TimeInterval = 7 * 24 * 3600
     private static let queue = DispatchQueue(label: "ListenFlow.audio")
     nonisolated(unsafe) private static var lengths: [String: Int] = [:]   // guarded by queue
 
@@ -172,6 +173,45 @@ enum AudioStore {
         queue.sync { Double(streamFiles(session).reduce(0) { $0 + currentLength($1) }) / 16000 }
     }
 
+    // The audio outlives refinement, so what has been refined is written down:
+    // beside each source's file, how many samples a completed refinement covered.
+    // Without it every later refinement would send, and pay for, the same speech.
+    private static func streamMark(_ file: URL) -> URL {
+        file.deletingPathExtension().appendingPathExtension("done")
+    }
+    private static func refinedLength(_ file: URL) -> Int {
+        (try? String(contentsOf: streamMark(file), encoding: .utf8)).flatMap { Int($0.trimmingCharacters(in: .whitespacesAndNewlines)) } ?? 0
+    }
+    /// A refinement of the whole session has finished: everything kept so far is done.
+    static func markStreamRefined(_ session: UUID) {
+        queue.sync {
+            for url in streamFiles(session) {
+                try? Data("\(currentLength(url))\n".utf8).write(to: streamMark(url), options: .atomic)
+                try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: streamMark(url).path)
+            }
+        }
+    }
+    /// Per source, the sample up to which the kept speech has been refined.
+    static func refinedSamples(_ session: UUID) -> [String: Int] {
+        queue.sync {
+            var result: [String: Int] = [:]
+            for url in streamFiles(session) {
+                let name = url.lastPathComponent.replacingOccurrences(of: ".stream.pcm", with: "")
+                if let source = name.removingPercentEncoding { result[source] = refinedLength(url) }
+            }
+            return result
+        }
+    }
+    /// Seconds of kept speech that no completed refinement has covered.
+    static func unrefinedStreamSeconds(_ session: UUID) -> TimeInterval {
+        queue.sync { Double(streamFiles(session).reduce(0) { $0 + max(0, currentLength($1) - refinedLength($1)) }) / 16000 }
+    }
+    /// Everything kept, for every session, in bytes.
+    static func totalBytes() -> Int {
+        guard let files = FileManager.default.enumerator(at: root, includingPropertiesForKeys: [.fileSizeKey]) else { return 0 }
+        return files.reduce(0) { $0 + (((try? ($1 as? URL)?.resourceValues(forKeys: [.fileSizeKey]))?.fileSize) ?? 0) }
+    }
+
     static func deleteStream(_ session: UUID) {
         queue.sync {
             let fm = FileManager.default
@@ -182,6 +222,7 @@ enum AudioStore {
             for url in streamFiles(session) {
                 try? fm.removeItem(at: url)
                 try? fm.removeItem(at: streamIndex(url))
+                try? fm.removeItem(at: streamMark(url))
             }
             if (try? fm.contentsOfDirectory(atPath: dir.path))?.isEmpty == true { try? fm.removeItem(at: dir) }
         }
@@ -235,15 +276,6 @@ enum AudioStore {
         }
     }
 
-    /// Kept audio is a convenience, not an archive.
-    static func purgeExpired(now: Date = Date()) {
-        let fm = FileManager.default
-        let dirs = (try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
-        for dir in dirs {
-            let modified = (try? dir.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? now
-            if now.timeIntervalSince(modified) > retention, let id = UUID(uuidString: dir.lastPathComponent) { delete(id) }
-        }
-    }
 }
 
 /// Second-pass recognition: whole pause-cut lines are joined into one longer window

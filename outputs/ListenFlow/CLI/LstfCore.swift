@@ -27,7 +27,7 @@ enum Lstf {
       lstf read [会话] [选项]           读一场会话的转写
       lstf search 关键词 [--session 会话] [--limit N]
                                        在全部（或一场）会话里找包含关键词的句子
-      lstf refine [会话] [--wait]      对有暂存录音、还没精修的会话启动精修
+      lstf refine [会话] [--wait]      对有录音、还没精修的会话启动精修
       lstf hotword list                看热词表
       lstf hotword add 词 [词…]        加热词（人名、产品名、术语的正确写法）
       lstf hotword delete 词 [词…]     删热词
@@ -65,7 +65,7 @@ enum Lstf {
       用户让你整理这场会                 lstf read 读完全部行，写好整理稿，再 lstf draft write
 
     refine：精修
-      录制时听流会暂存录音；精修把录音重新识别一遍，文字更准，完成后录音删除。
+      录制时听流会保存录音；精修把录音重新识别一遍，文字更准。录音精修后仍保留在用户的 Mac 上。
       list / read 里标着"可精修"的会话才能精修；正在录制的不行，需要用户先暂停。
       由听流 app 执行，所以听流必须在运行。豆包引擎下会按音频时长产生识别费用。
       不加 --wait 立即返回，用 lstf status 看进度；加 --wait 等到完成（长会议要几分钟）。
@@ -300,6 +300,8 @@ enum Lstf {
         var session: MeetingSession
         /// Speech kept for refinement by the cloud engine, in seconds.
         var keptSeconds: Double = 0
+        /// All the speech kept for the session, refined or not.
+        var savedSeconds: Double = 0
         /// Audio kept by the local engine, which only the app's window can refine.
         var localAudio = false
         var open = false
@@ -345,10 +347,10 @@ enum Lstf {
         if info.recording { parts.append("正在录制") }
         switch refinement(info) {
         case .running: parts.append("精修中 \(info.refining?.done ?? 0)/\(info.refining?.total ?? 0)")
-        case .possible: parts.append(info.recording ? "暂停后可精修" : "可精修（暂存录音约 \(length(info.keptSeconds))）")
+        case .possible: parts.append(info.recording ? "暂停后可精修" : "可精修（还没精修的录音约 \(length(info.keptSeconds))）")
         case .windowOnly: parts.append("未精修（本地模型录的，要在听流窗口里精修）")
-        case .done: parts.append("已精修")
-        case .none: parts.append("未精修，没有暂存录音")
+        case .done: parts.append(info.savedSeconds > 0 ? "已精修（录音保留约 \(length(info.savedSeconds))）" : "已精修")
+        case .none: parts.append("未精修，没有录音")
         }
         if info.session.organized != nil { parts.append("有整理稿") }
         let shots = info.session.imageLibrary.filter(\.isShot).count, others = info.session.imageLibrary.count - shots
@@ -485,7 +487,7 @@ enum Lstf {
             "id": session.id.uuidString, "shortID": shortID(session.id), "title": session.title,
             "started": iso(session.lines.first?.start ?? session.created), "durationSeconds": Int(duration(session)),
             "lines": session.lines.count, "recording": info.recording, "open": info.open,
-            "refinement": refinement(info).rawValue, "keptAudioSeconds": Int(info.keptSeconds),
+            "refinement": refinement(info).rawValue, "keptAudioSeconds": Int(info.keptSeconds), "savedAudioSeconds": Int(max(info.savedSeconds, info.keptSeconds)),
             "organized": session.organized != nil, "images": session.imageLibrary.count]
         if let refining = info.refining, refining.sessionID == session.id {
             object["refineProgress"] = ["done": refining.done, "total": refining.total]

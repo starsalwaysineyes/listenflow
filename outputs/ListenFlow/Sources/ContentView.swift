@@ -202,8 +202,8 @@ struct ContentView: View {
                 Label("精修全文", systemImage: "wand.and.stars").font(.system(size: 12, weight: .medium))
             }.buttonStyle(.plain).foregroundStyle(Palette.stream)
                 .help(model.usesCloud
-                      ? "把本机暂存的约 \(Int((model.keptStreamSeconds / 60).rounded(.up))) 分钟录音上传到豆包录音文件识别，重新识别全文，更准确；按音频时长另外计费，完成后删除暂存录音"
-                      : "用暂存的音频，以约 30 秒为一段重新识别全文，更准确；完成后删除暂存音频")
+                      ? "把本机保存的、还没精修的约 \(Int((model.keptStreamSeconds / 60).rounded(.up))) 分钟录音上传到豆包录音文件识别，重新识别全文，更准确；按音频时长另外计费。录音精修后仍保留在本机"
+                      : "用保存的录音，以约 30 秒为一段重新识别全文，更准确。录音精修后仍保留在本机")
         }
     }
 }
@@ -967,7 +967,7 @@ private struct StatusBar: View {
 
     private var saved: String {
         if model.sessionIsEmpty { return "会话自动保存在这台 Mac" }
-        if model.keepsAudio { return "已自动保存；录音暂存在本机，精修后删除" }
+        if model.keepsAudio { return "已自动保存；录音保存在本机，删除会话时一起删除" }
         return model.session.imageLibrary.isEmpty ? "已自动保存，不保留录音" : "文字和图片已自动保存，不保留录音"
     }
 

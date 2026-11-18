@@ -35,9 +35,10 @@ struct SettingsView: View {
                                 field("资源 ID", text: $draft.volcResourceID, prompt: "volc.seedasr.sauc.duration")
                                 Text("小时版填 volc.seedasr.sauc.duration，按送入的音频时长计费；并发版填 volc.seedasr.sauc.concurrent，需要单独开通。只在有人说话时连接和发送音频，静音不计费。")
                                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                                Toggle("暂存录音，用于会后「精修全文」", isOn: $draft.keepAudioForRefine)
-                                Text("开启后，发给豆包的那部分音频（有人说话的片段）同时保存在这台 Mac 的 ~/.listenflow/audio。会后点「精修全文」，这些录音会上传到豆包录音文件识别，结合整段上下文重新识别，比实时结果更准；按音频时长另外计费。完成后删除，最长保留 7 天。")
+                                Toggle("保存录音，用于会后「精修全文」和以后重新识别", isOn: $draft.keepAudioForRefine)
+                                Text("开启后，发给豆包的那部分音频（有人说话的片段）同时保存在这台 Mac 的 ~/.listenflow/audio。会后点「精修全文」，这些录音会上传到豆包录音文件识别，结合整段上下文重新识别，比实时结果更准；按音频时长另外计费。录音精修后不删除，一直留到删除那场会话，以后换了更好的模型还能重新识别。每一路声音每小时讲话约 115 MB。")
                                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                                AudioUsage()
                                 if draft.keepAudioForRefine {
                                     field("录音文件识别的资源 ID", text: $draft.volcFileResourceID, prompt: "volc.seedasr.auc")
                                 }
@@ -63,9 +64,10 @@ struct SettingsView: View {
                                 }.pickerStyle(.segmented)
                                 Text(draft.recognitionMode.detail + "。高精度约多用一半算力，错字约再少两到三成。")
                                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                                Toggle("暂存录音，用于事后「精修全文」", isOn: $draft.keepAudioForRefine)
-                                Text("音频只保存在这台 Mac 的 ~/.listenflow/audio，精修完成后删除，最长保留 7 天。关闭后不保存任何原始音频。")
+                                Toggle("保存录音，用于事后「精修全文」和以后重新识别", isOn: $draft.keepAudioForRefine)
+                                Text("音频只保存在这台 Mac 的 ~/.listenflow/audio，精修后不删除，一直留到删除那场会话。关闭后不保存任何原始音频。每一路声音每小时讲话约 115 MB。")
                                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                                AudioUsage()
                                 Text("复用本机模型缓存，模型加载和转写均为离线运行，音频不离开这台 Mac。").font(.caption).foregroundStyle(.secondary)
                             }
                         }.padding(12)
@@ -227,5 +229,22 @@ private struct Flow: Layout {
             }
             y += row.height + spacing
         }
+    }
+}
+
+/// How much disk the saved recordings take, counted when the settings open.
+private struct AudioUsage: View {
+    @State private var bytes: Int?
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Text(bytes.map { "已保存的录音共 " + ByteCountFormatter.string(fromByteCount: Int64($0), countStyle: .file) } ?? "正在统计已保存的录音…")
+            Button("在访达中显示") {
+                try? ListenFlowHome.ensure(AudioStore.root)
+                NSWorkspace.shared.activateFileViewerSelecting([AudioStore.root])
+            }.buttonStyle(.link)
+        }
+        .font(.caption).foregroundStyle(.secondary)
+        .task { bytes = await Task.detached(priority: .utility) { AudioStore.totalBytes() }.value }
     }
 }

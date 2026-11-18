@@ -257,6 +257,16 @@ enum VolcRecording {
     /// Less simultaneous sound than this is a notification, not a conversation.
     static let echoOverlap: TimeInterval = 3
 
+    /// The stretches of speech that no completed refinement has covered. The
+    /// audio is kept afterwards, so without this every later refinement — after
+    /// more was recorded into the session, say — would send the old speech again.
+    static func remaining(_ spans: [String: [AudioSpan]], after done: [String: Int]) -> [String: [AudioSpan]] {
+        spans.reduce(into: [:]) { result, entry in
+            let rest = entry.value.filter { $0.offset >= done[entry.key] ?? 0 }
+            if !rest.isEmpty { result[entry.key] = rest }
+        }
+    }
+
     /// Uploads still to do: a run that was interrupted has already replaced
     /// some stretches, and those are not sent, or paid for, twice.
     static func unfinished(_ lines: [TranscriptLine], source: String, spans: [AudioSpan]) -> Bool {
