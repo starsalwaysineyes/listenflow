@@ -102,11 +102,11 @@ enum Tool {
                 let through = Lstf.clock(organized.through.timeIntervalSince(session.created))
                 if options.json {
                     emit(["session": Lstf.json(item), "organized": organized.text, "through": through,
-                          "linesNotIncluded": session.unorganizedCount])
+                          "linesNotIncluded": session.unorganizedCount, "writtenBy": organized.fromAgent ? "agent" : "app"])
                     return
                 }
                 print((picked.note.map { $0 + "\n" } ?? "") + Lstf.header(item))
-                print("整理稿（AI 整理，覆盖到 \(through)" + (session.unorganizedCount > 0 ? "；之后还有 \(session.unorganizedCount) 行没有纳入" : "") + "）\n")
+                print("整理稿（\(organized.fromAgent ? "agent 通过 lstf 写入" : "听流里的模型整理")，覆盖到 \(through)" + (session.unorganizedCount > 0 ? "；之后还有 \(session.unorganizedCount) 行没有纳入" : "") + "）\n")
                 print(organized.text)
                 return
             }
@@ -185,6 +185,44 @@ enum Tool {
             do { change = try HotwordStore.remove(words) }
             catch { throw LstfError(message: "热词没有保存下来：\(error.localizedDescription)") }
             print(Lstf.hotwordResult(change, adding: false, recording: state?.recording == true))
+
+        case let .writeDraft(selector, file, through, replace):
+            // The text first: a missing file should not depend on what sessions there are.
+            let raw: Data
+            if let file, file != "-" {
+                guard let data = FileManager.default.contents(atPath: (file as NSString).expandingTildeInPath) else {
+                    throw LstfError(message: "读不到文件 \(file)。")
+                }
+                raw = data
+            } else {
+                guard isatty(0) == 0 else {
+                    throw LstfError(message: "整理稿的正文从 --file 或标准输入读取，例如 lstf draft write --file 整理稿.txt。", usage: true)
+                }
+                raw = FileHandle.standardInput.readDataToEndOfFile()
+            }
+            guard let decoded = String(data: raw, encoding: .utf8) else { throw LstfError(message: "整理稿不是 UTF-8 文本。") }
+            guard let text = SessionStore.cleanDraft(decoded) else { throw LstfError(message: "整理稿是空的。") }
+            guard text.count <= SessionStore.draftLimit else {
+                throw LstfError(message: "整理稿太长（\(text.count) 字），上限是 \(SessionStore.draftLimit) 字。")
+            }
+            let picked = try Lstf.resolve(selector, sessions: SessionStore.all(), open: state?.sessionID, running: state != nil)
+            let session = picked.session, short = Lstf.shortID(picked.session.id)
+            let item = info(session, state)
+            if let refining = state?.refining, refining.sessionID == session.id {
+                throw LstfError(message: "会话 \(short) 正在精修，行号会变；完成后重新读一遍再写。")
+            }
+            let count: Int
+            do { count = try SessionStore.draftCoverage(session, through: through, replace: replace, growing: item.recording) }
+            catch { throw LstfError(message: error.localizedDescription) }
+            if state != nil {
+                // The app may have this session open; it writes the draft into its own copy.
+                let answer = try ask(AgentBridge.Request(action: AgentBridge.draft, session: session.id, text: text, through: count, replace: replace))
+                guard answer.ok else { throw LstfError(message: "会话 \(short) 的整理稿没有写入：\(answer.message)") }
+            } else {
+                do { try SessionStore.writeDraft(session.id, text: text, through: count, replace: replace) }
+                catch { throw LstfError(message: "会话 \(short) 的整理稿没有写入：\(error.localizedDescription)") }
+            }
+            print(Lstf.draftWritten(session, count: count, characters: text.count, replaced: session.organized != nil, note: picked.note), terminator: "")
 
         case let .rename(name, selector):
             let picked = try Lstf.resolve(selector, sessions: SessionStore.all(), open: state?.sessionID, running: state != nil)

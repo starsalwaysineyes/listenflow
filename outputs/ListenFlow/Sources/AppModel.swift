@@ -1100,6 +1100,11 @@ final class AppModel: ObservableObject {
     /// from outside.
     private func handle(_ request: AgentBridge.Request) {
         func refuse(_ reason: String) { AgentBridge.respond(to: request, ok: false, reason) }
+        if request.action == AgentBridge.draft {
+            if let problem = writeDraft(request.session, text: request.text ?? "", through: request.through, replace: request.replace == true) { refuse(problem) }
+            else { AgentBridge.respond(to: request, ok: true, "已写入。") }
+            return
+        }
         if request.action == AgentBridge.rename {
             if let problem = renameSession(request.session, to: request.name ?? "") { refuse(problem) }
             else { AgentBridge.respond(to: request, ok: true, "已改名。") }
@@ -1294,7 +1299,7 @@ final class AppModel: ObservableObject {
         // from the earlier draft can be treated as settled.
         let stale = organizationStale
         let existing = stale ? [] : snapshot.organized?.segments ?? []
-        let settled = existing.count > 1 ? Array(existing.dropLast()) : []
+        let settled = Array(existing.prefix(OrganizedTranscript.settledCount(existing)))
         let settledIDs = Set(settled.flatMap(\.sourceLineIDs))
         let settledText = settled.map(\.text).joined(separator: "\n\n")
         let pendingLines = snapshot.lines.filter { !settledIDs.contains($0.id) }
@@ -1447,6 +1452,32 @@ final class AppModel: ObservableObject {
         lastLatency = 0
         error = nil
         notice = nil
+    }
+    /// Takes an organized draft an agent wrote and handed in through `lstf`, in
+    /// place of whatever draft the session had. Returns why it could not, or
+    /// nil when it is done.
+    @discardableResult
+    func writeDraft(_ id: UUID, text raw: String, through: Int?, replace: Bool) -> String? {
+        guard let text = SessionStore.cleanDraft(raw) else { return "整理稿是空的。" }
+        guard text.count <= SessionStore.draftLimit else { return "整理稿太长（\(text.count) 字），上限是 \(SessionStore.draftLimit) 字。" }
+        if id == session.id {
+            if isOrganizing { return "听流正在整理这场会话，等它完成（或用户点「停止」）后再写。" }
+            if isPostRefining { return "这场会话正在精修，行号会变；完成后重新读一遍再写。" }
+            do {
+                let count = try SessionStore.draftCoverage(session, through: through, replace: replace,
+                                                           growing: isRecording || isBusy || pendingCount > 0)
+                session.setDraft(text, through: count, author: OrganizedTranscript.agent)
+            } catch { return error.localizedDescription }
+            persist()
+            notice = "agent 写入了这场会话的整理稿。"
+            return nil
+        }
+        if id == storedRefine?.session.id { return "这场会话正在后台精修，行号会变；完成后重新读一遍再写。" }
+        guard SessionStore.writes else { return "找不到这场会话。" }
+        writer.flush()      // a session left a moment ago may still be on its way to disk
+        do { remember(SessionSummary(try SessionStore.writeDraft(id, text: text, through: through, replace: replace))) }
+        catch { return error.localizedDescription }
+        return nil
     }
     /// Why a session cannot be deleted at the moment; nil when it can.
     func deleteBlocker(_ id: UUID) -> String? {

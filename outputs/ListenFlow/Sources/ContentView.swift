@@ -842,8 +842,8 @@ private struct DraftPage: View {
 
     private var status: String {
         guard let organized = model.session.organized else { return "用设置里的大模型把零碎的话连成文章；自动更新约每 30 秒一次" }
-        var parts = [organized.sourceLineIDs.isEmpty ? "已整理图片资料"
-                     : "已整理到 \(SessionStore.timestamp(organized.through, relativeTo: model.session.created))"]
+        var parts = [organized.sourceLineIDs.isEmpty ? (organized.fromAgent ? "agent 写入" : "已整理图片资料")
+                     : (organized.fromAgent ? "agent 写入，" : "") + "已整理到 \(SessionStore.timestamp(organized.through, relativeTo: model.session.created))"]
         if model.session.unorganizedCount > 0 { parts.append("之后还有 \(model.session.unorganizedCount) 句") }
         if let count = organized.imageIDs?.count, count > 0 { parts.append("参考了 \(count) 张图") }
         if model.organizationImagesChanged { parts.append("图片选择变了") }
@@ -875,7 +875,7 @@ private struct DraftPage: View {
             .padding(.horizontal, 28).padding(.vertical, 12)
             Rectangle().fill(Palette.hairline).frame(height: 1)
             DraftDocument(preview: model.organizationPreview, savedText: model.session.organized?.text ?? "",
-                          isGenerating: model.isOrganizing)
+                          isGenerating: model.isOrganizing, fromAgent: model.session.organized?.fromAgent == true)
         }
     }
 }
@@ -884,6 +884,7 @@ private struct DraftDocument: View {
     @ObservedObject var preview: OrganizationPreview
     let savedText: String
     let isGenerating: Bool
+    var fromAgent = false
     var body: some View {
         let text = isGenerating && !preview.text.isEmpty ? preview.text : savedText
         if text.isEmpty {
@@ -898,7 +899,8 @@ private struct DraftDocument: View {
         } else {
             VStack(alignment: .leading, spacing: 0) {
                 DocumentTextView(text: text).frame(maxWidth: .infinity, maxHeight: .infinity)
-                Text(isGenerating ? "生成中，完成后自动保存" : "AI 整理稿，拿不准的地方请对照原始转写")
+                Text(isGenerating ? "生成中，完成后自动保存"
+                     : fromAgent ? "agent 通过 lstf 写入的整理稿，拿不准的地方请对照原始转写" : "AI 整理稿，拿不准的地方请对照原始转写")
                     .font(.system(size: 10)).foregroundStyle(Palette.muted)
                     .padding(.leading, 28 + RowMetrics.textInset).padding(.vertical, 9)
             }

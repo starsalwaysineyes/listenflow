@@ -338,12 +338,25 @@ struct OrganizedSegment: Codable, Identifiable {
     var sourceLineIDs: [UUID]
     var started: Date
     var through: Date
+    /// Who wrote it, when it was not the app's own model: "agent" for a draft
+    /// handed in through `lstf`. The app never re-sends such a stretch.
+    var author: String? = nil
 }
 
 struct OrganizedTranscript: Codable {
     var generatedAt: Date
     var segments: [OrganizedSegment]
     var imageIDs: [UUID]?
+
+    static let agent = "agent"
+    /// Some or all of it was written by an agent through `lstf`.
+    var fromAgent: Bool { segments.contains { $0.author != nil } }
+    /// How many leading segments an update leaves alone. The app redoes its own
+    /// last batch together with the new lines, so the seam re-flows; what an
+    /// agent wrote is not the app's to redo, nor anything before it.
+    static func settledCount(_ segments: [OrganizedSegment]) -> Int {
+        max(segments.count - 1, (segments.lastIndex { $0.author != nil } ?? -1) + 1, 0)
+    }
 
     var text: String { segments.map(\.text).joined(separator: "\n\n") }
     var sourceLineIDs: [UUID] { segments.flatMap(\.sourceLineIDs) }
@@ -412,6 +425,14 @@ struct MeetingSession: Codable, Identifiable {
     /// recorded and when. Such a title is shown whole and never replaced.
     var renamed: Bool?
     var imageLibrary: [ImageAttachment] { images ?? [] }
+    /// Puts a draft written outside the app in place of whatever draft there
+    /// was. It stands for the first `count` lines; later ones stay unorganized.
+    mutating func setDraft(_ text: String, through count: Int, author: String, now: Date = Date()) {
+        let covered = lines.prefix(max(0, count))
+        organized = OrganizedTranscript(generatedAt: now, segments: [
+            OrganizedSegment(text: text, sourceLineIDs: covered.map(\.id), started: covered.first?.start ?? created,
+                             through: covered.map(\.end).max() ?? created, author: author)], imageIDs: nil)
+    }
     /// What the session is called where its date is shown beside it anyway.
     var name: String { SessionStore.name(title: title, renamed: renamed == true) }
     var unorganizedCount: Int {
@@ -622,6 +643,41 @@ enum SessionStore {
         try save(session)
         return session
     }
+    static let draftLimit = 300_000
+    /// A draft as it will be stored; nil when nothing is left of it.
+    static func cleanDraft(_ raw: String) -> String? {
+        let text = raw.replacingOccurrences(of: "\r\n", with: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        return text.isEmpty ? nil : text
+    }
+    /// How many lines a draft handed in from outside stands for, or why it
+    /// cannot be taken. A draft that exists is only replaced when asked to be;
+    /// while lines are still arriving the writer has to say how far it read.
+    static func draftCoverage(_ session: MeetingSession, through: Int?, replace: Bool, growing: Bool) throws -> Int {
+        if session.organized != nil && !replace {
+            throw CaptureFailure.message("这场会话已经有整理稿。先读它（lstf read \(session.id.uuidString.prefix(8)) --organized）；确实要换成新的一版，加 --replace。")
+        }
+        if let through {
+            guard through >= 0, through <= session.lines.count, through > 0 || session.lines.isEmpty else {
+                throw CaptureFailure.message("这场会话有 \(session.lines.count) 行，--through 不能是 \(through)。")
+            }
+            return through
+        }
+        if growing {
+            throw CaptureFailure.message("这场会话还在录制，行数在增加：用 --through N 说明这份整理稿覆盖到第几行（你读到的最后一行）。")
+        }
+        return session.lines.count
+    }
+    /// Writes a draft into a session that is on disk and that nothing has open.
+    @discardableResult
+    static func writeDraft(_ id: UUID, text: String, through: Int?, replace: Bool) throws -> MeetingSession {
+        guard let text = cleanDraft(text) else { throw CaptureFailure.message("整理稿是空的。") }
+        guard text.count <= draftLimit else { throw CaptureFailure.message("整理稿太长（\(text.count) 字），上限是 \(draftLimit) 字。") }
+        guard var session = load(id) else { throw CaptureFailure.message("找不到这场会话，或它的文件读不出来。") }
+        let count = try draftCoverage(session, through: through, replace: replace, growing: false)
+        session.setDraft(text, through: count, author: OrganizedTranscript.agent)
+        try save(session)
+        return session
+    }
     /// Takes a session off the disk: its file, then its pictures. `remove` says
     /// how — the app moves them to the Trash. Kept audio is not touched here.
     /// A session that is not there is not an error.
@@ -664,7 +720,7 @@ enum SessionStore {
         if let organized = session.organized {
             let scope = organized.sourceLineIDs.isEmpty ? "图片资料" : "截至 \(timestamp(organized.through, relativeTo: session.created))"
             let labels = session.imageLibrary.filter { organized.imageIDs?.contains($0.id) == true }.map(\.label).joined(separator: "、")
-            result += "## 整理稿\n\n整理范围：\(scope)\(labels.isEmpty ? "" : "；参考图片：" + labels)；AI 整理，请对照原文核实。\n\n\(organized.text)\n\n"
+            result += "## 整理稿\n\n整理范围：\(scope)\(labels.isEmpty ? "" : "；参考图片：" + labels)；\(organized.fromAgent ? "agent 通过 lstf 写入" : "AI 整理")，请对照原文核实。\n\n\(organized.text)\n\n"
             if session.unorganizedCount > 0 { result += "另有 \(session.unorganizedCount) 段原始转写尚未纳入整理稿。\n\n" }
         }
         result += "## 原始转写\n\n\(transcript(session))\n\n"

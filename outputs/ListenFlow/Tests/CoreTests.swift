@@ -928,7 +928,7 @@ enum CaptureFailure: LocalizedError {
             precondition(Lstf.renamed(named.id, from: "全局声音 · Nov 18", to: "周会", note: nil) == "会话 \(short) 已改名：「全局声音 · Nov 18」→「周会」\n"
                          && Lstf.renamed(named.id, from: "周会", to: "周会", note: "听流没有在运行，这里是最近的一场。")
                             == "听流没有在运行，这里是最近的一场。\n会话 \(short) 本来就叫「周会」。\n")
-            precondition(Lstf.help.contains("lstf rename 新名字 [--session 会话]") && Lstf.help.contains("能改动的只有三件事"))
+            precondition(Lstf.help.contains("lstf rename 新名字 [--session 会话]"))
             precondition(Lstf.listRow(Lstf.Info(session: stored!, keptSeconds: 0, localAudio: false, open: false, recording: false, refining: nil)).contains("「需求评审 · 第二场」"))
         }
 
@@ -983,6 +983,91 @@ enum CaptureFailure: LocalizedError {
         print("PASS: recording refinement (span index, upload planning and cutting, clock mapping, WAV, request, replacement guards, paragraphs, when to cut on pauses), kept speech store, key file")
         print("PASS: lstf (arguments, choosing a session, paging, output, search), app/tool request files, refinement applied to a stored session")
         print("PASS: session list summaries, saving off the main thread, paragraphs on the page, screenshots kept by time and shown to lstf, hot word file and lstf hotword, console tables, kept-audio files held open")
+        // --- 0.11.3: an agent hands in the organized draft ---
+        do {
+            let draftRoot = FileManager.default.temporaryDirectory.appendingPathComponent("lf-draft-\(UUID().uuidString)")
+            defer { try? FileManager.default.removeItem(at: draftRoot) }
+            SessionStore.folderOverride = draftRoot.appendingPathComponent("Sessions")
+            defer { SessionStore.folderOverride = nil }
+            let began = Date(timeIntervalSince1970: 1_800_000_000)
+            var talk = MeetingSession(title: "全局声音 · 合成", created: began)
+            talk.lines = (0..<5).map { TranscriptLine(start: began.addingTimeInterval(Double($0) * 10 + 2), end: began.addingTimeInterval(Double($0) * 10 + 8),
+                                                      source: $0 % 2 == 0 ? "电脑声音" : "麦克风", text: "第 \($0 + 1) 句", latency: 1) }
+            try SessionStore.save(talk)
+
+            precondition(SessionStore.cleanDraft(" \r\n  第一段\r\n\r\n第二段 \n\n") == "第一段\n\n第二段" && SessionStore.cleanDraft(" \n ") == nil)
+            // How far a draft reaches.
+            let wholeReach = try SessionStore.draftCoverage(talk, through: nil, replace: false, growing: false)
+            let partReach = try SessionStore.draftCoverage(talk, through: 3, replace: false, growing: true)
+            precondition(wholeReach == 5 && partReach == 3, "A finished session: all of it; otherwise as far as the writer says")
+            for (through, growing) in [(Int?.none, true), (6, false), (0, false), (-1, false)] {
+                var refused = false
+                do { _ = try SessionStore.draftCoverage(talk, through: through, replace: false, growing: growing) } catch { refused = true }
+                precondition(refused, "through \(String(describing: through)), growing \(growing): while lines arrive the writer says how far it read, and never past the end")
+            }
+            let noLines = try SessionStore.draftCoverage(MeetingSession(), through: 0, replace: false, growing: false)
+            precondition(noLines == 0, "Pictures only: no lines to stand for")
+
+            // Written into a stored session.
+            let first = try SessionStore.writeDraft(talk.id, text: "\n[00:02] [电脑声音] 整理后的第一段。\n\n[00:12] [麦克风] 第二段。\n", through: 3, replace: false)
+            let onDisk = SessionStore.load(talk.id)!
+            precondition(first.organized?.text == "[00:02] [电脑声音] 整理后的第一段。\n\n[00:12] [麦克风] 第二段。" && onDisk.organized?.text == first.organized?.text)
+            precondition(onDisk.organized?.fromAgent == true && onDisk.organized?.segments.count == 1 && onDisk.organized?.segments[0].author == "agent"
+                         && onDisk.organized?.sourceLineIDs == Array(talk.lines.prefix(3).map(\.id)) && onDisk.organized?.through == talk.lines[2].end
+                         && onDisk.unorganizedCount == 2, "It stands for the lines it was written from; the rest are still to do")
+            precondition(onDisk.lines.map(\.text) == talk.lines.map(\.text) && onDisk.title == talk.title && onDisk.renamed == nil, "The transcript is not touched")
+            precondition(SessionStore.summaries().first?.hasDraft == true)
+            var guarded = ""
+            do { try SessionStore.writeDraft(talk.id, text: "另一版", through: nil, replace: false) } catch { guarded = error.localizedDescription }
+            precondition(guarded.contains("--replace") && guarded.contains("--organized") && SessionStore.load(talk.id)?.organized?.text == first.organized?.text,
+                         "A draft that is there is only replaced when asked to be")
+            let second = try SessionStore.writeDraft(talk.id, text: "新的一版", through: nil, replace: true)
+            precondition(second.organized?.text == "新的一版" && second.unorganizedCount == 0 && SessionStore.load(talk.id)?.organized?.segments.count == 1)
+            var emptyRefused = false, hugeRefused = false, missingRefused = false
+            do { try SessionStore.writeDraft(talk.id, text: " \n", through: nil, replace: true) } catch { emptyRefused = true }
+            do { try SessionStore.writeDraft(talk.id, text: String(repeating: "字", count: SessionStore.draftLimit + 1), through: nil, replace: true) } catch { hugeRefused = true }
+            do { try SessionStore.writeDraft(UUID(), text: "稿", through: nil, replace: true) } catch { missingRefused = true }
+            precondition(emptyRefused && hugeRefused && missingRefused && SessionStore.load(talk.id)?.organized?.text == "新的一版")
+            precondition(SessionStore.markdown(SessionStore.load(talk.id)!).contains("agent 通过 lstf 写入，请对照原文核实"))
+
+            // What the app redoes when the user asks it to update the draft.
+            func segment(_ author: String?) -> OrganizedSegment {
+                OrganizedSegment(text: "段", sourceLineIDs: [], started: began, through: began, author: author)
+            }
+            precondition(OrganizedTranscript.settledCount([]) == 0 && OrganizedTranscript.settledCount([segment(nil)]) == 0
+                         && OrganizedTranscript.settledCount([segment(nil), segment(nil), segment(nil)]) == 2, "The app redoes its own last batch")
+            precondition(OrganizedTranscript.settledCount([segment("agent")]) == 1 && OrganizedTranscript.settledCount([segment(nil), segment("agent")]) == 2
+                         && OrganizedTranscript.settledCount([segment("agent"), segment(nil)]) == 1
+                         && OrganizedTranscript.settledCount([segment("agent"), segment(nil), segment(nil)]) == 2, "What an agent wrote is never re-sent")
+            let legacy = try JSONDecoder().decode(OrganizedSegment.self, from: Data(#"{"id":"\#(UUID().uuidString)","text":"旧","sourceLineIDs":[],"started":0,"through":0}"#.utf8))
+            precondition(legacy.author == nil && !OrganizedTranscript(generatedAt: began, segments: [legacy], imageIDs: nil).fromAgent, "Drafts from before read as the app's own")
+
+            // The command and the request.
+            let parsedDrafts = try [["draft", "write"], ["draft", "write", "3F2A91BC", "--file", "稿.txt", "--through", "40", "--replace"],
+                                    ["draft", "write", "--file", "-", "latest"]].map(Lstf.parse)
+            precondition(parsedDrafts == [.writeDraft(session: nil, file: nil, through: nil, replace: false),
+                                          .writeDraft(session: "3F2A91BC", file: "稿.txt", through: 40, replace: true),
+                                          .writeDraft(session: "latest", file: "-", through: nil, replace: false)])
+            for wrong in [["draft"], ["draft", "read"], ["draft", "write", "a", "b"], ["draft", "write", "--through", "x"], ["draft", "write", "--json"], ["draft", "write", "--file"]] {
+                var usage = false
+                do { _ = try Lstf.parse(wrong) } catch let error as LstfError { usage = error.usage }
+                precondition(usage, "\(wrong) is a mistake in the command")
+            }
+            let asked = AgentBridge.Request(action: AgentBridge.draft, session: talk.id, text: "稿", through: 3, replace: true)
+            try AgentBridge.submit(asked)
+            let queued = AgentBridge.pending()
+            precondition(queued.count == 1 && queued[0].action == "draft" && queued[0].text == "稿" && queued[0].through == 3 && queued[0].replace == true)
+            AgentBridge.cancel(asked)
+            let short = Lstf.shortID(talk.id)
+            precondition(Lstf.draftWritten(talk, count: 3, characters: 120, replaced: false, note: nil)
+                         == "会话 \(short) 的整理稿已写入：120 字，覆盖第 1–3 行（到 00:28）。之后还有 2 行没有纳入。\n用户在听流的「整理稿」页里能看到。读回：lstf read \(short) --organized\n")
+            precondition(Lstf.draftWritten(talk, count: 5, characters: 9, replaced: true, note: "听流没有在运行，这里是最近的一场。")
+                         == "听流没有在运行，这里是最近的一场。\n会话 \(short) 的整理稿已写入：9 字，覆盖第 1–5 行（到 00:48）。替换了原有的整理稿。\n用户在听流的「整理稿」页里能看到。读回：lstf read \(short) --organized\n")
+            precondition(Lstf.help.contains("lstf draft write [会话] [--file 路径] [--through N] [--replace]") && Lstf.help.contains("能改动的只有四件事")
+                         && Lstf.help.contains("这是全文整理，不是摘要"))
+        }
+
+        print("PASS: a draft handed in by an agent (how far it reaches, replacing only when asked, what the app leaves alone on update), lstf draft write")
         print("PASS: deleting a session (its file and pictures, nothing else; refused when it cannot be moved away; not from lstf)")
         print("PASS: naming a session (clean names, the stored file, the list, the export), lstf rename (arguments, the request, output)")
         print("PASS: pause-aware chunking under noise, forced-cut flags, settings migration, refinement windows/guards/merge, echo filter, private audio store round trip")
