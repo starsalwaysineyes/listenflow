@@ -128,6 +128,12 @@ struct ListenFlowApp: App {
         Button(model.isRecording ? "暂停转写（⌥⌘R）" : "开始转写（⌥⌘R）") {
             Task { await model.toggleRecording() }
         }.disabled(!model.canToggleRecording)
+        // Everything-at-once only: the one case where the microphone is on without being asked for.
+        if (model.isRecording ? model.activeSource : model.source) == .all {
+            let on = model.isRecording ? model.micEnabled : !model.micMuted
+            Button(on ? "关闭麦克风（只录电脑声音）" : "打开麦克风") { Task { await model.toggleMic(!on) } }
+                .disabled(model.isBusy || model.micBusy)
+        }
         Button("截屏，存进这场会话（⇧⌘J）") { model.captureScreenshot() }
             .disabled(model.isCapturingShot)
         Button("打开听流窗口") { model.showMainWindow() }

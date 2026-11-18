@@ -1,11 +1,11 @@
 import SwiftUI
 import AppKit
 
-/// Colours that follow the system appearance, after the Codex and Claude
-/// desktop apps: a white page and neutral ink, as Codex has them, and one
-/// colour, Claude's clay, for the user's own side — what the microphone hears —
-/// and the controls that are on. What the Mac plays stays in ink. Red is kept
-/// for recording.
+/// Colours that follow the system appearance. The surfaces are the Codex
+/// desktop app's: white all over, neutral ink, filled buttons in ink. Two
+/// colours carry meaning and are used everywhere the same way — teal for what
+/// the Mac plays and for the app's own controls, clay for the user's own side,
+/// what the microphone hears. Red is kept for recording.
 enum Palette {
     private static func rgb(_ hex: UInt32, _ alpha: CGFloat = 1) -> NSColor {
         NSColor(srgbRed: CGFloat((hex >> 16) & 0xFF) / 255, green: CGFloat((hex >> 8) & 0xFF) / 255,
@@ -18,7 +18,8 @@ enum Palette {
         Color(nsColor: dynamicNS(light, dark, alpha: alpha))
     }
     static let page = dynamic(0xFFFFFF, 0x212121)
-    static let rail = dynamic(0xF7F7F7, 0x181818)
+    /// The list of sessions: the same white as the page in the light appearance, a line between them.
+    static let rail = dynamic(0xFFFFFF, 0x181818)
     /// What should stand out from the page it sits on: the chosen tab, a card, a menu button.
     static let raised = dynamic(0xFFFFFF, 0x303030)
     static let inkNS = dynamicNS(0x0D0D0D, 0xF7F7F7)
@@ -28,14 +29,13 @@ enum Palette {
     static let hairline = dynamic(0x000000, 0xFFFFFF, alpha: (0.10, 0.14))
     /// Behind the chosen row, a key cap, a round button: a little ink, no colour.
     static let wash = dynamic(0x000000, 0xFFFFFF, alpha: (0.06, 0.10))
-    static let accent = dynamic(0xC15F3C, 0xD97757)
-    /// What the Mac plays.
-    static let stream = dynamic(0x6B6B6B, 0xA8A8A8)
+    /// What the Mac plays, and the app's own controls.
+    static let stream = dynamic(0x0B7468, 0x5FD0BF)
+    static let accent = stream
     /// What the microphone hears: the user's own side.
-    static let voice = accent
+    static let voice = dynamic(0xC15F3C, 0xD97757)
     static let live = dynamic(0xCC3A33, 0xEB5E55)
     static let warning = dynamic(0x875A08, 0xDA9E25)
-    static let ok = dynamic(0x2F7613, 0x65BB30)
     static func source(_ name: String) -> Color { name == EchoFilter.micSource ? voice : stream }
 }
 
@@ -282,7 +282,7 @@ struct ContentView: View {
             banner(error, icon: "exclamationmark.triangle.fill", color: Palette.warning) { model.error = nil }
         }
         if let notice = model.notice {
-            banner(notice, icon: "checkmark.circle.fill", color: Palette.ok) { model.notice = nil }
+            banner(notice, icon: "checkmark.circle.fill", color: Palette.stream) { model.notice = nil }
         }
     }
 
@@ -332,14 +332,14 @@ struct ContentView: View {
             HStack(spacing: 7) {
                 ProgressView(value: Double(model.postRefineDone), total: Double(max(model.postRefineTotal, 1)))
                     .frame(width: 70).controlSize(.small)
-                Text("精修 \(model.postRefineDone)/\(model.postRefineTotal)").font(.system(size: 11)).foregroundStyle(Palette.muted)
+                Text("精修 \(model.postRefineDone)/\(model.postRefineTotal)").font(.system(size: 11)).foregroundStyle(Palette.stream)
                     .monospacedDigit()
                 Button("停止") { model.cancelRefineSession() }.font(.system(size: 11))
             }
         } else if model.canRefineSession {
             Button { model.refineSession() } label: {
                 Label("精修全文", systemImage: "wand.and.stars").font(.system(size: 12, weight: .medium))
-            }.buttonStyle(.plain).foregroundStyle(Palette.ink)
+            }.buttonStyle(.plain).foregroundStyle(Palette.stream)
                 .help(model.usesCloud
                       ? "把本机保存的、还没精修的约 \(Int((model.keptStreamSeconds / 60).rounded(.up))) 分钟录音上传到豆包录音文件识别，重新识别全文，更准确；按音频时长另外计费。录音精修后仍保留在本机"
                       : "用保存的录音，以约 30 秒为一段重新识别全文，更准确。录音精修后仍保留在本机")
@@ -559,7 +559,7 @@ private struct EngineFooter: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 7) {
-                Circle().fill(model.engineReady ? Palette.ok : Palette.warning).frame(width: 6, height: 6)
+                Circle().fill(model.engineReady ? Palette.stream : Palette.warning).frame(width: 6, height: 6)
                 Text(model.engineStatus).font(.system(size: 11, weight: .medium)).lineLimit(1)
             }
             if model.usesCloud {
@@ -640,7 +640,10 @@ private struct Transport: View {
             .onChange(of: model.session.id) { renaming = false }
             .onChange(of: model.renameToken) { renaming = true }
             Spacer(minLength: 10)
-            if model.isRecording { liveControls } else { sourceMenu }
+            if model.isRecording { liveControls } else {
+                if model.source == .all { micSwitch(on: !model.micMuted, recording: false) }
+                sourceMenu
+            }
             recordButton
         }
         .padding(.horizontal, 28).padding(.top, 16).padding(.bottom, 14)
@@ -664,7 +667,7 @@ private struct Transport: View {
             let last = model.session.lines.map(\.end).max() ?? model.session.created
             Text("\(Format.day(model.session.created)) \(Format.time(model.session.created)) 开始，\(Format.length(last.timeIntervalSince(model.session.created)))")
         } else {
-            Text(model.source.detail)
+            Text(model.source == .all && model.micMuted ? "只录电脑上的声音，这一场先不录麦克风" : model.source.detail)
         }
     }
 
@@ -725,17 +728,28 @@ private struct Transport: View {
             if model.activeSource != .microphone {
                 // With speakers the microphone re-records the Mac's own sound; those
                 // repeated lines are dropped (EchoFilter), so the switch is safe to use.
-                Button { Task { await model.toggleMic(!model.micEnabled) } } label: {
-                    Image(systemName: model.micEnabled ? "mic.fill" : "mic.slash")
-                        .font(.system(size: 13)).frame(width: 30, height: 30)
-                        .foregroundStyle(model.micEnabled ? Palette.voice : Palette.muted)
-                        .background(Palette.wash, in: Circle())
-                }
-                .buttonStyle(.plain).disabled(model.isBusy || model.micBusy)
-                .help(model.micEnabled ? "麦克风在录。外放时录到的电脑声音会自动去掉，你自己的话照常保留。点一下关闭麦克风"
-                                       : "麦克风没有在录。点一下打开")
+                micSwitch(on: model.micEnabled, recording: true)
             }
         }
+    }
+
+    /// The microphone, on or off. Before the start it says what the start will
+    /// do; switched off with everything-at-once chosen, it stays off across a pause.
+    private func micSwitch(on: Bool, recording: Bool) -> some View {
+        Button { Task { await model.toggleMic(!on) } } label: {
+            Image(systemName: on ? "mic.fill" : "mic.slash")
+                .font(.system(size: 13)).frame(width: recording ? 30 : 34, height: recording ? 30 : 34)
+                .foregroundStyle(on ? Palette.voice : Palette.muted)
+                .background(Palette.wash, in: Circle())
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain).disabled(model.isBusy || model.micBusy)
+        .help(recording
+              ? (on ? "麦克风在录。外放时录到的电脑声音会自动去掉，你自己的话照常保留。点一下关闭麦克风"
+                    : "麦克风没有在录。点一下打开")
+              : (on ? "开始转写后，麦克风和电脑上的声音一起录。点一下，这一场先不录麦克风"
+                    : "这一场不录麦克风，只转写电脑上的声音。点一下恢复"))
+        .accessibilityLabel(on ? "麦克风：开" : "麦克风：关")
     }
 
     private var recordButton: some View {
@@ -1026,7 +1040,8 @@ private struct EmptyTranscript: View {
         }
         let place = cloud ? "音频发送到火山引擎豆包识别；可以在设置里换成本地模型。" : "音频在这台 Mac 上识别。"
         switch model.source {
-        case .all: return "点「开始转写」，电脑上所有 App 的声音和麦克风一起转成文字。\n" + place
+        case .all: return (model.micMuted ? "点「开始转写」，电脑上所有 App 的声音转成文字；麦克风这一场先关着。\n"
+                                          : "点「开始转写」，电脑上所有 App 的声音和麦克风一起转成文字。\n") + place
         case .microphone: return "点「开始转写」，只听这台 Mac 的麦克风，适合线下课堂和线下会议。\n" + place
         case .app: return "在右上角选好一个 App，再点「开始转写」，只听它的声音。\n" + place
         }
@@ -1092,7 +1107,7 @@ private struct DraftPage: View {
                 HStack(spacing: 12) {
                     if model.isOrganizing {
                         ProgressView().controlSize(.small)
-                        Text("正在整理").font(.system(size: 12)).foregroundStyle(Palette.muted)
+                        Text("正在整理").font(.system(size: 12)).foregroundStyle(Palette.stream)
                         Button("停止") { model.cancelOrganization() }.controlSize(.small)
                     } else {
                         Button(model.session.organized == nil ? "整理这场会话" : "更新整理稿") { model.organize() }

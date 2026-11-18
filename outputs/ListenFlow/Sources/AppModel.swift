@@ -95,6 +95,10 @@ final class AppModel: ObservableObject {
     @Published var isBusy = false
     @Published var micEnabled = false
     @Published var micBusy = false
+    /// With everything-at-once chosen, the user switched the microphone off: it
+    /// stays off across a pause, until they switch it on, the session changes
+    /// or the app is opened again. Never saved.
+    @Published var micMuted = false
     @Published var modelReady = false
     @Published var modelLoading = false
     @Published var modelStatus = "模型尚未加载"
@@ -535,7 +539,7 @@ final class AppModel: ObservableObject {
         // running. Without it (no permission, no input device) the session
         // carries on with what the Mac plays, and says why. Still busy, so a
         // stop cannot slip in while the permission prompt is up.
-        if isRecording && source == .all {
+        if isRecording && source == .all && !micMuted {
             await setMic(true)
             if !micEnabled, let reason = error { error = "麦克风没有打开，目前只在转写电脑上的声音。\(reason)" }
         }
@@ -559,7 +563,13 @@ final class AppModel: ObservableObject {
     }
 
     func toggleMic(_ value: Bool) async {
-        guard isRecording, !isBusy, !micBusy else { return }
+        guard !isBusy, !micBusy else { return }
+        guard isRecording else {
+            // Before the start, or during a pause: only what the next start will do.
+            if source == .all { micMuted = !value }
+            return
+        }
+        if activeSource == .all { micMuted = !value }
         await setMic(value)
     }
 
@@ -1454,6 +1464,7 @@ final class AppModel: ObservableObject {
     }
     private func startFresh() {
         session = MeetingSession()
+        micMuted = false
         keptStreamSeconds = 0
         savedStreamSeconds = 0
         echoDropped = 0
@@ -1475,6 +1486,7 @@ final class AppModel: ObservableObject {
             return
         }
         session = value
+        micMuted = false
         keptStreamSeconds = 0
         refreshKeptAudio()
         echoDropped = 0
@@ -1933,7 +1945,9 @@ extension AppModel {
         showOrganized = false
 
         session = MeetingSession()
+        micMuted = true                 // the switch as it looks off, before a start
         main("main-empty")
+        micMuted = false
         session = fixture
 
         for engine in RecognitionEngine.allCases {
