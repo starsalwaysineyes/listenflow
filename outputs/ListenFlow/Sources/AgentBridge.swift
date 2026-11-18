@@ -3,8 +3,9 @@ import Foundation
 /// What the `lstf` command line tool and the app tell each other, through small
 /// files beside the sessions. The tool reads sessions straight from disk — the
 /// app saves after every settled sentence — so the only things it ever asks the
-/// app to do are start a refinement, rename a session and take a draft the
-/// agent wrote. While it runs, the app stays the one writer of sessions.
+/// app to do are start a refinement, rename a session, take a draft the agent
+/// wrote, and make or fill a group. While it runs, the app stays the one
+/// writer of sessions.
 enum AgentBridge {
     struct Refining: Codable, Equatable {
         var sessionID: UUID
@@ -35,7 +36,8 @@ enum AgentBridge {
         var action: String
         var session: UUID
         var created = Date()
-        /// For `rename`: what to call the session.
+        /// For `rename`: what to call the session. For the group requests: the
+        /// group's name; absent on `groupMove`, the session leaves its group.
         var name: String?
         /// For `draft`: the organized text, how many lines it stands for, and
         /// whether it may take the place of a draft that is already there.
@@ -51,6 +53,8 @@ enum AgentBridge {
     static let refine = "refine"
     static let rename = "rename"
     static let draft = "draft"
+    static let groupCreate = "group-create"
+    static let groupMove = "group-move"
     /// A request nobody picked up within this long was made while the app was away.
     static let requestLifetime: TimeInterval = 30
 

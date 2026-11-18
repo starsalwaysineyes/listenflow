@@ -489,6 +489,18 @@ struct SessionSummary: Identifiable, Equatable, Decodable {
     }
 }
 
+/// How wide the list of sessions may be. It can be dragged, but never so far
+/// that the transcript beside it has no room to be read.
+enum RailWidth {
+    static let standard: Double = 236
+    static let narrowest: Double = 190
+    static let widestEver: Double = 520
+    /// The transcript column keeps at least this much.
+    static let transcript: Double = 520
+    static func widest(inWindow width: Double) -> Double { max(narrowest, min(widestEver, width - transcript)) }
+    static func clamp(_ width: Double, widest: Double) -> Double { min(max(width, narrowest), max(narrowest, widest)) }
+}
+
 /// The groups down the side of the window: each one a name and the sessions
 /// filed under it. Every session is also in the list of recent ones below,
 /// so filing a session away never hides it.
@@ -500,14 +512,57 @@ struct SessionGroup: Identifiable, Equatable {
 enum SessionGroups {
     /// A group shows this many sessions until it is asked to show them all.
     static let shown = 5
-    /// `rows` newest first; so are the sessions inside each group. The groups
-    /// themselves are in name order, so each stays where it was when a new
-    /// session is recorded into another.
-    static func groups(_ rows: [SessionSummary]) -> [SessionGroup] {
+    /// `rows` newest first; so are the sessions inside each group. `names` are
+    /// the groups that were made, which may hold nothing yet. The groups are in
+    /// name order, so each stays where it was when a new session is recorded
+    /// into another.
+    static func groups(_ rows: [SessionSummary], names: [String] = []) -> [SessionGroup] {
         var byName: [String: [SessionSummary]] = [:]
+        for name in names { byName[name] = [] }
         for row in rows { if let name = row.group { byName[name, default: []].append(row) } }
         return byName.map { SessionGroup(name: $0.key, sessions: $0.value) }
             .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+    }
+}
+
+/// The groups that were made, by name, in `groups.json` beside the sessions.
+/// A session says which group it is in; this file is what lets a group exist
+/// before it has a session and after its last one has left.
+enum GroupStore {
+    static var file: URL { SessionStore.folder.deletingLastPathComponent().appendingPathComponent("groups.json") }
+    static func clean(_ raw: String) -> String? { SessionStore.cleanName(raw, limit: SessionStore.groupLimit) }
+    static func load() -> [String] {
+        (try? Data(contentsOf: file)).flatMap { try? JSONDecoder().decode([String].self, from: $0) } ?? []
+    }
+    static func save(_ names: [String]) throws {
+        var seen = Set<String>()
+        let unique = names.filter { seen.insert($0).inserted }.sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+        try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true,
+                                               attributes: [.posixPermissions: 0o700])
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .withoutEscapingSlashes]
+        try encoder.encode(unique).write(to: file, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+    }
+    /// Every group there is: the ones made, and any a session names that the
+    /// file does not know of (groups from 0.12.0, or a session put back from the Trash).
+    static func names(sessions: [String?]) -> [String] {
+        var seen = Set<String>()
+        return (load() + sessions.compactMap { $0 }).filter { seen.insert($0).inserted }
+            .sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+    }
+    /// True when the group is new.
+    @discardableResult
+    static func add(_ name: String) throws -> Bool {
+        var names = load()
+        guard !names.contains(name) else { return false }
+        names.append(name)
+        try save(names)
+        return true
+    }
+    static func remove(_ name: String) throws {
+        let names = load()
+        if names.contains(name) { try save(names.filter { $0 != name }) }
     }
 }
 

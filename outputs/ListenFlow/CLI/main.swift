@@ -86,12 +86,13 @@ enum Tool {
         case let .list(limit, group, json):
             var sessions = SessionStore.all()
             if let group {
-                let names = Set(sessions.compactMap(\.group))
+                let names = GroupStore.names(sessions: sessions.map(\.group))
                 sessions = sessions.filter { $0.group == group }
-                if sessions.isEmpty {
-                    throw LstfError(message: names.isEmpty ? "还没有任何分组。分组由用户在听流的会话列表里建。"
-                                    : "没有叫「\(group)」的分组。现有的分组：\(names.sorted().map { "「\($0)」" }.joined(separator: "、"))")
+                guard names.contains(group) else {
+                    throw LstfError(message: names.isEmpty ? "还没有任何分组。新建：lstf group create 分组名"
+                                    : "没有叫「\(group)」的分组。现有的分组：\(names.map { "「\($0)」" }.joined(separator: "、"))")
                 }
+                if sessions.isEmpty && !json { print("分组「\(group)」里还没有会话。"); return }
             }
             let shown = sessions.prefix(limit).map { info($0, state) }
             if json { emit(["total": sessions.count, "sessions": shown.map(Lstf.json)]); return }
@@ -231,6 +232,48 @@ enum Tool {
                 catch { throw LstfError(message: "会话 \(short) 的整理稿没有写入：\(error.localizedDescription)") }
             }
             print(Lstf.draftWritten(session, count: count, characters: text.count, replaced: session.organized != nil, note: picked.note), terminator: "")
+
+        case let .groups(json):
+            let sessions = SessionStore.all()
+            let groups = SessionGroups.groups(sessions.map(SessionSummary.init), names: GroupStore.names(sessions: sessions.map(\.group)))
+            if json { emit(["groups": groups.map(Lstf.json)]); return }
+            print(Lstf.groupList(groups), terminator: "")
+
+        case let .createGroup(name):
+            let existed = GroupStore.names(sessions: SessionStore.all().map(\.group)).contains(name)
+            if !existed {
+                if state != nil {
+                    // The app keeps the list of groups while it runs, and shows the new one at once.
+                    let answer = try ask(AgentBridge.Request(action: AgentBridge.groupCreate, session: UUID(), name: name))
+                    guard answer.ok else { throw LstfError(message: "分组「\(name)」没有建成：\(answer.message)") }
+                } else {
+                    do { try GroupStore.add(name) }
+                    catch { throw LstfError(message: "分组「\(name)」没有建成：\(error.localizedDescription)") }
+                }
+            }
+            print(Lstf.groupCreated(name, existed: existed), terminator: "")
+
+        case let .moveToGroup(group, selector):
+            let sessions = SessionStore.all()
+            let picked = try Lstf.resolve(selector, sessions: sessions, open: state?.sessionID, running: state != nil)
+            let session = picked.session, short = Lstf.shortID(picked.session.id)
+            if let group {
+                let names = GroupStore.names(sessions: sessions.map(\.group))
+                guard names.contains(group) else {
+                    throw LstfError(message: "没有叫「\(group)」的分组。" + (names.isEmpty ? "还没有任何分组；" : "现有的分组：\(names.map { "「\($0)」" }.joined(separator: "、"))。")
+                                    + "要新建就先 lstf group create \(group)")
+                }
+            }
+            if session.group != group {
+                if state != nil {
+                    let answer = try ask(AgentBridge.Request(action: AgentBridge.groupMove, session: session.id, name: group))
+                    guard answer.ok else { throw LstfError(message: "会话 \(short) 没有移动：\(answer.message)") }
+                } else {
+                    do { try SessionStore.update(session.id) { $0.group = group } }
+                    catch { throw LstfError(message: "会话 \(short) 没有移动：\(error.localizedDescription)") }
+                }
+            }
+            print(Lstf.groupMoved(session, from: session.group, to: group, note: picked.note), terminator: "")
 
         case let .rename(name, selector):
             let picked = try Lstf.resolve(selector, sessions: SessionStore.all(), open: state?.sessionID, running: state != nil)

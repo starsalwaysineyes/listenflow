@@ -94,6 +94,10 @@ struct ListenFlowApp: App {
                     model.showMainWindow()
                     model.renameToken += 1
                 }
+                Button("新建分组…") {
+                    model.showMainWindow()
+                    model.groupPrompt = .create
+                }
                 Button("删除这场会话…") {
                     model.showMainWindow()
                     model.askToDelete(model.session.id)

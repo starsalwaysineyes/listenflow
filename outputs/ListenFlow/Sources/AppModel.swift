@@ -124,8 +124,10 @@ final class AppModel: ObservableObject {
     @Published var deleteCandidate: SessionSummary?
     /// The window is asking for a group's name: a new group for a session, or
     /// a new name for a group there is.
-    enum GroupPrompt: Equatable { case new(UUID), rename(String) }
+    enum GroupPrompt: Equatable { case new(UUID), rename(String), create }
     @Published var groupPrompt: GroupPrompt?
+    /// The groups that were made, which may hold no session yet.
+    @Published var groupNames: [String] = []
     @Published var source: AudioSource = .all
     /// What a running session is actually capturing, decided at start time so the
     /// user can change the picker freely while stopped.
@@ -461,11 +463,15 @@ final class AppModel: ObservableObject {
         guard SessionStore.writes else { return }
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let stored = SessionStore.summaries()
+            // Groups from before there was a file for them are written into it.
+            let names = GroupStore.names(sessions: stored.map(\.group))
+            if names != GroupStore.load() { try? GroupStore.save(names) }
             DispatchQueue.main.async {
                 guard let self else { return }
                 let newer = self.history
                 self.history = stored
                 newer.forEach(self.remember)
+                self.groupNames = names
             }
         }
     }
@@ -1115,6 +1121,21 @@ final class AppModel: ObservableObject {
             else { AgentBridge.respond(to: request, ok: true, "已写入。") }
             return
         }
+        if request.action == AgentBridge.groupCreate {
+            let existed = request.name.flatMap(GroupStore.clean).map(groupNames.contains) ?? false
+            if let problem = createGroup(request.name ?? "") { refuse(problem) }
+            else { AgentBridge.respond(to: request, ok: true, existed ? "已经有这个分组。" : "已创建。") }
+            return
+        }
+        if request.action == AgentBridge.groupMove {
+            // From outside a session only moves into a group that is there: a
+            // misspelt name should not quietly make a new one.
+            if let name = request.name, !(GroupStore.clean(name).map(groupNames.contains) ?? false) {
+                refuse("没有叫「\(name)」的分组。先用 lstf group create 创建，或用 lstf group list 看有哪些。")
+            } else if let problem = setGroup(request.session, to: request.name) { refuse(problem) }
+            else { AgentBridge.respond(to: request, ok: true, "已移动。") }
+            return
+        }
         if request.action == AgentBridge.rename {
             if let problem = renameSession(request.session, to: request.name ?? "") { refuse(problem) }
             else { AgentBridge.respond(to: request, ok: true, "已改名。") }
@@ -1514,27 +1535,49 @@ final class AppModel: ObservableObject {
         catch { return "没有保存下来：\(error.localizedDescription)" }
         return nil
     }
-    /// Files a session under a group, or with nil takes it out of the one it is
-    /// in. The group comes into being with its first session and is gone with its last.
+    /// Writes down the groups that were made. A preview build showing made-up
+    /// history keeps them in memory only.
+    private func keepGroups(_ names: [String]) -> String? {
+        let sorted = Array(Set(names)).sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+        if SessionStore.writes {
+            do { try GroupStore.save(sorted) } catch { return "分组没有保存下来：\(error.localizedDescription)" }
+        }
+        if groupNames != sorted { groupNames = sorted }
+        return nil
+    }
+    /// Makes a group with nothing in it yet. One that is there already is left as it is.
+    @discardableResult
+    func createGroup(_ raw: String) -> String? {
+        guard let name = GroupStore.clean(raw) else { return "分组的名字不能是空的。" }
+        return groupNames.contains(name) ? nil : keepGroups(groupNames + [name])
+    }
+    /// Files a session under a group, making the group if need be, or with nil
+    /// takes the session out of the one it is in. A group stays when its last
+    /// session leaves; it goes when it is deleted.
     @discardableResult
     func setGroup(_ id: UUID, to raw: String?) -> String? {
         var name: String?
         if let raw {
-            guard let clean = SessionStore.cleanName(raw, limit: SessionStore.groupLimit) else { return "分组的名字不能是空的。" }
+            guard let clean = GroupStore.clean(raw) else { return "分组的名字不能是空的。" }
             name = clean
+            if let problem = createGroup(clean) { return problem }
         }
         return amend(id) { $0.group = name }
     }
     /// Every session of the group moves to the new name; an existing group of that name takes them in.
     @discardableResult
     func renameGroup(_ old: String, to raw: String) -> String? {
-        guard let name = SessionStore.cleanName(raw, limit: SessionStore.groupLimit) else { return "分组的名字不能是空的。" }
+        guard let name = GroupStore.clean(raw) else { return "分组的名字不能是空的。" }
         guard name != old else { return nil }
-        return regroup(old, to: name)
+        if let problem = regroup(old, to: name) { return problem }
+        return keepGroups(groupNames.filter { $0 != old } + [name])
     }
     /// The sessions stay, in the list of recent ones; only the group goes.
     @discardableResult
-    func dissolveGroup(_ name: String) -> String? { regroup(name, to: nil) }
+    func dissolveGroup(_ name: String) -> String? {
+        if let problem = regroup(name, to: nil) { return problem }
+        return keepGroups(groupNames.filter { $0 != name })
+    }
     private func regroup(_ old: String, to name: String?) -> String? {
         var members = history.filter { $0.group == old }.map(\.id)
         if session.group == old && !members.contains(session.id) { members.append(session.id) }
@@ -1849,6 +1892,7 @@ extension AppModel {
             }
             return SessionSummary(past)
         }
+        groupNames = ["读书会"]         // made, with nothing in it yet
         main("main-volc")
 
         // In the middle of a session: both sources live, a sentence still being heard.
@@ -1981,8 +2025,8 @@ extension AppModel {
         func state() -> [String: Any] {
             writer.flush()
             let onDisk = SessionStore.all()
-            return ["list": SessionGroups.groups(history).map { "\($0.name): " + $0.sessions.map(\.name).joined(separator: ", ") },
-                    "disk": SessionGroups.groups(onDisk.map(SessionSummary.init)).map { "\($0.name): " + $0.sessions.map(\.name).joined(separator: ", ") },
+            return ["list": SessionGroups.groups(history, names: groupNames).map { "\($0.name): " + $0.sessions.map(\.name).joined(separator: ", ") },
+                    "disk": SessionGroups.groups(onDisk.map(SessionSummary.init), names: GroupStore.load()).map { "\($0.name): " + $0.sessions.map(\.name).joined(separator: ", ") },
                     "recent": history.count, "lines kept": onDisk.map(\.lines.count).reduce(0, +)]
         }
         openSession(b.id)
@@ -1993,6 +2037,8 @@ extension AppModel {
         result["2 周会 renamed"] = state()
         result["3 problems"] = [dissolveGroup("课程"), setGroup(a.id, to: nil), setGroup(c.id, to: "  ")].compactMap { $0 }
         result["3 课程 dissolved, one taken out"] = state()
+        result["4 problems"] = [createGroup(" 空的 "), createGroup("空的"), createGroup(" ")].compactMap { $0 }
+        result["4 an empty group made, twice"] = state()
         result["open session's group"] = session.group ?? ""
         finish()
     }

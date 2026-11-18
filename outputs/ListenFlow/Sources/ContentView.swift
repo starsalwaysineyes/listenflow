@@ -63,6 +63,45 @@ private enum Format {
     }
 }
 
+/// The line between the list of sessions and the transcript. Dragging it makes
+/// the list wider or narrower; a double click puts it back.
+private struct RailHandle: View {
+    @Binding var width: Double
+    let widest: Double
+    @State private var start: Double?
+    @State private var over = false
+
+    var body: some View {
+        Rectangle().fill(Palette.hairline).frame(width: 1)
+            // A strip wide enough to catch, laid over the hairline without taking room.
+            .overlay {
+                Rectangle().fill(Color.primary.opacity(over || start != nil ? 0.06 : 0.001))
+                    .frame(width: 9)
+                    .contentShape(Rectangle())
+                    .onHover { inside in
+                        guard inside != over else { return }
+                        over = inside
+                        if inside { NSCursor.resizeLeftRight.push() } else { NSCursor.pop() }
+                    }
+                    .gesture(DragGesture(minimumDistance: 1, coordinateSpace: .global)
+                        .onChanged { value in
+                            let from = start ?? RailWidth.clamp(width, widest: widest)
+                            start = from
+                            width = RailWidth.clamp(from + value.translation.width, widest: widest)
+                        }
+                        .onEnded { _ in start = nil })
+                    .onTapGesture(count: 2) { width = RailWidth.standard }
+                    .help("拖动调整列表的宽度，双击恢复")
+                    .accessibilityLabel("列表宽度")
+                    .accessibilityValue("\(Int(width))")
+                    .accessibilityAdjustableAction { direction in
+                        width = RailWidth.clamp(width + (direction == .increment ? 20 : -20), widest: widest)
+                    }
+            }
+            .zIndex(1)
+    }
+}
+
 /// A session's name being typed over where it is shown, the way a file is
 /// renamed in Finder: Return or clicking elsewhere keeps what was typed,
 /// Escape leaves the old name. `done` gets nil when nothing should change.
@@ -113,18 +152,24 @@ struct ContentView: View {
     @ObservedObject var model: AppModel
     @State private var groupPrompt: AppModel.GroupPrompt?
     @State private var groupName = ""
+    /// How wide the user dragged the list of sessions.
+    @AppStorage("railWidth") private var railWidth = RailWidth.standard
     var body: some View {
-        HStack(spacing: 0) {
-            SessionRail(model: model).frame(width: 236)
-            Rectangle().fill(Palette.hairline).frame(width: 1)
-            VStack(spacing: 0) {
-                Transport(model: model)
-                banners
-                viewBar
-                Rectangle().fill(Palette.hairline).frame(height: 1)
-                if model.showOrganized { DraftPage(model: model) } else { TranscriptPage(model: model) }
-                StatusBar(model: model)
-            }.background(Palette.page)
+        GeometryReader { window in
+            // The transcript keeps room to be read, however far the list is dragged.
+            let widest = RailWidth.widest(inWindow: window.size.width)
+            HStack(spacing: 0) {
+                SessionRail(model: model).frame(width: RailWidth.clamp(railWidth, widest: widest))
+                RailHandle(width: $railWidth, widest: widest)
+                VStack(spacing: 0) {
+                    Transport(model: model)
+                    banners
+                    viewBar
+                    Rectangle().fill(Palette.hairline).frame(height: 1)
+                    if model.showOrganized { DraftPage(model: model) } else { TranscriptPage(model: model) }
+                    StatusBar(model: model)
+                }.background(Palette.page)
+            }
         }
         .foregroundStyle(Palette.ink)
         .tint(Palette.stream)
@@ -140,7 +185,7 @@ struct ContentView: View {
         } message: { row in
             Text(model.deleteDetail(row))
         }
-        .alert(groupPrompt.map { if case .rename = $0 { return "给分组改名" } else { return "新建分组" } } ?? "",
+        .alert({ if case .rename? = groupPrompt { return "给分组改名" } else { return "新建分组" } }(),
                isPresented: Binding(get: { model.groupPrompt != nil }, set: { if !$0 { model.groupPrompt = nil } })) {
             TextField("分组的名字", text: $groupName)
             Button("好") {
@@ -148,13 +193,18 @@ struct ContentView: View {
                 switch groupPrompt {
                 case let .new(id)?: problem = model.setGroup(id, to: groupName)
                 case let .rename(old)?: problem = model.renameGroup(old, to: groupName)
+                case .create?: problem = model.createGroup(groupName)
                 case nil: problem = nil
                 }
                 if let problem { model.error = problem }
             }
             Button("取消", role: .cancel) {}
         } message: {
-            Text(groupPrompt.map { if case .rename = $0 { return "分组里的会话都跟着换到新名字下。" } else { return "这场会话会放进新分组；它仍然在「最近」里。" } } ?? "")
+            switch groupPrompt {
+            case .rename?: Text("分组里的会话都跟着换到新名字下。")
+            case .new?: Text("这场会话会放进新分组；它仍然在「最近」里。")
+            default: Text("分组显示在会话列表上方。之后在会话上右键「移到分组」放进来。")
+            }
         }
         // The alert's buttons run after the model's copy is cleared, so the view keeps its own.
         .onChange(of: model.groupPrompt) { _, prompt in
@@ -272,7 +322,7 @@ private struct SessionRail: View {
     }
 
     var body: some View {
-        let groups = SessionGroups.groups(model.history)
+        let groups = SessionGroups.groups(model.history, names: model.groupNames)
         let names = groups.map(\.name)
         VStack(alignment: .leading, spacing: 0) {
             Button { model.newSession() } label: {
@@ -298,6 +348,10 @@ private struct SessionRail: View {
                         GroupHeader(model: model, group: group, folded: folded) { toggle(group.name) }
                             .padding(.top, 6)
                         if !folded {
+                            if group.sessions.isEmpty {
+                                Text("还没有会话。在会话上右键「移到分组」").font(.system(size: 11)).foregroundStyle(Palette.faint)
+                                    .lineLimit(1).padding(.leading, 34).frame(height: 24)
+                            }
                             ForEach(all ? group.sessions : Array(group.sessions.prefix(SessionGroups.shown))) { row in
                                 SessionRow(model: model, row: row, groups: names, compact: true)
                             }
@@ -350,7 +404,7 @@ private struct GroupHeader: View {
         .accessibilityLabel("分组 \(group.name)，\(group.sessions.count) 场会话，\(folded ? "已收起" : "已展开")")
         .contextMenu {
             Button("改名…") { model.groupPrompt = .rename(group.name) }
-            Button("解散分组（会话保留）") { if let problem = model.dissolveGroup(group.name) { model.error = problem } }
+            Button(group.sessions.isEmpty ? "删除分组" : "删除分组（会话保留）") { if let problem = model.dissolveGroup(group.name) { model.error = problem } }
         }
     }
 }

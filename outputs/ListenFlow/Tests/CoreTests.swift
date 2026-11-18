@@ -1030,6 +1030,62 @@ enum CaptureFailure: LocalizedError {
             precondition(Lstf.describe(Lstf.Info(session: sessions[0])).hasSuffix("分组「周会」") && !Lstf.describe(Lstf.Info(session: sessions[1])).contains("分组"))
             precondition(Lstf.json(Lstf.Info(session: sessions[0]))["group"] as? String == "周会" && Lstf.json(Lstf.Info(session: sessions[1]))["group"] == nil)
             precondition(Lstf.help.contains("lstf list --group 分组名"))
+
+            // 0.12.1: groups that were made exist on their own, and `lstf` can make and fill them.
+            precondition(GroupStore.load().isEmpty && GroupStore.file.path == groupRoot.appendingPathComponent("groups.json").path)
+            precondition(GroupStore.names(sessions: SessionStore.all().map(\.group)) == ["课程 2", "课程 10", "周会"],
+                         "Groups from before there was a file are the ones sessions name")
+            let addedNew = try GroupStore.add("读书会"), addedAgain = try GroupStore.add("读书会")
+            precondition(addedNew && !addedAgain && GroupStore.load() == ["读书会"])
+            let groupMode = try FileManager.default.attributesOfItem(atPath: GroupStore.file.path)[.posixPermissions] as? Int
+            precondition(groupMode == 0o600)
+            let withEmpty = SessionGroups.groups(SessionStore.summaries(), names: GroupStore.names(sessions: SessionStore.all().map(\.group)))
+            precondition(withEmpty.map(\.name) == ["读书会", "课程 2", "课程 10", "周会"] && withEmpty[0].sessions.isEmpty && withEmpty[3].sessions.count == 3,
+                         "A group that was made is there before it holds anything")
+            try GroupStore.save(["乙", "甲", "乙", "课程 10", "课程 2"])
+            let keptGroups = GroupStore.load()
+            precondition(Set(keptGroups) == ["乙", "甲", "课程 10", "课程 2"] && keptGroups.count == 4
+                         && keptGroups == keptGroups.sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+                         && keptGroups.firstIndex(of: "课程 2")! < keptGroups.firstIndex(of: "课程 10")!, "Kept once each, in name order")
+            try GroupStore.remove("甲")
+            try GroupStore.remove("没有的")
+            precondition(!GroupStore.load().contains("甲") && GroupStore.load().count == 3)
+            precondition(GroupStore.clean("  产品\n周会 ") == "产品 周会" && GroupStore.clean(" ") == nil)
+
+            let groupCommands = try [["group"], ["groups", "list", "--json"], ["group", "create", "产品", "周会"], ["group", "move", "周会"],
+                                     ["group", "move", "产品", "周会", "--session", "3F2A91BC"], ["group", "mv", "--out", "--session", "latest"]].map(Lstf.parse)
+            precondition(groupCommands == [.groups(json: false), .groups(json: true), .createGroup("产品 周会"), .moveToGroup(group: "周会", session: nil),
+                                           .moveToGroup(group: "产品 周会", session: "3F2A91BC"), .moveToGroup(group: nil, session: "latest")])
+            for wrong in [["group", "create"], ["group", "move"], ["group", "move", "周会", "--out"], ["group", "delete", "周会"], ["group", "rename", "a", "b"],
+                          ["group", "list", "--session", "x"], ["group", "create", "周会", "--json"]] {
+                var usage = false
+                do { _ = try Lstf.parse(wrong) } catch let error as LstfError { usage = error.usage }
+                precondition(usage, "\(wrong) is a mistake in the command; groups are not renamed or deleted from outside")
+            }
+            let listedGroups = Lstf.groupList(withEmpty)
+            precondition(listedGroups.contains("读书会　　  还没有会话\n") && listedGroups.contains("周会　　　  3 场，最近一场 ")
+                         && listedGroups.hasSuffix("— 共 4 个分组。看某个分组里的会话：lstf list --group 分组名\n"))
+            precondition(Lstf.groupList([]) == "还没有任何分组。新建：lstf group create 分组名\n")
+            precondition(Lstf.json(withEmpty[0])["sessions"] as? Int == 0 && Lstf.json(withEmpty[0])["latest"] == nil
+                         && Lstf.json(withEmpty[3])["sessions"] as? Int == 3 && Lstf.json(withEmpty[3])["latest"] != nil)
+            precondition(Lstf.groupCreated("周会", existed: true) == "已经有「周会」这个分组。\n" && Lstf.groupCreated("读书会", existed: false).hasPrefix("已新建分组「读书会」。"))
+            let filed = sessions[0], which = "会话 \(Lstf.shortID(filed.id))「周会三」"
+            precondition(Lstf.groupMoved(filed, from: nil, to: "周会", note: nil) == which + "已移到分组「周会」。\n"
+                         && Lstf.groupMoved(filed, from: "课程", to: "周会", note: nil) == which + "已从分组「课程」移到「周会」。\n"
+                         && Lstf.groupMoved(filed, from: "周会", to: "周会", note: nil) == which + "本来就在分组「周会」里。\n"
+                         && Lstf.groupMoved(filed, from: "周会", to: nil, note: "听流没有在运行，这里是最近的一场。") == "听流没有在运行，这里是最近的一场。\n" + which + "已移出分组「周会」。\n"
+                         && Lstf.groupMoved(filed, from: nil, to: nil, note: nil) == which + "本来就不在任何分组里。\n")
+            let asked = AgentBridge.Request(action: AgentBridge.groupMove, session: filed.id, name: nil)
+            let made = AgentBridge.Request(action: AgentBridge.groupCreate, session: UUID(), name: "读书会")
+            try AgentBridge.submit(asked); try AgentBridge.submit(made)
+            precondition(Set(AgentBridge.pending().map(\.action)) == ["group-move", "group-create"] && AgentBridge.pending().first { $0.action == "group-move" }?.name == nil)
+            AgentBridge.cancel(asked); AgentBridge.cancel(made)
+            precondition(Lstf.help.contains("lstf group create 分组名") && Lstf.help.contains("lstf group move --out") && Lstf.help.contains("能改动的只有五件事"))
+
+            // The list of sessions can be dragged wider, but leaves the transcript room.
+            precondition(RailWidth.widest(inWindow: 780) == 260 && RailWidth.widest(inWindow: 1400) == 520 && RailWidth.widest(inWindow: 600) == 190)
+            precondition(RailWidth.clamp(236, widest: 260) == 236 && RailWidth.clamp(900, widest: 260) == 260 && RailWidth.clamp(50, widest: 520) == 190
+                         && RailWidth.clamp(400, widest: 520) == 400 && RailWidth.clamp(400, widest: 100) == 190)
         }
 
         // --- 0.11.4: kept audio outlives refinement ---
@@ -1164,11 +1220,11 @@ enum CaptureFailure: LocalizedError {
                          == "会话 \(short) 的整理稿已写入：120 字，覆盖第 1–3 行（到 00:28）。之后还有 2 行没有纳入。\n用户在听流的「整理稿」页里能看到。读回：lstf read \(short) --organized\n")
             precondition(Lstf.draftWritten(talk, count: 5, characters: 9, replaced: true, note: "听流没有在运行，这里是最近的一场。")
                          == "听流没有在运行，这里是最近的一场。\n会话 \(short) 的整理稿已写入：9 字，覆盖第 1–5 行（到 00:48）。替换了原有的整理稿。\n用户在听流的「整理稿」页里能看到。读回：lstf read \(short) --organized\n")
-            precondition(Lstf.help.contains("lstf draft write [会话] [--file 路径] [--through N] [--replace]") && Lstf.help.contains("能改动的只有四件事")
-                         && Lstf.help.contains("这是全文整理，不是摘要"))
+            precondition(Lstf.help.contains("lstf draft write [会话] [--file 路径] [--through N] [--replace]") && Lstf.help.contains("这是全文整理，不是摘要"))
         }
 
         print("PASS: groups (stored with the session, order, every session still in the recent list, filing a stored session, lstf list --group)")
+        print("PASS: groups that exist on their own, lstf group list/create/move, how wide the session list may be dragged")
         print("PASS: kept audio outlives refinement (what is still to refine, nothing sent twice, no clearing out by age, what lstf reports)")
         print("PASS: a draft handed in by an agent (how far it reaches, replacing only when asked, what the app leaves alone on update), lstf draft write")
         print("PASS: deleting a session (its file and pictures, nothing else; refused when it cannot be moved away; not from lstf)")
