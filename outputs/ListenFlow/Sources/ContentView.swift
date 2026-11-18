@@ -1,30 +1,88 @@
 import SwiftUI
 import AppKit
 
-/// Colours that follow the system appearance. Two of them carry meaning: what
-/// the Mac plays and what the microphone hears are told apart by colour
-/// everywhere — the bar beside a paragraph, a level meter, a label.
+/// Colours that follow the system appearance, after the Codex and Claude
+/// desktop apps: a white page and neutral ink, as Codex has them, and one
+/// colour, Claude's clay, for the user's own side — what the microphone hears —
+/// and the controls that are on. What the Mac plays stays in ink. Red is kept
+/// for recording.
 enum Palette {
-    private static func rgb(_ hex: UInt32) -> NSColor {
+    private static func rgb(_ hex: UInt32, _ alpha: CGFloat = 1) -> NSColor {
         NSColor(srgbRed: CGFloat((hex >> 16) & 0xFF) / 255, green: CGFloat((hex >> 8) & 0xFF) / 255,
-                blue: CGFloat(hex & 0xFF) / 255, alpha: 1)
+                blue: CGFloat(hex & 0xFF) / 255, alpha: alpha)
     }
-    private static func dynamic(_ light: UInt32, _ dark: UInt32) -> Color {
-        Color(nsColor: NSColor(name: nil) { $0.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua ? rgb(dark) : rgb(light) })
+    private static func dynamicNS(_ light: UInt32, _ dark: UInt32, alpha: (light: CGFloat, dark: CGFloat) = (1, 1)) -> NSColor {
+        NSColor(name: nil) { $0.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua ? rgb(dark, alpha.dark) : rgb(light, alpha.light) }
     }
-    static let page = dynamic(0xFFFFFF, 0x1E1F21)
-    static let rail = dynamic(0xF1F2F0, 0x161718)
-    static let ink = Color(nsColor: .labelColor)
-    static let muted = Color(nsColor: .secondaryLabelColor)
-    static let faint = Color(nsColor: .tertiaryLabelColor)
-    static let hairline = Color(nsColor: .separatorColor)
+    private static func dynamic(_ light: UInt32, _ dark: UInt32, alpha: (light: CGFloat, dark: CGFloat) = (1, 1)) -> Color {
+        Color(nsColor: dynamicNS(light, dark, alpha: alpha))
+    }
+    static let page = dynamic(0xFFFFFF, 0x212121)
+    static let rail = dynamic(0xF7F7F7, 0x181818)
+    /// What should stand out from the page it sits on: the chosen tab, a card, a menu button.
+    static let raised = dynamic(0xFFFFFF, 0x303030)
+    static let inkNS = dynamicNS(0x0D0D0D, 0xF7F7F7)
+    static let ink = Color(nsColor: inkNS)
+    static let muted = dynamic(0x666666, 0xAFAFAF)
+    static let faint = dynamic(0xA3A3A3, 0x6E6E6E)
+    static let hairline = dynamic(0x000000, 0xFFFFFF, alpha: (0.10, 0.14))
+    /// Behind the chosen row, a key cap, a round button: a little ink, no colour.
+    static let wash = dynamic(0x000000, 0xFFFFFF, alpha: (0.06, 0.10))
+    static let accent = dynamic(0xC15F3C, 0xD97757)
     /// What the Mac plays.
-    static let stream = dynamic(0x0B7468, 0x5FD0BF)
+    static let stream = dynamic(0x6B6B6B, 0xA8A8A8)
     /// What the microphone hears: the user's own side.
-    static let voice = dynamic(0xAD5710, 0xF0A75E)
-    static let live = dynamic(0xD2362F, 0xFF6B62)
-    static let warning = dynamic(0xB36200, 0xF5B14C)
+    static let voice = accent
+    static let live = dynamic(0xCC3A33, 0xEB5E55)
+    static let warning = dynamic(0x875A08, 0xDA9E25)
+    static let ok = dynamic(0x2F7613, 0x65BB30)
     static func source(_ name: String) -> Color { name == EchoFilter.micSource ? voice : stream }
+}
+
+/// The one kind of filled button: ink on paper, as the record button is.
+struct InkButtonStyle: ButtonStyle {
+    var small = false
+    @Environment(\.isEnabled) private var enabled
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: small ? 11 : 13, weight: .medium))
+            .padding(.horizontal, small ? 10 : 14).frame(height: small ? 22 : 28)
+            .foregroundStyle(Palette.page)
+            .background(Palette.ink.opacity(configuration.isPressed ? 0.75 : 1),
+                        in: RoundedRectangle(cornerRadius: small ? 6 : 8, style: .continuous))
+            .opacity(enabled ? 1 : 0.4)
+            .contentShape(Rectangle())
+    }
+}
+
+/// Which reading of the session is shown: two tabs on a quiet track, the chosen one raised.
+private struct ViewTabs: View {
+    @Binding var organized: Bool
+    var body: some View {
+        HStack(spacing: 2) {
+            tab("原始转写", false)
+            tab("整理稿", true)
+        }
+        .padding(2)
+        .background(Palette.wash, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .accessibilityElement(children: .contain).accessibilityLabel("记录视图")
+    }
+    private func tab(_ title: String, _ value: Bool) -> some View {
+        let chosen = organized == value
+        return Button { organized = value } label: {
+            Text(title).font(.system(size: 12, weight: chosen ? .medium : .regular))
+                .foregroundStyle(chosen ? Palette.ink : Palette.muted)
+                .padding(.horizontal, 13).frame(height: 24)
+                .background {
+                    if chosen {
+                        RoundedRectangle(cornerRadius: 6, style: .continuous).fill(Palette.raised)
+                            .shadow(color: .black.opacity(0.10), radius: 1, y: 0.5)
+                    }
+                }
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain).accessibilityAddTraits(chosen ? .isSelected : [])
+    }
 }
 
 private enum Format {
@@ -75,7 +133,7 @@ private struct RailHandle: View {
         Rectangle().fill(Palette.hairline).frame(width: 1)
             // A strip wide enough to catch, laid over the hairline without taking room.
             .overlay {
-                Rectangle().fill(Color.primary.opacity(over || start != nil ? 0.06 : 0.001))
+                Rectangle().fill(Palette.ink.opacity(over || start != nil ? 0.06 : 0.001))
                     .frame(width: 9)
                     .contentShape(Rectangle())
                     .onHover { inside in
@@ -172,7 +230,7 @@ struct ContentView: View {
             }
         }
         .foregroundStyle(Palette.ink)
-        .tint(Palette.stream)
+        .tint(Palette.accent)
         .frame(minWidth: 780, minHeight: 520)
         .sheet(isPresented: $model.showSettings) { SettingsView(model: model) }
         .alert("删除「\(model.deleteCandidate?.name ?? "")」？",
@@ -224,7 +282,7 @@ struct ContentView: View {
             banner(error, icon: "exclamationmark.triangle.fill", color: Palette.warning) { model.error = nil }
         }
         if let notice = model.notice {
-            banner(notice, icon: "checkmark.circle.fill", color: Palette.stream) { model.notice = nil }
+            banner(notice, icon: "checkmark.circle.fill", color: Palette.ok) { model.notice = nil }
         }
     }
 
@@ -242,10 +300,7 @@ struct ContentView: View {
     /// Which reading of the session is shown, and what can be done with it.
     private var viewBar: some View {
         HStack(spacing: 14) {
-            Picker("记录视图", selection: $model.showOrganized) {
-                Text("原始转写").tag(false)
-                Text("整理稿").tag(true)
-            }.labelsHidden().pickerStyle(.segmented).frame(width: 168)
+            ViewTabs(organized: $model.showOrganized)
             Spacer(minLength: 8)
             if !model.showOrganized { refineControl }
             Text(counts).font(.system(size: 11)).monospacedDigit().foregroundStyle(Palette.muted).lineLimit(1)
@@ -277,14 +332,14 @@ struct ContentView: View {
             HStack(spacing: 7) {
                 ProgressView(value: Double(model.postRefineDone), total: Double(max(model.postRefineTotal, 1)))
                     .frame(width: 70).controlSize(.small)
-                Text("精修 \(model.postRefineDone)/\(model.postRefineTotal)").font(.system(size: 11)).foregroundStyle(Palette.stream)
+                Text("精修 \(model.postRefineDone)/\(model.postRefineTotal)").font(.system(size: 11)).foregroundStyle(Palette.muted)
                     .monospacedDigit()
                 Button("停止") { model.cancelRefineSession() }.font(.system(size: 11))
             }
         } else if model.canRefineSession {
             Button { model.refineSession() } label: {
                 Label("精修全文", systemImage: "wand.and.stars").font(.system(size: 12, weight: .medium))
-            }.buttonStyle(.plain).foregroundStyle(Palette.stream)
+            }.buttonStyle(.plain).foregroundStyle(Palette.ink)
                 .help(model.usesCloud
                       ? "把本机保存的、还没精修的约 \(Int((model.keptStreamSeconds / 60).rounded(.up))) 分钟录音上传到豆包录音文件识别，重新识别全文，更准确；按音频时长另外计费。录音精修后仍保留在本机"
                       : "用保存的录音，以约 30 秒为一段重新识别全文，更准确。录音精修后仍保留在本机")
@@ -349,7 +404,7 @@ private struct SessionRail: View {
                             .padding(.top, 6)
                         if !folded {
                             if group.sessions.isEmpty {
-                                Text("还没有会话。在会话上右键「移到分组」").font(.system(size: 11)).foregroundStyle(Palette.faint)
+                                Text("空的。右键会话「移到分组」").font(.system(size: 11)).foregroundStyle(Palette.faint)
                                     .lineLimit(1).padding(.leading, 34).frame(height: 24)
                             }
                             ForEach(all ? group.sessions : Array(group.sessions.prefix(SessionGroups.shown))) { row in
@@ -424,6 +479,7 @@ private struct SessionRow: View {
     }
 
     @State private var renaming = false
+    @State private var hovering = false
 
     private func content(current: Bool) -> some View {
         VStack(alignment: .leading, spacing: 3) {
@@ -446,7 +502,8 @@ private struct SessionRow: View {
             if !compact { Text(detail).font(.system(size: 11)).foregroundStyle(Palette.muted).lineLimit(1) }
         }
         .padding(.leading, compact ? 34 : 10).padding(.trailing, 10).padding(.vertical, compact ? 6 : 7)
-        .background(current || renaming ? Palette.ink.opacity(0.08) : .clear, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+        .background(current || renaming ? Palette.wash : hovering && model.canChangeSession ? Palette.wash.opacity(0.5) : .clear,
+                    in: RoundedRectangle(cornerRadius: 7, style: .continuous))
         .contentShape(Rectangle())
     }
 
@@ -458,6 +515,7 @@ private struct SessionRow: View {
         } else {
             Button { model.openSession(row.id) } label: { content(current: current) }
                 .buttonStyle(.plain)
+                .onHover { hovering = $0 }
                 .disabled(!current && !model.canChangeSession)
                 .opacity(current || model.canChangeSession ? 1 : 0.5)
                 .help(current || model.canChangeSession ? row.title + (compact ? "，" + detail : "") : "暂停转写并等识别完成后，才能换到别的会话")
@@ -501,7 +559,7 @@ private struct EngineFooter: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 7) {
-                Circle().fill(model.engineReady ? Palette.stream : Palette.warning).frame(width: 6, height: 6)
+                Circle().fill(model.engineReady ? Palette.ok : Palette.warning).frame(width: 6, height: 6)
                 Text(model.engineStatus).font(.system(size: 11, weight: .medium)).lineLimit(1)
             }
             if model.usesCloud {
@@ -630,9 +688,21 @@ private struct Transport: View {
             Divider()
             Button("刷新 App 列表") { model.refreshApps() }
         } label: {
-            Label(sourceName, systemImage: model.source == .microphone ? "mic" : model.source == .app ? "macwindow" : "waveform")
+            HStack(spacing: 7) {
+                Image(systemName: model.source == .microphone ? "mic" : model.source == .app ? "macwindow" : "waveform")
+                    .font(.system(size: 12)).foregroundStyle(Palette.muted)
+                Text(sourceName).font(.system(size: 13)).lineLimit(1)
+                Image(systemName: "chevron.down").font(.system(size: 9, weight: .semibold)).foregroundStyle(Palette.muted)
+            }
+            .padding(.horizontal, 13).frame(height: 34)
+            // Two fills, not a stroke: a stroked capsule leaves a tick at each end when drawn off screen.
+            .background {
+                Capsule().fill(Palette.hairline)
+                Capsule().fill(Palette.raised).padding(1)
+            }
+            .contentShape(Capsule())
         }
-        .menuStyle(.button).buttonStyle(.bordered).controlSize(.large).fixedSize()
+        .buttonStyle(.plain).menuIndicator(.hidden).fixedSize()
         .disabled(model.isBusy)
         .help(model.source.detail)
     }
@@ -659,7 +729,7 @@ private struct Transport: View {
                     Image(systemName: model.micEnabled ? "mic.fill" : "mic.slash")
                         .font(.system(size: 13)).frame(width: 30, height: 30)
                         .foregroundStyle(model.micEnabled ? Palette.voice : Palette.muted)
-                        .background(Palette.ink.opacity(0.06), in: Circle())
+                        .background(Palette.wash, in: Circle())
                 }
                 .buttonStyle(.plain).disabled(model.isBusy || model.micBusy)
                 .help(model.micEnabled ? "麦克风在录。外放时录到的电脑声音会自动去掉，你自己的话照常保留。点一下关闭麦克风"
@@ -965,7 +1035,7 @@ private struct EmptyTranscript: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             Image(systemName: model.isRecording ? "waveform" : "waveform.path")
-                .font(.system(size: 30, weight: .light)).foregroundStyle(model.isRecording ? Palette.stream : Palette.faint)
+                .font(.system(size: 30, weight: .light)).foregroundStyle(model.isRecording ? Palette.accent : Palette.faint)
                 .symbolEffect(.variableColor.iterative, isActive: model.isRecording)
             Text(headline).font(.system(size: 22, weight: .semibold))
             Text(detail).font(.system(size: 13)).foregroundStyle(Palette.muted).lineSpacing(6)
@@ -990,7 +1060,7 @@ private struct EmptyTranscript: View {
         HStack(spacing: 10) {
             Text(keys).font(.system(size: 11, weight: .medium)).foregroundStyle(Palette.muted)
                 .padding(.horizontal, 6).frame(height: 20)
-                .background(Palette.ink.opacity(0.06), in: RoundedRectangle(cornerRadius: 5, style: .continuous))
+                .background(Palette.wash, in: RoundedRectangle(cornerRadius: 5, style: .continuous))
                 .frame(width: 50, alignment: .leading)
             Text(meaning).font(.system(size: 12)).foregroundStyle(Palette.muted)
         }
@@ -1022,11 +1092,11 @@ private struct DraftPage: View {
                 HStack(spacing: 12) {
                     if model.isOrganizing {
                         ProgressView().controlSize(.small)
-                        Text("正在整理").font(.system(size: 12)).foregroundStyle(Palette.stream)
+                        Text("正在整理").font(.system(size: 12)).foregroundStyle(Palette.muted)
                         Button("停止") { model.cancelOrganization() }.controlSize(.small)
                     } else {
                         Button(model.session.organized == nil ? "整理这场会话" : "更新整理稿") { model.organize() }
-                            .buttonStyle(.borderedProminent).controlSize(.small)
+                            .buttonStyle(InkButtonStyle(small: true))
                             .disabled(!model.hasOrganizationContext || model.isImportingImages)
                     }
                     Text(status).font(.system(size: 11)).foregroundStyle(Palette.muted).lineLimit(1)
@@ -1118,7 +1188,7 @@ private struct DocumentTextView: NSViewRepresentable {
         paragraph.paragraphSpacing = 3
         view.textStorage?.setAttributedString(NSAttributedString(string: text, attributes: [
             .font: NSFont(name: "Songti SC", size: 16) ?? NSFont.systemFont(ofSize: 15),
-            .foregroundColor: NSColor.labelColor, .paragraphStyle: paragraph
+            .foregroundColor: Palette.inkNS, .paragraphStyle: paragraph
         ]))
         scroll.contentView.scroll(to: origin)
         scroll.reflectScrolledClipView(scroll.contentView)

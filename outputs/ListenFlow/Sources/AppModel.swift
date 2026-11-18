@@ -1905,6 +1905,20 @@ extension AppModel {
         livePreview.set(AudioSource.systemName, "接下来说一下用户访谈的情况，这周一共约到了")
         hasLivePartial = true
         main("main-recording")
+        // The island as it hangs from the notch, over a stand-in for a desktop.
+        let hanging = IslandState()
+        hanging.mode = .expanded
+        shot(ZStack(alignment: .top) {
+            Color(white: 0.82)
+            HStack(spacing: 22) {
+                Text("听流").fontWeight(.semibold)
+                Text("文件"); Text("编辑"); Text("显示")
+                Spacer()
+                Text("10:42")
+            }
+            .font(.system(size: 13)).foregroundStyle(.black.opacity(0.8)).padding(.horizontal, 48).frame(height: 32)
+            NotchIslandView(model: self, levels: levels, state: hanging).frame(width: 720, height: 300)
+        }, NSSize(width: 1200, height: 420), "island")
         isRecording = false
         activeSource = nil
         micEnabled = false

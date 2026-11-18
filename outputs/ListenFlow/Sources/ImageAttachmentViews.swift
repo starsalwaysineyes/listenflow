@@ -63,7 +63,7 @@ struct ImageAttachmentPicker: View {
                                         .buttonStyle(.plain).help("预览 \(title(image))")
                                     Button { model.selectImage(image, selected: false) } label: {
                                         Image(systemName: "xmark.circle.fill").symbolRenderingMode(.palette)
-                                            .foregroundStyle(Color.secondary, Color(nsColor: .windowBackgroundColor)).font(.system(size: 14))
+                                            .foregroundStyle(Palette.muted, Palette.page).font(.system(size: 14))
                                     }.buttonStyle(.plain).disabled(busy).help("这次整理不用这张；图片仍保存在会话中")
                                 }
                                 Text(image.label).font(.system(size: 9)).foregroundStyle(.secondary)
@@ -93,9 +93,9 @@ struct AttachmentThumbnail: View {
                 Image(nsImage: thumbnail).resizable().scaledToFit()
             } else { Image(systemName: "photo.badge.exclamationmark").foregroundStyle(.secondary) }
         }
-        .frame(width: 76, height: 56).background(Color(nsColor: .windowBackgroundColor), in: RoundedRectangle(cornerRadius: 6))
+        .frame(width: 76, height: 56).background(Palette.rail, in: RoundedRectangle(cornerRadius: 6))
         .clipShape(RoundedRectangle(cornerRadius: 6))
-        .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(Color(nsColor: .separatorColor)))
+        .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(Palette.hairline))
         .accessibilityLabel("\(image.label)：\(image.name)")
     }
 }

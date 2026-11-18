@@ -27,7 +27,7 @@ struct SettingsView: View {
                             if draft.engine == .volc {
                                 Label("云端识别：转写时，音频会发送到火山引擎（豆包）。边说边出字，一句说完后由服务端再识别一遍定稿。",
                                       systemImage: "cloud")
-                                    .font(.caption).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
+                                    .font(.caption).foregroundStyle(Palette.warning).fixedSize(horizontal: false, vertical: true)
                                 VStack(alignment: .leading, spacing: 5) {
                                     Text("豆包语音 API Key").font(.system(size: 11)).foregroundStyle(.secondary)
                                     SecureField("保存在 ~/.listenflow/keys.json，仅本人可读", text: $volcKey).textFieldStyle(.roundedBorder)
@@ -116,16 +116,17 @@ struct SettingsView: View {
                     }
                 }
             }
-            if let error { Text(error).font(.caption).foregroundStyle(.red) }
+            if let error { Text(error).font(.caption).foregroundStyle(Palette.live) }
             HStack {
                 Text("密钥不会出现在导出的记录里。").font(.caption).foregroundStyle(.secondary)
                 Spacer()
                 Button("保存设置") {
                     do { try model.applyPreferences(draft, key: key, volcKey: volcKey == volcKeyLoaded ? nil : volcKey); dismiss() }
                     catch { self.error = error.localizedDescription }
-                }.buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
+                }.buttonStyle(InkButtonStyle()).keyboardShortcut(.defaultAction)
             }
-        }.padding(28).frame(width: 650, height: 690).tint(Palette.stream)
+        }.padding(28).frame(width: 650, height: 690).groupBoxStyle(CardGroupBox())
+            .foregroundStyle(Palette.ink).tint(Palette.accent).background(Palette.rail)
             .onAppear { draft = model.preferences; key = SecretStore.read(account: draft.apiBase)
                 // Preview builds take the Doubao key from the environment only.
                 if Bundle.main.bundleIdentifier != "local.ListenFlow.preview" {
@@ -173,8 +174,8 @@ private struct HotwordEditor: View {
                             }.buttonStyle(.plain).foregroundStyle(.secondary).help("删除「\(word)」")
                         }
                         .padding(.leading, 9).padding(.trailing, 7).frame(height: 24)
-                        .background(Color.primary.opacity(index < live ? 0.08 : 0.03), in: Capsule())
-                        .foregroundStyle(index < live ? Color.primary : Color.secondary)
+                        .background(Palette.wash.opacity(index < live ? 1 : 0.45), in: Capsule())
+                        .foregroundStyle(index < live ? Palette.ink : Palette.muted)
                         .help(index < live ? "实时识别和精修都会用到" : "实时识别用不到（超出豆包流式接口约 100 tokens 的上限），精修全文时会用到")
                     }
                 }
@@ -246,5 +247,14 @@ private struct AudioUsage: View {
         }
         .font(.caption).foregroundStyle(.secondary)
         .task { bytes = await Task.detached(priority: .utility) { AudioStore.totalBytes() }.value }
+    }
+}
+
+/// A section of the settings: a white card on the paper, with a hairline round it.
+struct CardGroupBox: GroupBoxStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.content
+            .background(Palette.raised, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(Palette.hairline))
     }
 }
