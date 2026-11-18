@@ -4,7 +4,7 @@ macOS 原生实时转写、全文整理与上下文问答工具。默认用火�
 
 ## 打开与使用
 
-当前源码版本为 0.8.0。若旧版正在录音，先完成录音、暂停并退出旧版，再打开新版。第一次使用先在「模型与 API 设置」里填豆包语音的 API Key（见下文「识别引擎」）；左下角显示「豆包云端识别已就绪」即可开始。已保存的旧会话可以直接从「历史记录」中打开。
+当前源码版本为 0.9.0。若旧版正在录音，先完成录音、暂停并退出旧版，再打开新版。第一次使用先在「模型与 API 设置」里填豆包语音的 API Key（见下文「识别引擎」）；左下角显示「豆包云端识别已就绪」即可开始。已保存的旧会话可以直接从「历史记录」中打开。
 
 1. 在左侧「音频来源」二选一：
    - **指定 App**：先在目标 App（腾讯会议、浏览器、播放器）里播放声音，再在列表里选中它。首次需要在 macOS「系统设置 → 隐私与安全性 → 屏幕与系统音频录制」中授权听流，必要时重启应用。
@@ -44,12 +44,13 @@ macOS 原生实时转写、全文整理与上下文问答工具。默认用火�
 | 出字 | 开始说话约 0.8 秒出预览，句末约 0.5 秒定稿 | 一般 3–8 秒一段 |
 | 断句、标点、数字 | 服务端完成，自带二遍识别 | 本机按停顿切段 |
 | 需要 | 网络、API Key、账户额度 | Python 环境与约 2.7 GB 内存 |
-| 识别档位、合并重识别、事后精修 | 不适用，设置里不显示 | 可用 |
+| 识别档位、合并重识别 | 不适用，设置里不显示 | 可用 |
+| 会后「精修全文」 | 把暂存的录音上传到豆包录音文件识别，另外计费 | 在本机按 30 秒一段重识别 |
 | 外放回声过滤、人名术语、整理、问答、导出 | 相同 | 相同 |
 
 **豆包的配置**
 
-- API Key：火山引擎控制台「豆包流式语音识别」的密钥，存入 macOS 钥匙串（服务 `local.ListenFlow.llm`，账户 `volcengine-asr`），不写入文件。
+- API Key：火山引擎控制台「豆包语音」的密钥，流式识别和录音文件识别共用。保存在 `~/.listenflow/keys.json` 的 `volcengine-asr` 一项（见下文「数据」）。
 - 资源 ID：默认 `volc.seedasr.sauc.duration`（2.0 小时版，按送入的音频时长计费）。并发版是 `volc.seedasr.sauc.concurrent`，需要单独开通。资源没开通时握手可能照样成功，要到开始识别才报错；报错会带上服务端给的原因。
 - 人名、术语会作为热词随连接发送（服务端上限约 100 个 token，超出的部分不发送）。
 
@@ -62,9 +63,21 @@ macOS 原生实时转写、全文整理与上下文问答工具。默认用火�
 
 切到豆包后本地模型进程会退出，释放内存；切回本地时重新加载。
 
-## 识别档位与事后精修（仅本地模型）
+**会后精修（豆包录音文件识别）**
 
-以下内容只在识别引擎为「本地模型」时有效。豆包引擎自带二遍识别，不提供档位和精修。
+实时识别是边听边出字，一句话讲满约 20 秒会被服务端强制定稿，切点可能落在词中间。录音文件识别拿到的是整段音频，能结合前后文，分句也按语义来，实测更准（数据见 TESTING.md 0.9.0）。
+
+- 设置里开启「暂存录音」（默认开启）后，发给豆包的那部分音频——也就是有人说话的片段——同时保存在本机 `~/.listenflow/audio/<会话>/`。静音本来就不上传，也不保存。
+- 会后在「原始转写」右上角点「精修全文」：暂存的录音按约 5 分钟一段上传（两段同时进行），返回的分句替换原来的实时结果，时间戳对应回录音时的实际时间。一段讲话超过 5 分钟没有停顿时，在段尾 20 秒内最安静的地方切开。
+- 资源 ID 默认 `volc.seedasr.auc`，在设置里可改；密钥和流式识别是同一个。按音频时长另外计费，也就是同一段音频实时一次、精修一次。
+- 全部完成后删除暂存录音。中途失败或点了「停止」：已完成的段保留，录音还在，再点一次只上传没做完的段。
+- 某一段返回的文字比实时结果少一半以上（或是空的）时，这一段保留原文不替换。
+- 麦克风和指定 App 同录时，麦克风的录音里有外放回声。这一路上传时改为按 0.3 秒静音分句，返回后再过一遍回声过滤，和实时那一遍的做法一致。
+- 关掉「暂存录音」就不保存任何音频，也就没有「精修全文」。
+
+## 识别档位与事后精修（本地模型）
+
+以下内容只在识别引擎为「本地模型」时有效。豆包引擎自带二遍识别，没有档位；它的「精修全文」走的是录音文件识别，见上一节。
 
 设置 →「识别档位」：
 
@@ -136,16 +149,17 @@ macOS 原生实时转写、全文整理与上下文问答工具。默认用火�
 - 复用已有 Hugging Face 缓存，启用离线模式；没有再次下载模型。
 - 问答地址：`https://api.deepseek.com`；模型：`deepseek-flash`。
 - DeepSeek 请求默认关闭深度思考，流式显示回答；每次回答上限 4096 tokens。
-- API 密钥存在 macOS 钥匙串的 `local.ListenFlow.llm` 服务中，按 API 地址隔离。源码与设置文件没有密钥。
+- API 密钥保存在 `~/.listenflow/keys.json`，按 API 地址各存一项。源码与设置文件没有密钥。
 
 设置界面支持更换 `chat/completions` 兼容服务、模型和密钥。API 地址需使用 HTTPS，本机服务可以使用 HTTP。填入包含 `/v1` 的地址时，会保留该路径；也可直接填写完整 `/chat/completions` 地址。
 
 ## 数据
 
-- 识别引擎为豆包时：有人说话期间，16 kHz 单声道音频经 TLS 实时发送到火山引擎（`openspeech.bytedance.com`）；静音不发送。听流自己不把音频写入磁盘，「暂存录音」在豆包引擎下不生效。火山引擎一侧如何保留数据以其服务条款为准。
+- 识别引擎为豆包时：有人说话期间，16 kHz 单声道音频经 TLS 实时发送到火山引擎（`openspeech.bytedance.com`）；静音不发送。开启「暂存录音」时，发出去的这部分音频同时保存在本机，供会后「精修全文」再上传一次（录音文件识别，同一域名）；关闭时听流不把音频写入磁盘。火山引擎一侧如何保留数据以其服务条款为准。
 - 识别引擎为本地模型时：音频不离开这台 Mac。关闭「暂存录音」时，音频只在内存和本地进程管道中流转，不落盘。
 - 原始音频任何情况下都不发给问答 / 整理用的 LLM。
-- （本地模型）开启「暂存录音」时，音频以 16 kHz 单声道保存在 `~/Library/Application Support/ListenFlow/Audio/<会话>/`（目录 0700、文件 0600），精修完成后删除，最长保留 7 天。
+- 开启「暂存录音」时，音频以 16 kHz 单声道保存在 `~/.listenflow/audio/<会话>/`（目录 0700、文件 0600），精修完成后删除，最长保留 7 天。本地模型存的是送去识别的每个片段（`<来源>.pcm`）；豆包引擎存的是上传过的讲话片段（`<来源>.stream.pcm`，另有一个记录每段起始时间的 `.stream.idx`）。0.8.0 及更早版本存在 `~/Library/Application Support/ListenFlow/Audio/` 的音频，新版第一次启动时会移过来。
+- API 密钥保存在 `~/.listenflow/keys.json`（目录 0700、文件 0600，明文 JSON：问答接口以 API 地址为键，豆包语音以 `volcengine-asr` 为键）。可以直接用编辑器改；文件权限过宽时读取时会收紧，文件不是合法 JSON 时听流不会覆盖它。0.8.0 及更早版本把密钥存在 macOS 钥匙串（服务 `local.ListenFlow.llm`）；新版不再使用钥匙串，第一次用到某个密钥时把它从钥匙串移到这个文件，并删除钥匙串里的那一项。
 - 提问时发送当前会话的全部转写文字、最近 12 条问答和本次问题到配置的 API。
 - 整理时只发送当前转写快照，不使用先前问答作为原文。
 - 会话文字自动保存在 `~/Library/Application Support/ListenFlow/Sessions/`，保存为 JSON。
@@ -175,10 +189,11 @@ LISTENFLOW_APP_DIR="$PWD/../听流-整理版.app" ./build.sh
 - `Sources/AudioChunker.swift`：按滚动底噪判断停顿（只看 200 Hz 以上的能量，避开空调、风扇等低频噪声），在停顿处切段；8 秒上限时在最安静处切开。
 - `Sources/VolcProtocol.swift`：豆包流式识别的帧编解码（gzip 用系统 zlib）、分句去重、未定稿音频的补发缓存、说话检测。纯逻辑，不含网络。
 - `Sources/VolcStream.swift`：每个音频来源一条 WebSocket 连接（URLSession）：流式上传、实时预览与定稿、断线重连、暂停时收尾。
-- `Sources/Recognition.swift`：电源判断、音频暂存、精修窗口的分组、合理性检查与替换、外放回声过滤。
+- `Sources/VolcFile.swift`：豆包录音文件识别。暂存录音的分段与切点、上传音频里的时间和录音时刻的对应、请求与结果解析、替换原文的把关（纯逻辑），以及提交、轮询的客户端。
+- `Sources/Recognition.swift`：电源判断、音频暂存（两种引擎各自的文件）、精修窗口的分组、合理性检查与替换、外放回声过滤。
 - `Sources/ASRBridge.swift` / `Backend/asr_worker.py`：本地引擎，常驻 MLX 模型、JSON lines 本地管道。
 - `Sources/LLMClient.swift`：上下文快照、流式问答、错误与截断检查。
-- `Sources/Storage.swift`：钥匙串、会话、导出。
+- `Sources/Storage.swift`：设置、`~/.listenflow` 下的密钥文件、会话、导出。
 - `Sources/AppModel.swift` / `ContentView.swift`：会话状态和 SwiftUI 界面。
 
 ## 测试
@@ -189,7 +204,7 @@ LISTENFLOW_APP_DIR="$PWD/../听流-整理版.app" ./build.sh
 mkdir -p ../../work
 swiftc -swift-version 5 -parse-as-library \
   Sources/AudioChunker.swift Sources/Storage.swift Sources/ImageAttachments.swift Sources/LLMClient.swift \
-  Sources/Recognition.swift Sources/VolcProtocol.swift Tests/CoreTests.swift -o ../../work/core-tests -framework Security -framework IOKit
+  Sources/Recognition.swift Sources/VolcProtocol.swift Sources/VolcFile.swift Tests/CoreTests.swift -o ../../work/core-tests -framework Security -framework IOKit
 ../../work/core-tests
 ```
 
@@ -208,9 +223,9 @@ VOLC_ASR_API_KEY=… LISTENFLOW_REPLAY=/path/speech.pcm LISTENFLOW_REPLAY_ENGINE
   LISTENFLOW_REPLAY_OUT=/tmp/replay "../../work/preview/听流预览.app/Contents/MacOS/ListenFlow"
 ```
 
-密钥只从环境变量 `VOLC_ASR_API_KEY` 读取，预览构建不访问钥匙串。结果写到 `/tmp/replay-live.json`（定稿的行、每条预览与定稿的时间、暂停后等了多久）。可选：`LISTENFLOW_REPLAY_MIC`（第二路，当作麦克风）、`LISTENFLOW_REPLAY_DROP_AT=秒`（在该时刻掐断连接，检验重连补发）、`LISTENFLOW_REPLAY_THEN_LOCAL=1`（跑完后在同一进程切回本地模型再跑一遍）、`LISTENFLOW_REPLAY_RESOURCE`（换资源 ID，看报错）。不设 `LISTENFLOW_REPLAY_ENGINE` 时回放走本地模型。`LISTENFLOW_PREVIEW_SNAPSHOT=目录` 不开窗口，把主窗口和设置页按两种引擎各渲染成 PNG。
+密钥只从环境变量 `VOLC_ASR_API_KEY` 读取；预览构建不读真实的密钥文件，也不访问钥匙串。结果写到 `/tmp/replay-live.json`（定稿的行、每条预览与定稿的时间、暂停后等了多久）。可选：`LISTENFLOW_REPLAY_MIC`（第二路，当作麦克风）、`LISTENFLOW_REPLAY_DROP_AT=秒`（在该时刻掐断连接，检验重连补发）、`LISTENFLOW_REPLAY_THEN_LOCAL=1`（跑完后在同一进程切回本地模型再跑一遍）、`LISTENFLOW_REPLAY_RESOURCE`（换资源 ID，看报错）、`LISTENFLOW_REPLAY_REFINE=1`（录完接着走「精修全文」，结果写到 `-post.json`；音频会再计费一次）、`LISTENFLOW_REPLAY_CHUNK=秒`（缩短每段上传的长度，检验切分）。不设 `LISTENFLOW_REPLAY_ENGINE` 时回放走本地模型。`LISTENFLOW_PREVIEW_SNAPSHOT=目录` 不开窗口，把主窗口和设置页按两种引擎各渲染成 PNG。
 
-测试包括：豆包帧的编码解码（gzip 头、帧头、错误帧、残缺帧）、分句去重、补发缓存、说话检测、引擎设置迁移、纯静音不输出、连续音频切分无样本丢失、有底噪时仍在停顿处切分、8 秒上限与被迫切开标记、纯静音片段不发送、两路音源互不重置、旧设置迁移、精修窗口分组与异常结果拦截、音频暂存读写与权限、错误音频恢复、20 秒窗口与 32 秒上限、上下文快照、会话序列化和兼容 API 流式响应。
+测试包括：豆包帧的编码解码（gzip 头、帧头、错误帧、残缺帧）、分句去重、补发缓存、说话检测、引擎设置迁移、录音精修（讲话片段索引、分段与切点、时间对应、WAV 与请求、替换把关）、讲话片段的暂存与删除、密钥文件的读写与权限、纯静音不输出、连续音频切分无样本丢失、有底噪时仍在停顿处切分、8 秒上限与被迫切开标记、纯静音片段不发送、两路音源互不重置、旧设置迁移、精修窗口分组与异常结果拦截、音频暂存读写与权限、错误音频恢复、20 秒窗口与 32 秒上限、上下文快照、会话序列化和兼容 API 流式响应。
 
 切分与精修方案的对比实验在 `work/asr-lab/`（`lab2.py`–`lab4.py`、`parity.py`），改参数后可以重跑。
 
@@ -219,7 +234,7 @@ VOLC_ASR_API_KEY=… LISTENFLOW_REPLAY=/path/speech.pcm LISTENFLOW_REPLAY_ENGINE
 完整实测结果见 [TESTING.md](TESTING.md)，本地模型持续转写的资源采样见 [RESOURCE-USAGE.md](RESOURCE-USAGE.md)。
 
 - 豆包引擎：一条连接最长能保持多久没有测到上限（实际每段讲话一条连接，最长跑过 40 秒）；连续几小时的课堂、两路同时长时间识别、真实断网（而不是模拟掐断）都还没有实测。一句话一直不停顿时，约 20 秒才定稿一次，这期间只有预览。
-- 豆包引擎下没有「精修全文」，录完不能在本机重识别；想要这个能力请用本地模型录。
+- 豆包引擎的「精修全文」只用文件回放测过，最长一次 269 秒；真实课堂长度（几十段上传）、上传中途断网、单段大小的上限都还没有实测。
 - 下面几条关于切段和 8 秒上限的说明只针对本地模型。
 
 - 远场收音（电脑放在讲台远处、内置麦克风）时讲话只比底噪高约 10 dB，错字仍明显多于近距离收音。最有效的办法是让麦克风靠近说话人或用外接麦克风；调高系统输入音量对识别帮助不大，因为噪声会被同样放大。

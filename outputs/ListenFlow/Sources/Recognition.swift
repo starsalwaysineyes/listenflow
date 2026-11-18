@@ -19,13 +19,24 @@ enum PowerSource {
     }
 }
 
-/// The session's audio, one Int16 file per source, kept only so a session recorded
-/// in economy mode can be re-recognized later. Never leaves this Mac.
+/// The session's audio, one Int16 file per source, kept only so the session can be
+/// re-recognized later. With the local engine it never leaves this Mac; with the
+/// cloud engine it is what was streamed to Doubao, and refinement sends it again.
 enum AudioStore {
     /// Tests point this at a temporary folder so they never touch real sessions.
     nonisolated(unsafe) static var rootOverride: URL?
-    static var root: URL {
-        rootOverride ?? SessionStore.folder.deletingLastPathComponent().appendingPathComponent("Audio", isDirectory: true)
+    static var root: URL { rootOverride ?? ListenFlowHome.root.appendingPathComponent("audio", isDirectory: true) }
+    /// Up to 0.8.0 kept audio sat beside the sessions in Application Support.
+    /// Sessions still refer to it, so it moves rather than being left behind.
+    static func adoptLegacy() {
+        let fm = FileManager.default
+        let old = SessionStore.folder.deletingLastPathComponent().appendingPathComponent("Audio", isDirectory: true)
+        guard rootOverride == nil, let sessions = try? fm.contentsOfDirectory(at: old, includingPropertiesForKeys: nil) else { return }
+        queue.sync {
+            try? ListenFlowHome.ensure(root)
+            for dir in sessions { try? fm.moveItem(at: dir, to: root.appendingPathComponent(dir.lastPathComponent)) }
+            if (try? fm.contentsOfDirectory(atPath: old.path))?.isEmpty == true { try? fm.removeItem(at: old) }
+        }
     }
     static let retention: TimeInterval = 7 * 24 * 3600
     private static let queue = DispatchQueue(label: "ListenFlow.audio")
@@ -45,24 +56,116 @@ enum AudioStore {
             let offset = lengths[url.path] ?? currentLength(url)
             lengths[url.path] = offset + samples.count
             let data = samples.map { Int16(max(-1, min(1, $0)) * 32767) }.withUnsafeBytes { Data($0) }
-            queue.async {
-                do {
-                    let fm = FileManager.default
-                    try fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true,
-                                           attributes: [.posixPermissions: 0o700])
-                    if !fm.fileExists(atPath: url.path) {
-                        fm.createFile(atPath: url.path, contents: nil, attributes: [.posixPermissions: 0o600])
-                    }
-                    let handle = try FileHandle(forWritingTo: url)
-                    defer { try? handle.close() }
-                    try handle.seek(toOffset: UInt64(offset * 2))
-                    try handle.write(contentsOf: data)
-                } catch {
-                    // Refinement simply becomes unavailable for this stretch; live
-                    // transcription is unaffected.
-                }
-            }
+            // A failed write only makes refinement unavailable for this stretch;
+            // live transcription is unaffected.
+            queue.async { try? write(data, to: url, at: UInt64(offset * 2)) }
             return AudioRef(offset: offset, count: samples.count)
+        }
+    }
+
+    private static func write(_ data: Data, to url: URL, at position: UInt64?) throws {
+        let fm = FileManager.default
+        try fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true,
+                               attributes: [.posixPermissions: 0o700])
+        if !fm.fileExists(atPath: url.path) {
+            fm.createFile(atPath: url.path, contents: nil, attributes: [.posixPermissions: 0o600])
+        }
+        let handle = try FileHandle(forWritingTo: url)
+        defer { try? handle.close() }
+        if let position { try handle.seek(toOffset: position) } else { try handle.seekToEnd() }
+        try handle.write(contentsOf: data)
+    }
+
+    // MARK: Cloud engine
+    //
+    // The speech streamed to Doubao, kept so the whole session can be recognized
+    // again from the recording afterwards. Its own files: there are no chunks to
+    // point lines at, only stretches of speech and when each began.
+
+    static func streamFile(session: UUID, source: String) -> URL {
+        file(session: session, source: source).deletingPathExtension().appendingPathExtension("stream.pcm")
+    }
+    private static func streamIndex(_ file: URL) -> URL {
+        file.deletingPathExtension().appendingPathExtension("idx")
+    }
+
+    /// 16-bit PCM as it goes to the service; `spanStart` is set on the first
+    /// piece of a new stretch of speech.
+    static func appendStream(_ pcm: Data, session: UUID, source: String, spanStart: Date?) {
+        let url = streamFile(session: session, source: source)
+        queue.sync {
+            let offset = lengths[url.path] ?? currentLength(url)
+            lengths[url.path] = offset + pcm.count / 2
+            queue.async {
+                if let spanStart {
+                    try? write(Data("\(offset) \(spanStart.timeIntervalSince1970)\n".utf8), to: streamIndex(url), at: nil)
+                }
+                try? write(pcm, to: url, at: UInt64(offset * 2))
+            }
+        }
+    }
+
+    /// Every source of the session that has kept speech, with its stretches.
+    static func streamSpans(_ session: UUID) -> [String: [AudioSpan]] {
+        queue.sync {
+            var result: [String: [AudioSpan]] = [:]
+            for url in streamFiles(session) {
+                let name = url.lastPathComponent.replacingOccurrences(of: ".stream.pcm", with: "")
+                guard let source = name.removingPercentEncoding,
+                      let index = try? String(contentsOf: streamIndex(url), encoding: .utf8) else { continue }
+                let spans = VolcRecording.spans(index: index, totalSamples: currentLength(url))
+                if !spans.isEmpty { result[source] = spans }
+            }
+            return result
+        }
+    }
+
+    static func readStream(session: UUID, source: String, offset: Int, count: Int) -> Data? {
+        let url = streamFile(session: session, source: source)
+        return queue.sync {
+            guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+            defer { try? handle.close() }
+            guard (try? handle.seek(toOffset: UInt64(offset * 2))) != nil,
+                  let data = try? handle.read(upToCount: count * 2), data.count == count * 2 else { return nil }
+            return data
+        }
+    }
+
+    /// Seconds of kept speech, all sources together; 0 when there is none.
+    static func streamSeconds(_ session: UUID) -> TimeInterval {
+        queue.sync { Double(streamFiles(session).reduce(0) { $0 + currentLength($1) }) / 16000 }
+    }
+
+    static func deleteStream(_ session: UUID) {
+        queue.sync {
+            let fm = FileManager.default
+            let dir = folder(session)
+            // By prefix, not by listed URL: a listing may spell the path differently.
+            lengths = lengths.filter { !($0.key.hasPrefix(dir.path) && $0.key.hasSuffix(".stream.pcm")) }
+            for url in streamFiles(session) {
+                try? fm.removeItem(at: url)
+                try? fm.removeItem(at: streamIndex(url))
+            }
+            if (try? fm.contentsOfDirectory(atPath: dir.path))?.isEmpty == true { try? fm.removeItem(at: dir) }
+        }
+    }
+
+    private static func streamFiles(_ session: UUID) -> [URL] {
+        ((try? FileManager.default.contentsOfDirectory(at: folder(session), includingPropertiesForKeys: nil)) ?? [])
+            .filter { $0.lastPathComponent.hasSuffix(".stream.pcm") }
+    }
+
+    /// The local engine's files only; kept speech of the cloud engine stays.
+    static func deleteChunks(_ session: UUID) {
+        queue.sync {
+            let fm = FileManager.default
+            let dir = folder(session)
+            lengths = lengths.filter { !($0.key.hasPrefix(dir.path) && !$0.key.hasSuffix(".stream.pcm")) }
+            for url in (try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? []
+            where url.pathExtension == "pcm" && !url.lastPathComponent.hasSuffix(".stream.pcm") {
+                try? fm.removeItem(at: url)
+            }
+            if (try? fm.contentsOfDirectory(atPath: dir.path))?.isEmpty == true { try? fm.removeItem(at: dir) }
         }
     }
 

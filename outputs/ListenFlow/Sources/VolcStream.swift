@@ -42,6 +42,10 @@ final class VolcStream: @unchecked Sendable {
     let source: String
     private let settings: Settings
     private let emit: (Event) -> Void
+    /// Receives exactly the audio that is streamed, once, as 16-bit PCM; the date
+    /// is set on the first piece of each stretch of speech. Called on the
+    /// stream's own queue.
+    private let keep: ((Data, Date?) -> Void)?
     private let queue = DispatchQueue(label: "ListenFlow.volc", qos: .userInitiated)
     private let urlSession = URLSession(configuration: .ephemeral)
 
@@ -75,9 +79,10 @@ final class VolcStream: @unchecked Sendable {
     private var openSince: Date?
 
     /// `emit` is called on the main queue.
-    init(source: String, settings: Settings, emit: @escaping (Event) -> Void) {
+    init(source: String, settings: Settings, keep: ((Data, Date?) -> Void)? = nil, emit: @escaping (Event) -> Void) {
         self.source = source
         self.settings = settings
+        self.keep = keep
         self.emit = emit
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now() + 0.5, repeating: 0.5)
@@ -142,7 +147,9 @@ final class VolcStream: @unchecked Sendable {
             publishOpenSince()
         }
         if let segment = live {
-            segment.backlog.append(VolcFrame.pcm(samples))
+            let pcm = VolcFrame.pcm(samples)
+            segment.backlog.append(pcm)
+            self.keep?(pcm, nil)
             if end.timeIntervalSince(lastSpeech) > Self.closeAfterQuiet { self.end(segment) }
             else if Double(segment.backlog.unsent) / 32000 > Self.maxBacklog {
                 fail("豆包语音识别连接中断，重连未成功。已识别的内容已保留。")
@@ -156,7 +163,9 @@ final class VolcStream: @unchecked Sendable {
         // Speech began: open a connection and lead with the moments before it,
         // so the first syllable is not clipped.
         let segment = Segment(start: end.addingTimeInterval(-Double(preroll.count) / 16000))
-        segment.backlog.append(VolcFrame.pcm(preroll))
+        let lead = VolcFrame.pcm(preroll)
+        segment.backlog.append(lead)
+        self.keep?(lead, segment.backlog.start)
         preroll.removeAll(keepingCapacity: true)
         lastSpeech = end
         live = segment

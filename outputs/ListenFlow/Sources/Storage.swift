@@ -38,6 +38,8 @@ struct Preferences: Codable {
     /// (`volc.seedasr.sauc.concurrent`) needs its own quota; a handshake that
     /// succeeds does not mean the resource is usable.
     var volcResourceID = "volc.seedasr.sauc.duration"
+    /// Doubao recording-file recognition, used to refine a finished session.
+    var volcFileResourceID = "volc.seedasr.auc"
     var python = "/Users/aurora/Desktop/workspace/asr-realtime-lab/.venv/bin/python"
     var asrModel = "mlx-community/Qwen3-ASR-1.7B-8bit"
     var language = ""
@@ -46,7 +48,8 @@ struct Preferences: Codable {
     var llmModel = "deepseek-flash"
     var recognitionMode = RecognitionMode.auto
     /// Keep the session's 16 kHz audio on this Mac so it can be re-recognized later;
-    /// deleted once refined, and after seven days regardless.
+    /// deleted once refined, and after seven days regardless. With the cloud
+    /// engine only the speech that was streamed is kept.
     var keepAudioForRefine = true
     /// Live transcript in the notch. The body height is set by dragging the
     /// island's bottom edge; 0.7.0's line-count presets are not carried over,
@@ -67,6 +70,7 @@ struct Preferences: Codable {
         let d = Preferences()
         engine = (try? c.decodeIfPresent(RecognitionEngine.self, forKey: .engine)) ?? d.engine
         volcResourceID = try c.decodeIfPresent(String.self, forKey: .volcResourceID) ?? d.volcResourceID
+        volcFileResourceID = try c.decodeIfPresent(String.self, forKey: .volcFileResourceID) ?? d.volcFileResourceID
         python = try c.decodeIfPresent(String.self, forKey: .python) ?? d.python
         asrModel = try c.decodeIfPresent(String.self, forKey: .asrModel) ?? d.asrModel
         language = try c.decodeIfPresent(String.self, forKey: .language) ?? d.language
@@ -93,43 +97,104 @@ struct Preferences: Codable {
     func save() { if let data = try? JSONEncoder().encode(self) { UserDefaults.standard.set(data, forKey: "preferences") } }
 }
 
+/// `~/.listenflow`: what the user should be able to find, back up or delete by
+/// hand — API keys and kept recordings. Readable by the owner only.
+enum ListenFlowHome {
+    /// Tests point this at a temporary folder.
+    nonisolated(unsafe) static var rootOverride: URL?
+    static var isPreview: Bool { Bundle.main.bundleIdentifier == "local.ListenFlow.preview" }
+    static var root: URL {
+        if let rootOverride { return rootOverride }
+        // Preview and test builds get a throwaway home: they never see real keys
+        // or recordings, and nothing they write survives.
+        if isPreview { return FileManager.default.temporaryDirectory.appendingPathComponent("listenflow-preview-home", isDirectory: true) }
+        return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".listenflow", isDirectory: true)
+    }
+    static func ensure(_ directory: URL) throws {
+        let fm = FileManager.default
+        try fm.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+    }
+}
+
+/// API keys, in `~/.listenflow/keys.json` (mode 0600): one entry per account —
+/// the API address for question answering, `volcengine-asr` for Doubao speech.
+/// Up to 0.8.0 they were in the Keychain. Nothing is stored there any more: a
+/// key found there is moved to the file the first time it is asked for.
 enum SecretStore {
-    /// Keychain account of the Doubao speech recognition key.
+    /// Account of the Doubao speech recognition key (streaming and recordings).
     static let volcAccount = "volcengine-asr"
-    private static let service = "local.ListenFlow.llm"
-    private static func query(_ account: String) -> [String: Any] {
-        [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service,
+    static var file: URL { ListenFlowHome.root.appendingPathComponent("keys.json") }
+    private static let lock = NSLock()
+
+    /// Nil when the file exists but cannot be read as a JSON object of strings:
+    /// it is then left alone rather than overwritten.
+    private static func load() -> [String: String]? {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: file.path) else { return [:] }
+        // Hand-made files tend to be world-readable; a key file must not be.
+        if let mode = (try? fm.attributesOfItem(atPath: file.path))?[.posixPermissions] as? Int, mode & 0o077 != 0 {
+            try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+        }
+        guard let data = try? Data(contentsOf: file) else { return nil }
+        if data.allSatisfy({ $0 == 0x20 || $0 == 0x0a || $0 == 0x0d || $0 == 0x09 }) { return [:] }
+        return (try? JSONSerialization.jsonObject(with: data)) as? [String: String]
+    }
+
+    private static func store(_ value: String, _ account: String) throws {
+        guard var all = load() else {
+            throw CaptureFailure.message("密钥文件 \(file.path) 不是有效的 JSON，没有改动它。请修正或删除这个文件后再保存。")
+        }
+        // An empty entry is kept on purpose: it says the key was cleared here,
+        // so the Keychain is not consulted for it again.
+        all[account] = value
+        do {
+            try ListenFlowHome.ensure(file.deletingLastPathComponent())
+            let data = try JSONSerialization.data(withJSONObject: all, options: [.prettyPrinted, .sortedKeys])
+            // Created private before it holds anything, then swapped in whole.
+            let draft = file.appendingPathExtension("tmp")
+            try? FileManager.default.removeItem(at: draft)
+            guard FileManager.default.createFile(atPath: draft.path, contents: data, attributes: [.posixPermissions: 0o600]) else {
+                throw CocoaError(.fileWriteUnknown)
+            }
+            _ = try FileManager.default.replaceItemAt(file, withItemAt: draft)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+        } catch {
+            throw CaptureFailure.message("无法把密钥保存到 \(file.path)：\(error.localizedDescription)")
+        }
+    }
+
+    static func read(account: String) -> String {
+        lock.withLock {
+            guard let all = load() else { return "" }
+            if let value = all[account] { return value }
+            // Only the installed app looks in the Keychain, and once per account.
+            guard ListenFlowHome.rootOverride == nil, !ListenFlowHome.isPreview, Bundle.main.bundleIdentifier != nil else { return "" }
+            let old = keychain(account)
+            try? store(old, account)
+            // Moved, not copied — but only once the file is known to hold it.
+            if !old.isEmpty, load()?[account] == old { SecItemDelete(keychainQuery(account) as CFDictionary) }
+            return old
+        }
+    }
+
+    static func save(_ value: String, account: String) throws {
+        try lock.withLock { try store(value, account) }
+    }
+
+    private static func keychainQuery(_ account: String) -> [String: Any] {
+        [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: "local.ListenFlow.llm",
          kSecAttrAccount as String: account]
     }
-    static func read(account: String) -> String {
-        var q = query(account)
-        q[kSecReturnData as String] = true
-        q[kSecMatchLimit as String] = kSecMatchLimitOne
+
+    private static func keychain(_ account: String) -> String {
+        var query = keychainQuery(account)
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
         var result: CFTypeRef?
-        guard SecItemCopyMatching(q as CFDictionary, &result) == errSecSuccess,
+        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
               let data = result as? Data else { return "" }
         return String(data: data, encoding: .utf8) ?? ""
-    }
-    static func save(_ value: String, account: String) throws {
-        let q = query(account)
-        if value.isEmpty {
-            let status = SecItemDelete(q as CFDictionary)
-            guard status == errSecSuccess || status == errSecItemNotFound else {
-                throw CaptureFailure.message("无法删除钥匙串中的密钥（\(status)）。")
-            }
-            return
-        }
-        let data = Data(value.utf8)
-        let status = SecItemUpdate(q as CFDictionary, [kSecValueData as String: data] as CFDictionary)
-        if status == errSecItemNotFound {
-            var item = q
-            item[kSecValueData as String] = data
-            item[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
-            let added = SecItemAdd(item as CFDictionary, nil)
-            guard added == errSecSuccess else { throw CaptureFailure.message("无法保存 API 密钥到钥匙串（\(added)）。") }
-        } else if status != errSecSuccess {
-            throw CaptureFailure.message("无法更新 API 密钥（\(status)）。")
-        }
     }
 }
 

@@ -359,9 +359,156 @@ enum CaptureFailure: LocalizedError {
         var listed = Preferences(); listed.hotwords = "小林，梯度下降,损失函数\n听流"
         precondition(listed.hotwordList == ["小林", "梯度下降", "损失函数", "听流"])
 
+        // --- Refinement from the recording (cloud engine) ---
+        let recT0 = Date(timeIntervalSince1970: 1_800_000_000)
+        // The index: one line per stretch of speech; garbage and backwards offsets are skipped.
+        let recIndex = "0 \(recT0.timeIntervalSince1970)\n16000 \(recT0.timeIntervalSince1970 + 10)\nnonsense\n8000 5\n48000 \(recT0.timeIntervalSince1970 + 30)\n"
+        let recSpans = VolcRecording.spans(index: recIndex, totalSamples: 80000)
+        precondition(recSpans == [AudioSpan(offset: 0, count: 16000, start: recT0),
+                                  AudioSpan(offset: 16000, count: 32000, start: recT0.addingTimeInterval(10)),
+                                  AudioSpan(offset: 48000, count: 32000, start: recT0.addingTimeInterval(30))], "Spans run to the next mark or the end")
+        precondition(VolcRecording.spans(index: "", totalSamples: 100).isEmpty && VolcRecording.spans(index: "0 1\n", totalSamples: 0).isEmpty)
+
+        // Uploads: whole stretches while they fit, nothing lost, nothing sent twice.
+        let recPlan = VolcRecording.plan(recSpans, limit: 50000, search: 8000) { _ in preconditionFailure("No stretch needs cutting") }
+        precondition(recPlan.map { $0.map(\.offset) } == [[0, 16000], [48000]], "A stretch that does not fit starts the next upload")
+        // One long lecture without a pause: cut where the callback says, inside the search range.
+        var recAsked: [Range<Int>] = []
+        let recLong = [AudioSpan(offset: 1000, count: 250_000, start: recT0)]
+        let recCut = VolcRecording.plan(recLong, limit: 100_000, search: 20_000) { range in recAsked.append(range); return range.lowerBound + 5000 }
+        precondition(recAsked == [81_000..<101_000, 166_000..<186_000], "Search the end of each upload")
+        precondition(recCut.count == 3 && recCut.allSatisfy { $0.count == 1 && $0[0].count <= 100_000 })
+        precondition(recCut.map { $0[0].offset } == [1000, 86_000, 171_000] && recCut.map { $0[0].count }.reduce(0, +) == 250_000, "Contiguous and complete")
+        precondition(abs(recCut[1][0].start.timeIntervalSince(recT0) - 85000.0 / 16000) < 0.001, "A cut stretch keeps its clock")
+        let recWild = VolcRecording.plan(recLong, limit: 100_000, search: 20_000) { _ in 0 }
+        precondition(recWild.allSatisfy { $0[0].count > 0 && $0[0].count <= 100_000 } && recWild.map { $0[0].count }.reduce(0, +) == 250_000, "A bad cut point is clamped")
+
+        // The quietest moment: noise, 0.4 s of near silence, noise.
+        var recNoise = (0..<48000).map { i in Int16(((i * 7919) % 2000) - 1000) }
+        for i in 30000..<36400 { recNoise[i] = Int16(i % 3) }
+        let recQuiet = VolcRecording.quietest(in: recNoise.withUnsafeBytes { Data($0) })
+        precondition((30000..<36400).contains(recQuiet), "Cut in the pause, got \(recQuiet)")
+        precondition(VolcRecording.quietest(in: Data(count: 100)) == 25, "Too short to search: the middle")
+
+        // Time in the upload → capture clock, with 0.5 s put between separate stretches only.
+        let recPair = [recSpans[0], recSpans[1]]                     // 1 s at T0, then 2 s at T0+10
+        precondition(VolcRecording.starts(recPair) == [0, 1500])
+        precondition(VolcRecording.date(ms: 400, in: recPair) == recT0.addingTimeInterval(0.4))
+        precondition(VolcRecording.date(ms: 1200, in: recPair) == recT0.addingTimeInterval(1), "Inside the seam: end of the stretch before")
+        precondition(VolcRecording.date(ms: 2500, in: recPair) == recT0.addingTimeInterval(11))
+        precondition(VolcRecording.date(ms: 99_000, in: recPair) == recT0.addingTimeInterval(12), "Never past the audio")
+        precondition(VolcRecording.starts([recCut[0][0], recCut[1][0]]) == [0, 85000 / 16], "Halves of one stretch join without a gap")
+
+        let recWav = VolcRecording.wav([Data(repeating: 1, count: 32000), Data(repeating: 2, count: 64000)], spans: recPair)
+        precondition(recWav.count == 44 + 32000 + 16000 + 64000 && String(decoding: recWav[0..<4], as: UTF8.self) == "RIFF"
+                     && String(decoding: recWav[8..<16], as: UTF8.self) == "WAVEfmt ")
+        precondition(recWav[24..<28].elementsEqual([0x80, 0x3e, 0, 0]) && recWav[22] == 1 && recWav[34] == 16, "16 kHz mono 16-bit")
+        precondition(recWav[40..<44].withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) } == 112000 && recWav[44] == 1
+                     && recWav[44 + 32000] == 0 && recWav[44 + 48000] == 2, "Data length, and silence in the seam")
+
+        let recBody = try JSONSerialization.jsonObject(with: VolcRecording.submitBody(wav: recWav, uid: "u", hotwords: ["听流", " "], splitOnPauses: false)) as! [String: Any]
+        let recAudio = recBody["audio"] as! [String: Any], recRequest = recBody["request"] as! [String: Any]
+        precondition(recAudio["format"] as? String == "wav" && Data(base64Encoded: recAudio["data"] as! String) == recWav)
+        precondition(recRequest["model_name"] as? String == "bigmodel" && recRequest["show_utterances"] as? Bool == true
+                     && recRequest["enable_punc"] as? Bool == true && recRequest["vad_segment"] == nil)
+        precondition(((recRequest["corpus"] as? [String: Any])?["context"] as? String)?.contains("听流") == true)
+        let recSplit = (try JSONSerialization.jsonObject(with: VolcRecording.submitBody(wav: Data(), uid: "u", hotwords: [], splitOnPauses: true)) as! [String: Any])["request"] as! [String: Any]
+        precondition(recSplit["vad_segment"] as? Bool == true && recSplit["end_window_size"] as? Int == 300 && recSplit["corpus"] == nil)
+
+        // The answer: same shape as a streaming result, without `definite`.
+        let recAnswer = Data(#"{"audio_info":{"duration":3000},"result":{"text":"第一句。第二句。","utterances":[{"start_time":100,"end_time":900,"text":"第一句。"},{"start_time":1600,"end_time":3400,"text":"第二句。"},{"start_time":3400,"end_time":3450,"text":"  "}]}}"#.utf8)
+        let recLines = VolcRecording.lines(VolcFrame.utterances(in: recAnswer)!.utterances, spans: recPair, source: "腾讯会议")
+        precondition(recLines.map(\.text) == ["第一句。", "第二句。"] && recLines.allSatisfy { $0.refined == true && $0.source == "腾讯会议" })
+        precondition(recLines[0].start == recT0.addingTimeInterval(0.1) && recLines[1].start == recT0.addingTimeInterval(10.1)
+                     && recLines[1].end == recT0.addingTimeInterval(11.9))
+
+        // Replacing: only this source's lines inside the stretch of time the upload covers.
+        func recLine(_ at: Double, _ source: String, _ text: String) -> TranscriptLine {
+            TranscriptLine(start: recT0.addingTimeInterval(at), end: recT0.addingTimeInterval(at + 1), source: source, text: text, latency: 0)
+        }
+        var recSession = [recLine(0, "腾讯会议", "第一局"), recLine(10.5, "腾讯会议", "第二句"), recLine(10.6, "麦克风", "我说的"), recLine(31, "腾讯会议", "后面的")]
+        let recOld = VolcRecording.covered(recSession, source: "腾讯会议", spans: recPair)
+        precondition(recOld.map(\.text) == ["第一局", "第二句"])
+        VolcRecording.replace(recOld, with: recLines, in: &recSession)
+        precondition(recSession.map(\.text) == ["第一句。", "第二句。", "我说的", "后面的"], "Other sources and other times untouched")
+        precondition(VolcRecording.acceptable(original: "今天讲梯度下降", refined: "今天讲，梯度下降。") && VolcRecording.acceptable(original: "嗯", refined: "嗯，我们开始上课")
+                     && VolcRecording.acceptable(original: "", refined: "漏掉的一句"))
+        precondition(!VolcRecording.acceptable(original: "今天讲梯度下降和损失函数", refined: "今天") && !VolcRecording.acceptable(original: "今天讲", refined: "")
+                     && !VolcRecording.acceptable(original: "", refined: "。"), "Never trade words for nothing")
+
+        precondition(VolcFrame.errorMessage(Data(#"{"header":{"reqid":"x","code":45000030,"message":"requested resource not granted"}}"#.utf8)) == "requested resource not granted",
+                     "The reason, not the envelope")
+
+        // Splitting on pauses can lose a very short line; one the new result does not cover stays.
+        let recLive = [recLine(0, "麦克风", "关于新版本的设计"), recLine(5.2, "麦克风", "第一"), recLine(6.3, "麦克风", "很多人没有注意到")]
+        let recFresh = [recLine(0.1, "麦克风", "关于新版本的设计。"), recLine(6.4, "麦克风", "很多人没有注意到。")]
+        precondition(VolcRecording.uncovered(recLive, by: recFresh).map(\.text) == ["第一"])
+        precondition(VolcRecording.uncovered(recLive, by: []).count == 3 && VolcRecording.uncovered([], by: recFresh).isEmpty)
+
+        // Kept speech on disk: stretches with their clocks, private, and removable on its own.
+        let recTmp = FileManager.default.temporaryDirectory.appendingPathComponent("lf-stream-\(UUID().uuidString)")
+        AudioStore.rootOverride = recTmp
+        let recSID = UUID()
+        _ = AudioStore.append([Float](repeating: 0.1, count: 400), session: recSID, source: "腾讯会议")     // a local-engine chunk
+        AudioStore.appendStream(Data(repeating: 3, count: 2000), session: recSID, source: "腾讯会议", spanStart: recT0)
+        AudioStore.appendStream(Data(repeating: 4, count: 1000), session: recSID, source: "腾讯会议", spanStart: nil)
+        AudioStore.appendStream(Data(repeating: 5, count: 600), session: recSID, source: "腾讯会议", spanStart: recT0.addingTimeInterval(60))
+        AudioStore.appendStream(Data(repeating: 6, count: 800), session: recSID, source: "麦克风", spanStart: recT0.addingTimeInterval(5))
+        let recKept = AudioStore.streamSpans(recSID)
+        precondition(Set(recKept.keys) == ["腾讯会议", "麦克风"], "Source names survive the file name")
+        precondition(recKept["腾讯会议"]!.map(\.offset) == [0, 1500] && recKept["腾讯会议"]!.map(\.count) == [1500, 300]
+                     && abs(recKept["腾讯会议"]![1].start.timeIntervalSince(recT0) - 60) < 0.001)
+        precondition(AudioStore.readStream(session: recSID, source: "腾讯会议", offset: 1000, count: 800) == Data(repeating: 4, count: 1000) + Data(repeating: 5, count: 600))
+        precondition(AudioStore.readStream(session: recSID, source: "腾讯会议", offset: 1700, count: 200) == nil, "Never a short read")
+        precondition(abs(AudioStore.streamSeconds(recSID) - 2200.0 / 16000) < 1e-9)
+        let recPerms = try FileManager.default.attributesOfItem(atPath: AudioStore.streamFile(session: recSID, source: "麦克风").path)[.posixPermissions] as! Int
+        precondition(recPerms == 0o600, "Kept speech must be private")
+        AudioStore.deleteStream(recSID)
+        precondition(AudioStore.streamSpans(recSID).isEmpty && AudioStore.streamSeconds(recSID) == 0)
+        precondition(AudioStore.read(session: recSID, source: "腾讯会议", offset: 0, count: 400) != nil, "The local engine's audio is not this refinement's to delete")
+        AudioStore.appendStream(Data(repeating: 7, count: 200), session: recSID, source: "麦克风", spanStart: recT0)
+        precondition(AudioStore.streamSpans(recSID)["麦克风"]!.map(\.offset) == [0], "A new recording starts a new file")
+        AudioStore.deleteChunks(recSID)
+        precondition(AudioStore.read(session: recSID, source: "腾讯会议", offset: 0, count: 1) == nil && AudioStore.streamSeconds(recSID) > 0)
+        AudioStore.deleteStream(recSID)
+        precondition(!AudioStore.hasAudio(recSID), "An empty folder is removed")
+        try? FileManager.default.removeItem(at: recTmp)
+        AudioStore.rootOverride = nil
+
+        // --- Keys in ~/.listenflow/keys.json ---
+        let keyHome = FileManager.default.temporaryDirectory.appendingPathComponent("lf-home-\(UUID().uuidString)")
+        ListenFlowHome.rootOverride = keyHome
+        precondition(SecretStore.read(account: "https://api.example.com") == "" && !FileManager.default.fileExists(atPath: keyHome.path), "Reading creates nothing")
+        try SecretStore.save("first-key", account: "https://api.example.com")
+        try SecretStore.save("second-key", account: SecretStore.volcAccount)
+        precondition(SecretStore.read(account: "https://api.example.com") == "first-key" && SecretStore.read(account: SecretStore.volcAccount) == "second-key")
+        let keyMode = try FileManager.default.attributesOfItem(atPath: SecretStore.file.path)[.posixPermissions] as! Int
+        let homeMode = try FileManager.default.attributesOfItem(atPath: keyHome.path)[.posixPermissions] as! Int
+        precondition(keyMode == 0o600 && homeMode == 0o700, "Only the owner may read keys")
+        let keyFiles = try FileManager.default.contentsOfDirectory(atPath: keyHome.path)
+        precondition(keyFiles == ["keys.json"], "No draft left behind")
+        try SecretStore.save("", account: "https://api.example.com")
+        precondition(SecretStore.read(account: "https://api.example.com") == "" && SecretStore.read(account: SecretStore.volcAccount) == "second-key", "Clearing one key leaves the others")
+        // A file made by hand: readable by others, then not; broken, then left alone.
+        try Data(#"{"volcengine-asr": "typed-by-hand"}"#.utf8).write(to: SecretStore.file)
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: SecretStore.file.path)
+        precondition(SecretStore.read(account: SecretStore.volcAccount) == "typed-by-hand")
+        let keyTightened = try FileManager.default.attributesOfItem(atPath: SecretStore.file.path)[.posixPermissions] as! Int
+        precondition(keyTightened == 0o600, "Tightened on first read")
+        try Data("{ not json".utf8).write(to: SecretStore.file)
+        precondition(SecretStore.read(account: SecretStore.volcAccount) == "")
+        var keyRefused = false
+        do { try SecretStore.save("x", account: "a") } catch { keyRefused = true }
+        let keyBroken = try Data(contentsOf: SecretStore.file)
+        precondition(keyRefused && keyBroken == Data("{ not json".utf8), "A file that cannot be read is never overwritten")
+        try? FileManager.default.removeItem(at: keyHome)
+        ListenFlowHome.rootOverride = nil
+        precondition(Preferences().volcFileResourceID == "volc.seedasr.auc")
+
         print("PASS: silence, bounded chunks, lossless boundaries, endpointing, independent sources, discard, API URLs, context snapshots, session round-trip")
         print("PASS: old-session compatibility, organized draft persistence/export, late-arrival coverage, lossless cleanup batching, raw-only cleanup context")
         print("PASS: Doubao frames (gzip, headers, errors, malformed input), sentence de-duplication, resend backlog, speech gate, engine settings")
+        print("PASS: recording refinement (span index, upload planning and cutting, clock mapping, WAV, request, replacement guards), kept speech store, key file")
         print("PASS: pause-aware chunking under noise, forced-cut flags, settings migration, refinement windows/guards/merge, echo filter, private audio store round trip")
         if CommandLine.arguments.contains("--organize-live") {
             let key = String(data: FileHandle.standardInput.readDataToEndOfFile(), encoding: .utf8)!.trimmingCharacters(in: .whitespacesAndNewlines)

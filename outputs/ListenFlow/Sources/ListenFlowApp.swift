@@ -71,7 +71,7 @@ struct ListenFlowApp: App {
                 settings.apiBase = "https://api.deepseek.com"
                 settings.llmModel = "deepseek-flash"
                 settings.save()
-                print("DeepSeek configured; API credential saved to Keychain.")
+                print("DeepSeek configured; API credential saved to \(SecretStore.file.path).")
                 exit(0)
             } catch { fputs("Configuration failed: \(error.localizedDescription)\n", stderr); exit(1) }
         }

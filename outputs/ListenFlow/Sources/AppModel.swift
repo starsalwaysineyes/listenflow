@@ -182,6 +182,11 @@ final class AppModel: ObservableObject {
     private var refineQueue: [RefineJob] = []
     private var refineInFlight: RefineJob?
     private var postRefineChanged = 0
+    /// Seconds of streamed speech kept on disk for this session (cloud engine).
+    @Published var keptStreamSeconds: Double = 0
+    private var cloudRefineTask: Task<Void, Never>?
+    /// Audio per upload; the replay harness shortens it to exercise the cutting.
+    private var cloudChunkSeconds = VolcRecording.chunkSeconds
     private var askTask: Task<Void, Never>?
     private var organizeTask: Task<Void, Never>?
     private var lastOrganizationAttempt = Date.distantPast
@@ -239,11 +244,19 @@ final class AppModel: ObservableObject {
         guard let organized = session.organized, let refined = session.refinedAt else { return false }
         return refined > organized.generatedAt
     }
-    /// Audio for this session is kept and there is at least one multi-line window to redo.
+    /// Audio for this session is kept and there is something to redo: with the
+    /// local engine at least one multi-line window, with the cloud any kept speech.
     var canRefineSession: Bool {
-        !usesCloud && !isRecording && !isBusy && pending.isEmpty && !isPostRefining && modelReady
+        guard !isRecording, !isBusy, !isPostRefining else { return false }
+        if usesCloud { return pendingCount == 0 && volcKeyPresent && keptStreamSeconds > 0 }
+        return pending.isEmpty && modelReady
             && session.lines.contains { $0.audio != nil }
             && !Refinement.windows(session.lines, limit: Refinement.postWindow).isEmpty
+    }
+    /// For the footer: this session has audio on disk, or is about to.
+    var keepsAudio: Bool {
+        session.lines.contains { $0.audio != nil } || keptStreamSeconds > 0
+            || (isRecording && usesCloud && preferences.keepAudioForRefine)
     }
     var selectedApp: AudioApp? { apps.first { $0.id == selectedPID } }
     var connectionLabel: String {
@@ -269,7 +282,10 @@ final class AppModel: ObservableObject {
         refreshVolcKey()
         refreshApps()
         history = SessionStore.all()
-        DispatchQueue.global(qos: .utility).async { AudioStore.purgeExpired() }
+        DispatchQueue.global(qos: .utility).async {
+            if !ListenFlowHome.isPreview { AudioStore.adoptLegacy() }
+            AudioStore.purgeExpired()
+        }
         updateRecognitionMode()
         // UI tests use a separate bundle identifier and a synthetic session, never a live recording.
         if Bundle.main.bundleIdentifier == "local.ListenFlow.preview",
@@ -332,7 +348,8 @@ final class AppModel: ObservableObject {
         if usesCloud { refreshVolcKey() } else if !modelReady && !modelLoading { loadModel() }
     }
 
-    /// The key is read off the main thread: the Keychain may put up a prompt.
+    /// The key is read off the main thread: it is a file read, and the first
+    /// time after an update the Keychain may put up a prompt.
     private func refreshVolcKey() {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let present = !AppModel.volcKey().isEmpty
@@ -340,8 +357,8 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// Preview and test builds take the key from the environment and never touch
-    /// the Keychain; the real app only ever reads the Keychain.
+    /// Preview and test builds take the key from the environment only; the real
+    /// app reads `~/.listenflow/keys.json`.
     nonisolated private static func volcKey() -> String {
         if Bundle.main.bundleIdentifier == "local.ListenFlow.preview" {
             return ProcessInfo.processInfo.environment["VOLC_ASR_API_KEY"] ?? ""
@@ -465,7 +482,12 @@ final class AppModel: ObservableObject {
         if source == EchoFilter.micSource && activeStreams.keys.contains(where: { $0 != EchoFilter.micSource }) {
             settings.endWindowMS = 200
         }
-        let stream = VolcStream(source: source, settings: settings) { [weak self] event in
+        // Keep what is streamed, so the session can be refined from the recording.
+        let keeping = preferences.keepAudioForRefine && (!ListenFlowHome.isPreview || AudioStore.rootOverride != nil)
+        let sessionID = session.id
+        let stream = VolcStream(source: source, settings: settings, keep: keeping ? { pcm, start in
+            AudioStore.appendStream(pcm, session: sessionID, source: source, spanStart: start)
+        } : nil) { [weak self] event in
             self?.receive(event, from: id, source: source)
         }
         streamsByID[id] = stream
@@ -527,7 +549,19 @@ final class AppModel: ObservableObject {
             refreshCloudActivity()
             settleHeldMic()
             refreshPending()
+            refreshKeptAudio()
             persist()
+        }
+    }
+
+    private func refreshKeptAudio() {
+        let id = session.id
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let seconds = AudioStore.streamSeconds(id)
+            DispatchQueue.main.async {
+                guard let self, self.session.id == id, self.keptStreamSeconds != seconds else { return }
+                self.keptStreamSeconds = seconds
+            }
         }
     }
 
@@ -753,6 +787,7 @@ final class AppModel: ObservableObject {
     /// pass, meant for after a meeting recorded on battery.
     func refineSession() {
         guard canRefineSession else { return }
+        if usesCloud { refineSessionCloud(); return }
         let groups = Refinement.windows(session.lines, limit: Refinement.postWindow)
         var jobs: [RefineJob] = []
         for group in groups {
@@ -778,6 +813,7 @@ final class AppModel: ObservableObject {
     func cancelRefineSession() {
         guard isPostRefining else { return }
         refineQueue.removeAll { $0.post }
+        cloudRefineTask?.cancel()
         isPostRefining = false
         notice = "已停止精修，已完成的 \(postRefineDone) 处保留；暂存音频仍在，可以稍后继续。"
     }
@@ -786,11 +822,154 @@ final class AppModel: ObservableObject {
         isPostRefining = false
         session.refinedAt = Date()
         // The audio served its purpose; keeping it longer than needed is not the deal.
-        AudioStore.delete(session.id)
+        AudioStore.deleteChunks(session.id)
         for index in session.lines.indices { session.lines[index].audio = nil }
         persist()
         notice = "全文精修完成：重新识别 \(postRefineTotal) 段，其中 \(postRefineChanged) 段文字有改动。暂存音频已删除。"
             + (session.organized != nil ? "整理稿下次更新时会按精修后的原文整篇重整。" : "")
+    }
+
+    // MARK: - Cloud refinement
+
+    private struct CloudUpload: Sendable {
+        let source: String
+        let spans: [AudioSpan]
+        var seconds: TimeInterval { Double(spans.reduce(0) { $0 + $1.count }) / 16000 }
+    }
+
+    /// The session's kept speech as uploads of a few minutes each. A stretch too
+    /// long for one upload is cut at its quietest moment, which means reading
+    /// the audio, so this runs off the main thread.
+    nonisolated private static func cloudUploads(session: UUID, limit: TimeInterval) -> [CloudUpload] {
+        let spans = AudioStore.streamSpans(session)
+        // App sources first: the microphone's echo check reads their text.
+        let sources = spans.keys.sorted { ($0 == EchoFilter.micSource ? 1 : 0, $0) < ($1 == EchoFilter.micSource ? 1 : 0, $1) }
+        return sources.flatMap { source in
+            VolcRecording.plan(spans[source] ?? [], limit: Int(limit * 16000),
+                               search: Int(VolcRecording.cutSearchSeconds * 16000)) { range in
+                guard let pcm = AudioStore.readStream(session: session, source: source, offset: range.lowerBound,
+                                                      count: range.count) else { return range.upperBound }
+                return range.lowerBound + VolcRecording.quietest(in: pcm)
+            }.map { CloudUpload(source: source, spans: $0) }
+        }
+    }
+
+    /// Two uploads at a time; each result is handed over as soon as it is in.
+    nonisolated private static func recognize(_ uploads: [CloudUpload], session: UUID, client: VolcFileClient,
+                                              hotwords: [String], splitMic: Bool,
+                                              apply: @MainActor @Sendable (Int, [VolcUtterance]) -> Void) async throws {
+        try await withThrowingTaskGroup(of: (Int, [VolcUtterance]).self) { group in
+            var next = 0, running = 0
+            while true {
+                while next < uploads.count && running < 2 {
+                    let index = next, upload = uploads[index]
+                    group.addTask {
+                        var parts: [Data] = []
+                        for span in upload.spans {
+                            guard let pcm = AudioStore.readStream(session: session, source: upload.source,
+                                                                  offset: span.offset, count: span.count) else {
+                                throw VolcFileError.failed("暂存的音频读不出来了。")
+                            }
+                            parts.append(pcm)
+                        }
+                        let body = VolcRecording.submitBody(wav: VolcRecording.wav(parts, spans: upload.spans),
+                                                            uid: UUID().uuidString, hotwords: hotwords,
+                                                            splitOnPauses: splitMic && upload.source == EchoFilter.micSource)
+                        return (index, try await client.recognize(body: body, seconds: upload.seconds))
+                    }
+                    next += 1; running += 1
+                }
+                guard let (index, utterances) = try await group.next() else { return }
+                running -= 1
+                await apply(index, utterances)
+            }
+        }
+    }
+
+    /// Send the kept speech to Doubao's recording-file recognition and replace
+    /// the live lines with what comes back.
+    private func refineSessionCloud() {
+        let sessionID = session.id
+        let settings = preferences
+        let limit = cloudChunkSeconds
+        error = nil
+        notice = nil
+        postRefineDone = 0
+        postRefineTotal = 0
+        postRefineChanged = 0
+        isPostRefining = true
+        cloudRefineTask = Task { [weak self] in
+            let key = await Task.detached { AppModel.volcKey() }.value
+            let planned = await Task.detached { AppModel.cloudUploads(session: sessionID, limit: limit) }.value
+            guard let self, self.isPostRefining, self.session.id == sessionID else { return }
+            guard !key.isEmpty else {
+                self.isPostRefining = false
+                self.volcKeyPresent = false
+                self.error = "还没有填写豆包语音识别的 API Key，无法精修。"
+                return
+            }
+            // A run that was interrupted has already replaced some stretches;
+            // those are not sent, or paid for, twice.
+            let uploads = planned.filter { upload in
+                let old = VolcRecording.covered(self.session.lines, source: upload.source, spans: upload.spans)
+                return old.isEmpty || old.contains { $0.refined != true }
+            }
+            self.postRefineTotal = uploads.count
+            let seconds = uploads.reduce(0) { $0 + $1.seconds }
+            var failure: String?
+            // A microphone recorded next to an app has the app's sound in it.
+            let splitMic = Set(planned.map(\.source)).count > 1
+            do {
+                try await AppModel.recognize(uploads, session: sessionID,
+                                             client: VolcFileClient(key: key, resourceID: settings.volcFileResourceID),
+                                             hotwords: settings.hotwordList, splitMic: splitMic) { [weak self] index, utterances in
+                    self?.applyCloud(uploads[index], utterances, session: sessionID,
+                                     split: splitMic && uploads[index].source == EchoFilter.micSource)
+                }
+            } catch {
+                failure = error.localizedDescription
+            }
+            // Stopped by the user: `cancelRefineSession` has said so already.
+            guard self.isPostRefining, self.session.id == sessionID, !Task.isCancelled else { return }
+            self.isPostRefining = false
+            if let failure {
+                self.error = "精修中断：\(failure) 已完成的 \(self.postRefineDone) 段保留，暂存音频仍在，可以稍后再点「精修全文」继续。"
+                return
+            }
+            AudioStore.deleteStream(sessionID)
+            self.keptStreamSeconds = 0
+            if self.postRefineChanged > 0 { self.session.refinedAt = Date() }
+            self.persist()
+            self.notice = planned.isEmpty ? "这段会话没有可用的暂存音频。"
+                : uploads.isEmpty ? "这段会话已经精修过，暂存音频已删除。"
+                : "全文精修完成：\(uploads.count) 段、约 \(Self.minutes(seconds))的音频由豆包录音文件识别重新识别，其中 \(self.postRefineChanged) 段文字有改动。暂存音频已删除。"
+                    + (self.session.organized != nil && self.postRefineChanged > 0 ? "整理稿下次更新时会按精修后的原文整篇重整。" : "")
+        }
+    }
+
+    private func applyCloud(_ upload: CloudUpload, _ utterances: [VolcUtterance], session id: UUID, split: Bool) {
+        guard isPostRefining, session.id == id else { return }
+        var fresh = VolcRecording.lines(utterances, spans: upload.spans, source: upload.source)
+        // The recording has the echo in it again; the live pass had dropped it.
+        if upload.source == EchoFilter.micSource { fresh.removeAll { EchoFilter.isEcho($0, among: session.lines) } }
+        let old = VolcRecording.covered(session.lines, source: upload.source, spans: upload.spans)
+        if split { fresh = (fresh + VolcRecording.uncovered(old, by: fresh)).sorted { $0.start < $1.start } }
+        let before = old.map(\.text).joined(), after = fresh.map(\.text).joined()
+        if before == after {
+            // Nothing to improve; keep the lines (and their place in an organized
+            // draft) and only note that this stretch is done.
+            let ids = Set(old.map(\.id))
+            for index in session.lines.indices where ids.contains(session.lines[index].id) { session.lines[index].refined = true }
+        } else if VolcRecording.acceptable(original: before, refined: after) {
+            VolcRecording.replace(old, with: fresh, in: &session.lines)
+            postRefineChanged += 1
+        }
+        postRefineDone += 1
+        persist()
+    }
+
+    nonisolated private static func minutes(_ seconds: TimeInterval) -> String {
+        seconds < 90 ? "\(Int(seconds.rounded())) 秒" : "\(Int((seconds / 60).rounded())) 分钟"
     }
 
     private func failWorker(_ message: String) {
@@ -834,7 +1013,7 @@ final class AppModel: ObservableObject {
     func applyPreferences(_ value: Preferences, key: String, volcKey: String? = nil) throws {
         let engineChanged = preferences.engine != value.engine
         let changed = preferences.python != value.python || preferences.asrModel != value.asrModel
-        if (changed || engineChanged) && (isRecording || isBusy || pendingCount > 0 || modelLoading) {
+        if (changed || engineChanged) && (isRecording || isBusy || pendingCount > 0 || modelLoading || isPostRefining) {
             throw CaptureFailure.message("请先暂停转写并等待识别完成，再切换识别引擎或本地模型。")
         }
         if value.engine == .volc && value.volcResourceID.trimmingCharacters(in: .whitespaces).isEmpty {
@@ -849,6 +1028,8 @@ final class AppModel: ObservableObject {
         }
         preferences = value
         preferences.volcResourceID = value.volcResourceID.trimmingCharacters(in: .whitespaces)
+        let fileResource = value.volcFileResourceID.trimmingCharacters(in: .whitespaces)
+        preferences.volcFileResourceID = fileResource.isEmpty ? Preferences().volcFileResourceID : fileResource
         preferences.save()
         updateRecognitionMode()
         if value.engine == .local {
@@ -1067,6 +1248,7 @@ final class AppModel: ObservableObject {
         guard canChangeSession else { return }
         persist()
         session = MeetingSession()
+        keptStreamSeconds = 0
         echoDropped = 0
         resetRefinement()
         askImageIDs = []; organizationImageIDs = []
@@ -1078,6 +1260,8 @@ final class AppModel: ObservableObject {
         guard canChangeSession else { return }
         persist()
         session = value
+        keptStreamSeconds = 0
+        refreshKeptAudio()
         echoDropped = 0
         resetRefinement()
         askImageIDs = Set((value.chat.last(where: { $0.role == "user" })?.imageIDs ?? []).prefix(ImageAttachmentStore.maxSelected))
@@ -1103,6 +1287,7 @@ final class AppModel: ObservableObject {
     func shutdown() {
         askTask?.cancel()
         organizeTask?.cancel()
+        cloudRefineTask?.cancel()
         persist()
         cancelStreams()
         worker.shutdown()
@@ -1198,6 +1383,10 @@ extension AppModel {
         }
         volcKeyPresent = true
         if let resource = env["LISTENFLOW_REPLAY_RESOURCE"] { preferences.volcResourceID = resource }
+        let refine = env["LISTENFLOW_REPLAY_REFINE"] == "1"
+        preferences.keepAudioForRefine = refine
+        if let seconds = env["LISTENFLOW_REPLAY_CHUNK"].flatMap(Double.init) { cloudChunkSeconds = seconds }
+        if let resource = env["LISTENFLOW_REPLAY_FILE_RESOURCE"] { preferences.volcFileResourceID = resource }
         updateRecognitionModeForReplay()
         session = MeetingSession(title: "replay", created: Date())
         replayStarted = session.created
@@ -1237,6 +1426,17 @@ extension AppModel {
                                           "drainSeconds": Date().timeIntervalSince(fed), "echoDropped": echoDropped,
                                           "events": replayLog ?? [], "error": error ?? ""])
         replayLog = nil
+        guard refine else { return }
+        keptStreamSeconds = AudioStore.streamSeconds(session.id)
+        let kept = keptStreamSeconds
+        let began = Date()
+        refineSession()
+        while isPostRefining { try? await Task.sleep(nanoseconds: 200_000_000) }
+        write(out + "-post.json", extra: ["notice": notice ?? "", "error": error ?? "", "keptSeconds": kept,
+                                          "uploads": postRefineTotal, "changed": postRefineChanged,
+                                          "refineSeconds": Date().timeIntervalSince(began),
+                                          "audioLeft": AudioStore.streamSeconds(session.id)])
+        AudioStore.delete(session.id)
     }
 
     /// Renders the main window and the settings sheet for both engines to PNG files

@@ -60,7 +60,7 @@ enum Gzip {
     }
 }
 
-struct VolcUtterance: Equatable {
+struct VolcUtterance: Equatable, Sendable {
     var text: String
     var definite: Bool
     /// Milliseconds from the start of the audio sent on this connection.
@@ -175,7 +175,10 @@ enum VolcFrame {
     /// The reason carried by an error frame or a failed handshake body.
     static func errorMessage(_ payload: Data) -> String {
         if let object = try? JSONSerialization.jsonObject(with: payload) as? [String: Any] {
-            for key in ["error", "message", "err_msg"] { if let text = object[key] as? String, !text.isEmpty { return text } }
+            // Recording-file recognition wraps its reason in a "header" object.
+            for source in [object, object["header"] as? [String: Any] ?? [:]] {
+                for key in ["error", "message", "err_msg"] { if let text = source[key] as? String, !text.isEmpty { return text } }
+            }
         }
         return String(decoding: payload.prefix(300), as: UTF8.self)
     }

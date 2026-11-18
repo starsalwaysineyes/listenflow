@@ -336,7 +336,9 @@ struct ContentView: View {
             Button { model.refineSession() } label: {
                 Label("精修全文", systemImage: "wand.and.stars").font(.system(size: 11))
             }.buttonStyle(.plain).foregroundStyle(teal).padding(.trailing, 6)
-                .help("用暂存的音频，以约 30 秒为一段重新识别全文，更准确；完成后删除暂存音频")
+                .help(model.usesCloud
+                      ? "把本机暂存的约 \(Int((model.keptStreamSeconds / 60).rounded(.up))) 分钟录音上传到豆包录音文件识别，重新识别全文，更准确；按音频时长另外计费，完成后删除暂存录音"
+                      : "用暂存的音频，以约 30 秒为一段重新识别全文，更准确；完成后删除暂存音频")
         }
     }
 
@@ -482,7 +484,7 @@ struct ContentView: View {
             }
             Spacer()
             Text(!model.session.imageLibrary.isEmpty ? "会话与图片已保存在本机" : model.session.lines.isEmpty ? "会话文字自动保存在本机"
-                 : model.session.lines.contains { $0.audio != nil } ? "已自动保存 · 音频暂存本机，精修后删除" : "已自动保存 · 不保存原始音频")
+                 : model.keepsAudio ? "已自动保存 · 音频暂存本机，精修后删除" : "已自动保存 · 不保存原始音频")
                 .font(.system(size: 10))
         }
         .foregroundStyle(muted)
@@ -732,13 +734,19 @@ struct SettingsView: View {
                                     .font(.caption).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
                                 VStack(alignment: .leading, spacing: 5) {
                                     Text("豆包语音 API Key").font(.system(size: 11)).foregroundStyle(.secondary)
-                                    SecureField("密钥存入 macOS 钥匙串", text: $volcKey).textFieldStyle(.roundedBorder)
+                                    SecureField("保存在 ~/.listenflow/keys.json，仅本人可读", text: $volcKey).textFieldStyle(.roundedBorder)
                                 }
                                 field("资源 ID", text: $draft.volcResourceID, prompt: "volc.seedasr.sauc.duration")
                                 Text("小时版填 volc.seedasr.sauc.duration，按送入的音频时长计费；并发版填 volc.seedasr.sauc.concurrent，需要单独开通。只在有人说话时连接和发送音频，静音不计费。")
                                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                                 field("人名、术语（逗号分隔，可选）", text: $draft.hotwords)
-                                Text("识别档位、合并重识别和事后精修只用于本地模型；豆包自带二遍识别。没有网络时可以切换到本地模型。")
+                                Toggle("暂存录音，用于会后「精修全文」", isOn: $draft.keepAudioForRefine)
+                                Text("开启后，发给豆包的那部分音频（有人说话的片段）同时保存在这台 Mac 的 ~/.listenflow/audio。会后点「精修全文」，这些录音会上传到豆包录音文件识别，结合整段上下文重新识别，比实时结果更准；按音频时长另外计费。完成后删除，最长保留 7 天。")
+                                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                                if draft.keepAudioForRefine {
+                                    field("录音文件识别的资源 ID", text: $draft.volcFileResourceID, prompt: "volc.seedasr.auc")
+                                }
+                                Text("识别档位和合并重识别只用于本地模型；豆包自带二遍识别。没有网络时可以切换到本地模型。")
                                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                             } else {
                                 Picker("模型", selection: $draft.asrModel) {
@@ -759,7 +767,7 @@ struct SettingsView: View {
                                 Text(draft.recognitionMode.detail + "。高精度约多用一半算力，错字约再少两到三成。")
                                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                                 Toggle("暂存录音，用于事后「精修全文」", isOn: $draft.keepAudioForRefine)
-                                Text("音频只保存在这台 Mac，精修完成后删除，最长保留 7 天。关闭后不保存任何原始音频。")
+                                Text("音频只保存在这台 Mac 的 ~/.listenflow/audio，精修完成后删除，最长保留 7 天。关闭后不保存任何原始音频。")
                                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                                 Text("复用本机模型缓存，模型加载和转写均为离线运行，音频不离开这台 Mac。").font(.caption).foregroundStyle(.secondary)
                             }
@@ -794,7 +802,7 @@ struct SettingsView: View {
                             field("模型名称", text: $draft.llmModel, prompt: "deepseek-flash")
                             VStack(alignment: .leading, spacing: 5) {
                                 Text("API Key").font(.system(size: 11)).foregroundStyle(.secondary)
-                                SecureField("密钥存入 macOS 钥匙串", text: $key).textFieldStyle(.roundedBorder)
+                                SecureField("保存在 ~/.listenflow/keys.json，仅本人可读", text: $key).textFieldStyle(.roundedBorder)
                             }
                             Button("读取此地址已保存的密钥") { key = SecretStore.read(account: draft.apiBase) }.font(.caption)
                             Text("支持 chat/completions 兼容接口与流式回答。提问时发送当前会话的转写文字和最近问答，音频不会发送给问答服务。").font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
@@ -820,7 +828,7 @@ struct SettingsView: View {
             }
         }.padding(28).frame(width: 650, height: 690).tint(teal)
             .onAppear { draft = model.preferences; key = SecretStore.read(account: draft.apiBase)
-                // Preview builds never touch the Keychain.
+                // Preview builds take the Doubao key from the environment only.
                 if Bundle.main.bundleIdentifier != "local.ListenFlow.preview" {
                     volcKeyLoaded = SecretStore.read(account: SecretStore.volcAccount)
                     volcKey = volcKeyLoaded
