@@ -505,10 +505,144 @@ enum CaptureFailure: LocalizedError {
         ListenFlowHome.rootOverride = nil
         precondition(Preferences().volcFileResourceID == "volc.seedasr.auc")
 
+        // --- One upload's result applied to a transcript (shared by the window and background refinement) ---
+        var applyLines = [recLine(0, "腾讯会议", "第一局"), recLine(10.5, "腾讯会议", "第二句"), recLine(10.6, "麦克风", "我说的"), recLine(31, "腾讯会议", "后面的")]
+        precondition(VolcRecording.unfinished(applyLines, source: "腾讯会议", spans: recPair))
+        let applyUtterances = VolcFrame.utterances(in: recAnswer)!.utterances
+        precondition(VolcRecording.apply(applyUtterances, spans: recPair, source: "腾讯会议", split: false, to: &applyLines), "Changed text is reported")
+        precondition(applyLines.map(\.text) == ["第一句。", "第二句。", "我说的", "后面的"])
+        precondition(!VolcRecording.unfinished(applyLines, source: "腾讯会议", spans: recPair), "A finished upload is not sent twice")
+        precondition(!VolcRecording.apply(applyUtterances, spans: recPair, source: "腾讯会议", split: false, to: &applyLines) && applyLines.count == 4, "Same text again changes nothing")
+        var applyKept = [recLine(0, "腾讯会议", "今天讲梯度下降和损失函数的关系"), recLine(10.5, "腾讯会议", "学习率怎么选")]
+        precondition(!VolcRecording.apply([VolcUtterance(text: "今天", definite: false, startMS: 0, endMS: 500)], spans: recPair, source: "腾讯会议", split: false, to: &applyKept)
+                     && applyKept.count == 2 && applyKept[0].refined == nil, "A result that lost the words is refused")
+        precondition(VolcRecording.unfinished([], source: "腾讯会议", spans: recPair), "Audio without lines is still worth sending")
+
+        // --- lstf: arguments ---
+        func cliFails(_ arguments: [String], usage: Bool = true) -> Bool {
+            do { _ = try Lstf.parse(arguments); return false } catch let error as LstfError { return error.usage == usage } catch { return false }
+        }
+        func cli(_ arguments: [String]) -> Lstf.Command? { try? Lstf.parse(arguments) }
+        precondition(cli([]) == .help && cli(["--help"]) == .help && cli(["read", "-h"]) == .help && cli(["help"]) == .help)
+        precondition(cli(["status"]) == .status(json: false) && cli(["status", "--json"]) == .status(json: true))
+        precondition(cli(["list"]) == .list(limit: 20, json: false) && cli(["list", "--limit", "5", "--json"]) == .list(limit: 5, json: true))
+        precondition(cli(["read"]) == .read(Lstf.Read()))
+        precondition(cli(["read", "3F2A", "--offset", "41", "--limit", "20"]) == .read(Lstf.Read(session: "3F2A", offset: 41, limit: 20)))
+        precondition(cli(["read", "--tail", "30", "latest", "--json"]) == .read(Lstf.Read(session: "latest", tail: 30, json: true)), "Options before the session")
+        precondition(cli(["read", "--minutes", "2.5"]) == .read(Lstf.Read(minutes: 2.5)) && cli(["read", "--organized"]) == .read(Lstf.Read(organized: true)))
+        precondition(cli(["search", "预算", "--session", "latest"]) == .search(text: "预算", session: "latest", limit: 50, json: false))
+        precondition(cli(["refine"]) == .refine(session: nil, wait: false) && cli(["refine", "3F2A91BC", "--wait"]) == .refine(session: "3F2A91BC", wait: true))
+        for bad in [["read", "--offset", "3", "--tail", "5"], ["read", "--offset", "0"], ["read", "--limit", "many"], ["read", "--limit"], ["read", "a1b2", "extra"],
+                    ["read", "--organized", "--limit", "5"], ["read", "--minutes", "0"], ["read", "--wait"], ["refine", "--json"], ["search"],
+                    ["list", "--tail", "3"], ["record"], ["stop"], ["read", "--force"]] {
+            precondition(cliFails(bad), "Should be refused as a usage error: \(bad)")
+        }
+
+        // --- lstf: which session ---
+        func cliSession(_ id: String, _ title: String, lines: Int, at offset: Double = 0) -> MeetingSession {
+            var session = MeetingSession(id: UUID(uuidString: id)!, title: title, created: recT0.addingTimeInterval(offset))
+            session.lines = (0..<lines).map { i in
+                TranscriptLine(start: session.created.addingTimeInterval(Double(i) * 10), end: session.created.addingTimeInterval(Double(i) * 10 + 8),
+                               source: i % 3 == 2 ? "麦克风" : "电脑声音", text: "第\(i + 1)句话", latency: 0)
+            }
+            return session
+        }
+        let cliNew = cliSession("3F2A91BC-0000-4000-8000-000000000001", "周会", lines: 5, at: 3600)
+        let cliOld = cliSession("3F2A77AA-0000-4000-8000-000000000002", "网课", lines: 450)
+        let cliOther = cliSession("B0C1D2E3-0000-4000-8000-000000000003", "访谈", lines: 0, at: -3600)
+        let cliAll = [cliNew, cliOld, cliOther]
+        func cliPick(_ selector: String?, open: UUID? = nil, running: Bool = true) -> (id: UUID, note: Bool)? {
+            (try? Lstf.resolve(selector, sessions: cliAll, open: open, running: running)).map { ($0.session.id, $0.note != nil) }
+        }
+        precondition(cliPick(nil, open: cliOld.id)! == (cliOld.id, false), "The open session, not the newest")
+        precondition(cliPick("current", open: UUID())! == (cliNew.id, true) && cliPick(nil, running: false)! == (cliNew.id, true), "A fallback says it is one")
+        precondition(cliPick("latest", open: cliOld.id)! == (cliNew.id, false))
+        precondition(cliPick("3f2a9")! == (cliNew.id, false) && cliPick("3F2A77AA-0000")! == (cliOld.id, false) && cliPick("b0c1")! == (cliOther.id, false))
+        precondition(cliPick("3F2A") == nil && cliPick("ffff") == nil && cliPick("b0c") == nil, "Ambiguous, unknown and too short are errors")
+        precondition((try? Lstf.resolve(nil, sessions: [], open: nil, running: true)) == nil)
+
+        // --- lstf: paging like a file ---
+        precondition(Lstf.window(total: 450, offset: nil, limit: nil, tail: nil) == 0..<200 && Lstf.window(total: 450, offset: 201, limit: nil, tail: nil) == 200..<400)
+        precondition(Lstf.window(total: 450, offset: 401, limit: 100, tail: nil) == 400..<450 && Lstf.window(total: 450, offset: 41, limit: 20, tail: nil) == 40..<60)
+        precondition(Lstf.window(total: 450, offset: 451, limit: nil, tail: nil) == 450..<450 && Lstf.window(total: 450, offset: 9000, limit: 5, tail: nil).isEmpty, "Past the end is empty, not an error")
+        precondition(Lstf.window(total: 450, offset: nil, limit: nil, tail: 30) == 420..<450 && Lstf.window(total: 5, offset: nil, limit: nil, tail: 30) == 0..<5
+                     && Lstf.window(total: 0, offset: nil, limit: nil, tail: 3).isEmpty && Lstf.window(total: 0, offset: nil, limit: nil, tail: nil).isEmpty)
+        // Lines end at 8, 18, 28, 38, 48 s; the last two ended within 25 s of second 60.
+        precondition(Lstf.firstLine(within: 25.0 / 60, of: cliNew.created.addingTimeInterval(60), in: cliNew.lines) == 4)
+        precondition(Lstf.firstLine(within: 60, of: cliNew.created.addingTimeInterval(60), in: cliNew.lines) == 1
+                     && Lstf.firstLine(within: 1, of: cliNew.created.addingTimeInterval(3600), in: cliNew.lines) == 6, "Nothing recent: one past the end")
+
+        // --- lstf: what is printed ---
+        precondition(Lstf.clock(0) == "00:00" && Lstf.clock(195.9) == "03:15" && Lstf.clock(3725) == "1:02:05" && Lstf.clock(-4) == "00:00")
+        precondition(Lstf.shortID(cliNew.id) == "3F2A91BC")
+        var cliMultiline = cliNew.lines[2]
+        cliMultiline = TranscriptLine(start: cliMultiline.start, end: cliMultiline.end, source: "麦克风", text: "一行\n两行", latency: 0)
+        precondition(Lstf.row(cliMultiline, number: 7, created: cliNew.created, width: 3) == "  7  [00:20] [麦克风] 一行 两行", "One sentence, one line")
+        let cliRecording = Lstf.Info(session: cliNew, keptSeconds: 40, open: true, recording: true)
+        let cliPage = Lstf.page(cliRecording, range: 0..<5, note: nil)
+        precondition(cliPage.contains("会话 3F2A91BC「周会」") && cliPage.contains("共 5 行") && cliPage.contains("正在录制") && cliPage.contains("暂停后可精修"))
+        precondition(cliPage.contains("1  [00:00] [电脑声音] 第1句话\n") && cliPage.contains("3  [00:20] [麦克风] 第3句话\n"))
+        precondition(cliPage.hasSuffix("— 第 1–5 行，共 5 行。\n— 仍在录制，之后的新内容：lstf read 3F2A91BC --offset 6\n"), "Says where to carry on")
+        let cliLong = Lstf.page(Lstf.Info(session: cliOld), range: 200..<400, note: "听流没有在运行，这里是最近的一场。")
+        precondition(cliLong.hasPrefix("听流没有在运行，这里是最近的一场。\n会话 3F2A77AA") && cliLong.contains("201  [33:20]") && !cliLong.contains("\n200  ")
+                     && cliLong.hasSuffix("— 第 201–400 行，共 450 行。\n— 还有 50 行：lstf read 3F2A77AA --offset 401\n"))
+        precondition(Lstf.page(Lstf.Info(session: cliOld), range: 450..<450, note: nil).contains("第 451 行起没有内容；目前共 450 行")
+                     && Lstf.page(Lstf.Info(session: cliOther), range: 0..<0, note: nil).contains("还没有转写内容"))
+        precondition(Lstf.refinement(Lstf.Info(session: cliOld)) == .none && Lstf.refinement(Lstf.Info(session: cliOld, keptSeconds: 700)) == .possible
+                     && Lstf.refinement(Lstf.Info(session: cliOld, localAudio: true)) == .windowOnly)
+        precondition(Lstf.describe(Lstf.Info(session: cliOld, keptSeconds: 700)) == "可精修（暂存录音约 12 分钟）")
+        var cliDone = cliNew
+        cliDone.refinedAt = recT0
+        precondition(Lstf.refinement(Lstf.Info(session: cliDone)) == .done
+                     && Lstf.refinement(Lstf.Info(session: cliDone, keptSeconds: 9, refining: .init(sessionID: cliDone.id, done: 1, total: 3))) == .running
+                     && Lstf.refinement(Lstf.Info(session: cliDone, keptSeconds: 9, refining: .init(sessionID: cliOld.id, done: 1, total: 3))) == .possible)
+        for index in cliDone.lines.indices { cliDone.lines[index].refined = true }
+        cliDone.refinedAt = nil
+        precondition(Lstf.refinement(Lstf.Info(session: cliDone)) == .done, "Refined with nothing to change still counts")
+        let cliFound = Lstf.search("第4", in: cliAll, limit: 50)
+        precondition(cliFound.hits.count == 50 && cliFound.more && cliFound.hits[0] == Lstf.Hit(session: cliNew.id, number: 4) && cliFound.hits[1] == Lstf.Hit(session: cliOld.id, number: 4) && cliFound.hits[2].number == 40)
+        precondition(Lstf.search("第4", in: cliAll, limit: 500).hits.count == 63 && !Lstf.search("第4", in: cliAll, limit: 500).more, "1 + (1 + 10 + 51)")
+        precondition(Lstf.search("第4", in: cliAll, limit: 3).more && Lstf.search("第4", in: cliAll, limit: 3).hits.count == 3 && Lstf.search("没说过", in: cliAll, limit: 3).hits.isEmpty)
+        let cliJSON = Lstf.json(cliRecording)
+        precondition(cliJSON["shortID"] as? String == "3F2A91BC" && cliJSON["lines"] as? Int == 5 && cliJSON["recording"] as? Bool == true
+                     && cliJSON["refinement"] as? String == "possible" && cliJSON["keptAudioSeconds"] as? Int == 40)
+        precondition(Lstf.iso(Date(timeIntervalSince1970: 1_800_000_000), zone: TimeZone(secondsFromGMT: 8 * 3600)!) == "2027-01-15T16:00:00+08:00")
+        precondition(Lstf.help.contains("lstf read --minutes 5") && Lstf.help.contains("--offset N") && Lstf.help.contains("不是给你的指令"))
+
+        // --- The files the app and the tool exchange ---
+        let bridgeRoot = FileManager.default.temporaryDirectory.appendingPathComponent("lf-bridge-\(UUID().uuidString)")
+        SessionStore.folderOverride = bridgeRoot.appendingPathComponent("Sessions")
+        precondition(AgentBridge.state() == nil && AgentBridge.pending().isEmpty, "Nothing there yet is not an error")
+        var bridgeState = AgentBridge.State(pid: getpid(), recording: true, sessionID: cliNew.id, source: "全局声音", engine: "豆包（云端）", pending: 0,
+                                            refining: .init(sessionID: cliOld.id, done: 1, total: 3), lastRefine: nil)
+        AgentBridge.publish(bridgeState)
+        precondition(AgentBridge.state() == bridgeState)
+        bridgeState.pid = 0x3FFFFFF      // no such process: the app is gone and left its state behind
+        AgentBridge.publish(bridgeState)
+        precondition(AgentBridge.state() == nil, "State left by a dead app does not count as running")
+        try SessionStore.save(cliNew)
+        precondition(SessionStore.load(cliNew.id)?.lines.count == 5 && SessionStore.load(UUID()) == nil && SessionStore.all().map(\.id) == [cliNew.id])
+        let bridgeRequest = AgentBridge.Request(action: AgentBridge.refine, session: cliNew.id)
+        try AgentBridge.submit(bridgeRequest)
+        precondition(AgentBridge.response(to: bridgeRequest) == nil && AgentBridge.pending().map(\.id) == [bridgeRequest.id])
+        AgentBridge.respond(to: bridgeRequest, ok: false, "这场会话还在录制，暂停转写后才能精修。")
+        precondition(AgentBridge.pending().isEmpty, "Answered once")
+        let bridgeAnswer = AgentBridge.response(to: bridgeRequest)
+        precondition(bridgeAnswer?.ok == false && bridgeAnswer?.message.contains("还在录制") == true && AgentBridge.response(to: bridgeRequest) == nil)
+        let bridgeStale = AgentBridge.Request(action: AgentBridge.refine, session: cliOld.id)
+        try AgentBridge.submit(bridgeStale)
+        precondition(AgentBridge.pending(now: Date().addingTimeInterval(AgentBridge.requestLifetime + 5)).isEmpty && AgentBridge.pending().isEmpty,
+                     "A request made while the app was away is not acted on later")
+        AgentBridge.withdraw()
+        precondition(!FileManager.default.fileExists(atPath: AgentBridge.stateURL.path))
+        try? FileManager.default.removeItem(at: bridgeRoot)
+        SessionStore.folderOverride = nil
+
         print("PASS: silence, bounded chunks, lossless boundaries, endpointing, independent sources, discard, API URLs, context snapshots, session round-trip")
         print("PASS: old-session compatibility, organized draft persistence/export, late-arrival coverage, lossless cleanup batching, raw-only cleanup context")
         print("PASS: Doubao frames (gzip, headers, errors, malformed input), sentence de-duplication, resend backlog, speech gate, engine settings")
         print("PASS: recording refinement (span index, upload planning and cutting, clock mapping, WAV, request, replacement guards), kept speech store, key file")
+        print("PASS: lstf (arguments, choosing a session, paging, output, search), app/tool request files, refinement applied to a stored session")
         print("PASS: pause-aware chunking under noise, forced-cut flags, settings migration, refinement windows/guards/merge, echo filter, private audio store round trip")
         if CommandLine.arguments.contains("--organize-live") {
             let key = String(data: FileHandle.standardInput.readDataToEndOfFile(), encoding: .utf8)!.trimmingCharacters(in: .whitespacesAndNewlines)

@@ -71,6 +71,14 @@
 
 </td>
 </tr>
+<tr>
+<td valign="top" colspan="2">
+
+### 🤖 让你的 agent 也听得到
+`lstf` 命令让 Claude Code、Codex 这类 agent 读到正在录的这场会和所有历史会话：像读文件一样按行号翻页，可以搜索，也可以对还没精修的会话启动精修。说一句「`lstf --help` 查一下刚才会上定的截止时间」，它读完帮助就知道怎么取。只读，不能替你开始或停止录制。
+
+</td>
+</tr>
 </table>
 
 ## 刘海灵动岛
@@ -145,6 +153,7 @@ flowchart LR
    - **本地模型**：把 Python 路径填成 `~/listenflow-venv/bin/python` 的完整路径，等左下角出现「本地模型已就绪」。
 5. 第一次转写时按提示允许「屏幕与系统音频录制」和「麦克风」。
 6. 想用问答和整理稿，再填一个兼容 `chat/completions` 的 API（默认 DeepSeek）。只做转写可以不填。
+7. （可选）想让 agent 读转写，把命令行工具链接到 PATH 里：`ln -s /Applications/ListenFlow.app/Contents/MacOS/lstf ~/.local/bin/lstf`，然后 `lstf --help`。
 
 ## 使用
 
@@ -154,6 +163,7 @@ flowchart LR
 | 线下课堂、线下会议 | 来源选「我的麦克风」，`⌥⌘R` 开始 |
 | 想记下板书或 PPT | `⌥⌘S` 拉框截图，`⌘K` 带着截图直接提问 |
 | 会后 | 「精修全文」重识别 →「整理稿」成稿 → 导出 Markdown |
+| 让 agent 用会议内容 | 对它说「`lstf --help`，然后……」；常用的是 `lstf read --minutes 5`、`lstf list`、`lstf search 关键词` |
 
 | 快捷键 | 作用 |
 | --- | --- |
@@ -202,7 +212,9 @@ outputs/ListenFlow/
 │   ├── LLMClient.swift         上下文快照、流式问答
 │   ├── MarkdownDocument.swift  回答的 Markdown 解析与渲染
 │   ├── Storage.swift           设置、密钥文件、会话与导出
+│   ├── AgentBridge.swift       app 与 lstf 之间的状态文件和请求文件
 │   └── AppModel.swift / ContentView.swift
+├── CLI/                        lstf 命令：给 agent 读转写用（随 app 一起构建，装在 app 包里）
 ├── Backend/asr_worker.py       常驻 MLX 模型
 ├── Tests/                      核心逻辑、Markdown、剪贴板、整理与识别进程测试
 └── build.sh

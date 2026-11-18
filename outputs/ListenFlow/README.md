@@ -4,7 +4,7 @@ macOS 原生实时转写、全文整理与上下文问答工具。默认用火�
 
 ## 打开与使用
 
-当前源码版本为 0.9.1。若旧版正在录音，先完成录音、暂停并退出旧版，再打开新版。第一次使用先在「模型与 API 设置」里填豆包语音的 API Key（见下文「识别引擎」）；左下角显示「豆包云端识别已就绪」即可开始。已保存的旧会话可以直接从「历史记录」中打开。
+当前源码版本为 0.10.0。若旧版正在录音，先完成录音、暂停并退出旧版，再打开新版。第一次使用先在「模型与 API 设置」里填豆包语音的 API Key（见下文「识别引擎」）；左下角显示「豆包云端识别已就绪」即可开始。已保存的旧会话可以直接从「历史记录」中打开。
 
 1. 在左侧「音频来源」三选一：
    - **全局**（默认）：电脑上所有 App 的声音和麦克风一起录，不用选 App，适合线上会议——对方的话和你自己的话都有。电脑上的声音标为「电脑声音」，你说的话标为「麦克风」。听流自己发出的声音不录。首次需要授权「屏幕与系统音频录制」和「麦克风」；麦克风没授权或没有输入设备时，会话照常进行，只转写电脑上的声音，并提示原因。
@@ -75,6 +75,33 @@ macOS 原生实时转写、全文整理与上下文问答工具。默认用火�
 - 某一段返回的文字比实时结果少一半以上（或是空的）时，这一段保留原文不替换。
 - 麦克风和指定 App 同录时，麦克风的录音里有外放回声。这一路上传时改为按 0.3 秒静音分句，返回后再过一遍回声过滤，和实时那一遍的做法一致。
 - 关掉「暂存录音」就不保存任何音频，也就没有「精修全文」。
+
+## 给 agent 用的命令行：lstf
+
+`lstf` 让 Claude Code、Codex 这类能跑命令的 agent 读到听流的转写：正在录的这一场，或者历史上的任何一场。对 agent 说「`lstf --help` 查一下刚才会上定的截止时间」，它读完帮助就知道该怎么取。
+
+```sh
+lstf status                       # 听流是否在运行、是否在录、当前是哪一场
+lstf read --minutes 5             # 当前这场最近 5 分钟
+lstf read                         # 当前这场，从第 1 行起，最多 200 行
+lstf read 3F2A91BC --offset 201 --limit 100   # 像读文件一样：起始行号 + 行数
+lstf read --tail 30               # 最后 30 行
+lstf read 3F2A91BC --organized    # 整理稿
+lstf list                         # 历史会话，新的在前
+lstf search 预算                  # 哪场会的哪一句提到过
+lstf refine 3F2A91BC --wait       # 对还没精修的会话启动精修，等它完成
+```
+
+- **只读**。不能开始、暂停录制，不能新建或修改会话。唯一的例外是 `refine`：对有暂存录音、还没精修的会话启动「精修全文」。
+- **只有定稿的句子**。每句定稿后听流立即存盘，`lstf` 直接读会话文件，所以正在录的内容一般在说完约 1 秒后就能读到；灰色的未定稿预览不在其中。一直不停顿的讲话，豆包约 20 秒才定稿一行。
+- **会话怎么指定**：省略或 `current` 是听流里当前打开的那一场，`latest` 是最近一场，其余用 `lstf list` 第一列的 ID（写开头几位即可）。
+- **分页**：每行是一句话，带行号、从会话开始算起的时间和来源。输出末尾写明共多少行、接着读该用哪个 `--offset`；正在录制的会话下次从上次读到的行号之后接着读。
+- **精修由听流 app 执行**，所以听流必须在运行；正在录制的会话要先暂停。不是当前打开的那一场也可以，听流在后台完成，不切换界面（这种情况只支持豆包引擎录的会话）。豆包引擎下精修按音频时长另外计费。精修会重新断句，行号整体变化。
+- `status`、`list`、`read`、`search` 加 `--json` 得到结构化输出。退出码：0 成功，1 做不到（原因在标准错误），2 命令写错了。
+- **安装**：从源码 `./build.sh` 时，如果存在 `~/.local/bin`，会自动把它链接成 `~/.local/bin/lstf`。用发布包的话手动链接一次：`ln -s /Applications/ListenFlow.app/Contents/MacOS/lstf ~/.local/bin/lstf`（或 PATH 里的其他目录）。
+- 听流没开时也能读历史和搜索；`status` 会说明它没有在运行。
+
+需要知道：agent 读到的会议内容会发给它背后的模型服务。`lstf` 本身不联网，也没有扩大本机的暴露面，会话文件本来就只有你自己能读。
 
 ## 识别档位与事后精修（本地模型）
 
@@ -164,6 +191,7 @@ macOS 原生实时转写、全文整理与上下文问答工具。默认用火�
 - 提问时发送当前会话的全部转写文字、最近 12 条问答和本次问题到配置的 API。
 - 整理时只发送当前转写快照，不使用先前问答作为原文。
 - 会话文字自动保存在 `~/Library/Application Support/ListenFlow/Sessions/`，保存为 JSON。
+- 同一目录下的 `state.json` 是听流运行时写的状态（是否在录、当前会话、精修进度），退出时删除；`requests/` 是 `lstf refine` 向听流发请求用的，30 秒内没人处理的请求自动清掉。两者都不含转写内容。
 - 暂停录制不会关闭问答。切换会话前需要等待已有音频处理完。
 - 左下状态显示当前引擎是否就绪（豆包：等待声音 / 正在连接 / 识别中 / 正在重连）；底栏标明是云端识别还是本地处理，并显示最近一句的延迟（豆包：句子说完到定稿；本地：开始采集到文字返回）。
 - 积压时显示提示；队列过长会暂停采集，识别进程超时会明确报错，不会伪装实时。
@@ -195,6 +223,8 @@ LISTENFLOW_APP_DIR="$PWD/../听流-整理版.app" ./build.sh
 - `Sources/ASRBridge.swift` / `Backend/asr_worker.py`：本地引擎，常驻 MLX 模型、JSON lines 本地管道。
 - `Sources/LLMClient.swift`：上下文快照、流式问答、错误与截断检查。
 - `Sources/Storage.swift`：设置、`~/.listenflow` 下的密钥文件、会话、导出。
+- `Sources/AgentBridge.swift`：app 和 `lstf` 之间交换的状态文件与请求文件，两边共用。
+- `CLI/LstfCore.swift`：`lstf` 的参数解析、会话选择、分页和输出（纯逻辑）；`CLI/main.swift`：读文件、向 app 发精修请求。
 - `Sources/AppModel.swift` / `ContentView.swift`：会话状态和 SwiftUI 界面。
 
 ## 测试
@@ -205,7 +235,7 @@ LISTENFLOW_APP_DIR="$PWD/../听流-整理版.app" ./build.sh
 mkdir -p ../../work
 swiftc -swift-version 5 -parse-as-library \
   Sources/AudioChunker.swift Sources/Storage.swift Sources/ImageAttachments.swift Sources/LLMClient.swift \
-  Sources/Recognition.swift Sources/VolcProtocol.swift Sources/VolcFile.swift Tests/CoreTests.swift -o ../../work/core-tests -framework Security -framework IOKit
+  Sources/Recognition.swift Sources/VolcProtocol.swift Sources/VolcFile.swift Sources/AgentBridge.swift CLI/LstfCore.swift Tests/CoreTests.swift -o ../../work/core-tests -framework Security -framework IOKit
 ../../work/core-tests
 ```
 
@@ -224,9 +254,9 @@ VOLC_ASR_API_KEY=… LISTENFLOW_REPLAY=/path/speech.pcm LISTENFLOW_REPLAY_ENGINE
   LISTENFLOW_REPLAY_OUT=/tmp/replay "../../work/preview/听流预览.app/Contents/MacOS/ListenFlow"
 ```
 
-密钥只从环境变量 `VOLC_ASR_API_KEY` 读取；预览构建不读真实的密钥文件，也不访问钥匙串。结果写到 `/tmp/replay-live.json`（定稿的行、每条预览与定稿的时间、暂停后等了多久）。可选：`LISTENFLOW_REPLAY_MIC`（第二路，当作麦克风）、`LISTENFLOW_REPLAY_DROP_AT=秒`（在该时刻掐断连接，检验重连补发）、`LISTENFLOW_REPLAY_THEN_LOCAL=1`（跑完后在同一进程切回本地模型再跑一遍）、`LISTENFLOW_REPLAY_RESOURCE`（换资源 ID，看报错）、`LISTENFLOW_REPLAY_REFINE=1`（录完接着走「精修全文」，结果写到 `-post.json`；音频会再计费一次）、`LISTENFLOW_REPLAY_CHUNK=秒`（缩短每段上传的长度，检验切分）。不设 `LISTENFLOW_REPLAY_ENGINE` 时回放走本地模型。`LISTENFLOW_PREVIEW_SNAPSHOT=目录` 不开窗口，把主窗口和设置页按两种引擎各渲染成 PNG。
+密钥只从环境变量 `VOLC_ASR_API_KEY` 读取；预览构建不读真实的密钥文件，也不访问钥匙串。结果写到 `/tmp/replay-live.json`（定稿的行、每条预览与定稿的时间、暂停后等了多久）。可选：`LISTENFLOW_REPLAY_MIC`（第二路，当作麦克风）、`LISTENFLOW_REPLAY_DROP_AT=秒`（在该时刻掐断连接，检验重连补发）、`LISTENFLOW_REPLAY_THEN_LOCAL=1`（跑完后在同一进程切回本地模型再跑一遍）、`LISTENFLOW_REPLAY_RESOURCE`（换资源 ID，看报错）、`LISTENFLOW_REPLAY_REFINE=1`（录完接着走「精修全文」，结果写到 `-post.json`；音频会再计费一次）、`LISTENFLOW_REPLAY_CHUNK=秒`（缩短每段上传的长度，检验切分）。测 `lstf` 时加 `LISTENFLOW_PREVIEW_STORE=目录`（预览构建把会话和暂存录音存到这个目录）、`LISTENFLOW_REPLAY_KEEP=1`（暂存录音但不自动精修）、`LISTENFLOW_REPLAY_HOLD=秒`（回放结束后继续运行这么久），再用 `LSTF_HOME=同一目录 lstf …` 去读。不设 `LISTENFLOW_REPLAY_ENGINE` 时回放走本地模型。`LISTENFLOW_PREVIEW_SNAPSHOT=目录` 不开窗口，把主窗口和设置页按两种引擎各渲染成 PNG。
 
-测试包括：豆包帧的编码解码（gzip 头、帧头、错误帧、残缺帧）、分句去重、补发缓存、说话检测、引擎设置迁移、录音精修（讲话片段索引、分段与切点、时间对应、WAV 与请求、替换把关）、讲话片段的暂存与删除、密钥文件的读写与权限、纯静音不输出、连续音频切分无样本丢失、有底噪时仍在停顿处切分、8 秒上限与被迫切开标记、纯静音片段不发送、两路音源互不重置、旧设置迁移、精修窗口分组与异常结果拦截、音频暂存读写与权限、错误音频恢复、20 秒窗口与 32 秒上限、上下文快照、会话序列化和兼容 API 流式响应。
+测试包括：`lstf` 的参数解析、会话选择、分页与输出、app 与 `lstf` 之间的请求文件、豆包帧的编码解码（gzip 头、帧头、错误帧、残缺帧）、分句去重、补发缓存、说话检测、引擎设置迁移、录音精修（讲话片段索引、分段与切点、时间对应、WAV 与请求、替换把关）、讲话片段的暂存与删除、密钥文件的读写与权限、纯静音不输出、连续音频切分无样本丢失、有底噪时仍在停顿处切分、8 秒上限与被迫切开标记、纯静音片段不发送、两路音源互不重置、旧设置迁移、精修窗口分组与异常结果拦截、音频暂存读写与权限、错误音频恢复、20 秒窗口与 32 秒上限、上下文快照、会话序列化和兼容 API 流式响应。
 
 切分与精修方案的对比实验在 `work/asr-lab/`（`lab2.py`–`lab4.py`、`parity.py`），改参数后可以重跑。
 
@@ -236,6 +266,7 @@ VOLC_ASR_API_KEY=… LISTENFLOW_REPLAY=/path/speech.pcm LISTENFLOW_REPLAY_ENGINE
 
 - 豆包引擎：一条连接最长能保持多久没有测到上限（实际每段讲话一条连接，最长跑过 40 秒）；连续几小时的课堂、两路同时长时间识别、真实断网（而不是模拟掐断）都还没有实测。一句话一直不停顿时，约 20 秒才定稿一次，这期间只有预览。
 - 豆包引擎的「精修全文」只用文件回放测过，最长一次 269 秒；真实课堂长度（几十段上传）、上传中途断网、单段大小的上限都还没有实测。
+- `lstf` 判断听流是否在运行，靠的是状态文件里的进程号是否还活着。听流崩溃后进程号恰好被别的进程占用时，`lstf status` 会误报「正在运行」，直到听流再次启动；读取转写不受影响。
 - 下面几条关于切段和 8 秒上限的说明只针对本地模型。
 
 - 远场收音（电脑放在讲台远处、内置麦克风）时讲话只比底噪高约 10 dB，错字仍明显多于近距离收音。最有效的办法是让麦克风靠近说话人或用外接麦克风；调高系统输入音量对识别帮助不大，因为噪声会被同样放大。

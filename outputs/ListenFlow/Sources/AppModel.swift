@@ -286,6 +286,13 @@ final class AppModel: ObservableObject {
     }
 
     init() {
+        // Tests of the command line tool: a preview build that keeps its sessions
+        // and audio in a folder of the test's own, where the tool can read them.
+        if ListenFlowHome.isPreview, let store = ProcessInfo.processInfo.environment["LISTENFLOW_PREVIEW_STORE"] {
+            let root = URL(fileURLWithPath: store, isDirectory: true)
+            SessionStore.folderOverride = root.appendingPathComponent("Sessions", isDirectory: true)
+            AudioStore.rootOverride = root.appendingPathComponent("audio", isDirectory: true)
+        }
         capture.onChunk = { [weak self] chunk in Task { @MainActor in self?.submit(chunk) } }
         capture.onLevel = { [weak self] source, level in
             Task { @MainActor in
@@ -946,10 +953,7 @@ final class AppModel: ObservableObject {
             }
             // A run that was interrupted has already replaced some stretches;
             // those are not sent, or paid for, twice.
-            let uploads = planned.filter { upload in
-                let old = VolcRecording.covered(self.session.lines, source: upload.source, spans: upload.spans)
-                return old.isEmpty || old.contains { $0.refined != true }
-            }
+            let uploads = planned.filter { VolcRecording.unfinished(self.session.lines, source: $0.source, spans: $0.spans) }
             self.postRefineTotal = uploads.count
             let seconds = uploads.reduce(0) { $0 + $1.seconds }
             var failure: String?
@@ -985,23 +989,129 @@ final class AppModel: ObservableObject {
 
     private func applyCloud(_ upload: CloudUpload, _ utterances: [VolcUtterance], session id: UUID, split: Bool) {
         guard isPostRefining, session.id == id else { return }
-        var fresh = VolcRecording.lines(utterances, spans: upload.spans, source: upload.source)
-        // The recording has the echo in it again; the live pass had dropped it.
-        if upload.source == EchoFilter.micSource { fresh.removeAll { EchoFilter.isEcho($0, among: session.lines) } }
-        let old = VolcRecording.covered(session.lines, source: upload.source, spans: upload.spans)
-        if split { fresh = (fresh + VolcRecording.uncovered(old, by: fresh)).sorted { $0.start < $1.start } }
-        let before = old.map(\.text).joined(), after = fresh.map(\.text).joined()
-        if before == after {
-            // Nothing to improve; keep the lines (and their place in an organized
-            // draft) and only note that this stretch is done.
-            let ids = Set(old.map(\.id))
-            for index in session.lines.indices where ids.contains(session.lines[index].id) { session.lines[index].refined = true }
-        } else if VolcRecording.acceptable(original: before, refined: after) {
-            VolcRecording.replace(old, with: fresh, in: &session.lines)
+        if VolcRecording.apply(utterances, spans: upload.spans, source: upload.source, split: split, to: &session.lines) {
             postRefineChanged += 1
         }
         postRefineDone += 1
         persist()
+    }
+
+    // MARK: - Agent bridge (the `lstf` command line tool)
+
+    /// A refinement of a session that is not the one open in the window,
+    /// started from the command line. It works on its own copy and saves it.
+    private struct StoredRefine {
+        var session: MeetingSession
+        var done = 0
+        var total = 0
+        var changed = 0
+    }
+    private var storedRefine: StoredRefine?
+    private var publishedState: AgentBridge.State?
+    private var lastRefine: AgentBridge.RefineResult?
+    private var refiningOpenSession: UUID?
+
+    /// Once a second: answer what the tool asked for, and say what the app is doing.
+    private func serveAgents() {
+        guard SessionStore.writes else { return }
+        // A refinement of the open session that has just ended, however it ended.
+        if isPostRefining { refiningOpenSession = session.id }
+        else if let id = refiningOpenSession {
+            refiningOpenSession = nil
+            lastRefine = .init(sessionID: id, ok: error == nil, message: error ?? notice ?? "", finished: Date())
+        }
+        for request in AgentBridge.pending() { handle(request) }
+        let refining = isPostRefining
+            ? AgentBridge.Refining(sessionID: session.id, done: postRefineDone, total: postRefineTotal)
+            : storedRefine.map { AgentBridge.Refining(sessionID: $0.session.id, done: $0.done, total: $0.total) }
+        let state = AgentBridge.State(pid: getpid(), recording: isRecording, sessionID: session.id,
+                                      source: activeSource?.label, engine: preferences.engine.label,
+                                      pending: pendingCount, refining: refining, lastRefine: lastRefine)
+        if state != publishedState {
+            publishedState = state
+            AgentBridge.publish(state)
+        }
+    }
+
+    /// The one thing an agent may change: start refining a session that has
+    /// kept audio. Recording is never started or stopped from outside.
+    private func handle(_ request: AgentBridge.Request) {
+        func refuse(_ reason: String) { AgentBridge.respond(to: request, ok: false, reason) }
+        guard request.action == AgentBridge.refine else { refuse("这个版本的听流不认识这个请求。"); return }
+        if isPostRefining || storedRefine != nil { refuse("已有一场会话在精修，等它完成后再试。"); return }
+        if request.session == session.id {
+            if isRecording { refuse("这场会话还在录制，暂停转写后才能精修。"); return }
+            if isBusy || pendingCount > 0 { refuse("还有句子在识别，稍后再试。"); return }
+            if usesCloud { keptStreamSeconds = AudioStore.streamSeconds(session.id) }
+            guard canRefineSession else {
+                refuse(usesCloud && !volcKeyPresent ? "还没有填写豆包语音识别的 API Key，无法精修。"
+                       : !usesCloud && !modelReady ? "本地模型还没有就绪，无法精修。"
+                       : "这场会话没有可以精修的内容：没有暂存录音，或已经精修过。")
+                return
+            }
+            refineSession()
+            if isPostRefining { AgentBridge.respond(to: request, ok: true, "已开始精修。") }
+            else { refuse(notice ?? "这场会话现在无法精修。") }
+            return
+        }
+        guard let stored = SessionStore.load(request.session) else { refuse("找不到这场会话。"); return }
+        guard AudioStore.streamSeconds(stored.id) > 0 else {
+            refuse(AudioStore.hasAudio(stored.id)
+                   ? "这场会话是用本地模型录的，需要先在听流的「历史记录」里打开它，再点「精修全文」。"
+                   : "这场会话没有暂存录音：已经精修过，或录制时关闭了「暂存录音」。")
+            return
+        }
+        guard volcKeyPresent else { refuse("还没有填写豆包语音识别的 API Key，无法精修。"); return }
+        refineStored(stored)
+        AgentBridge.respond(to: request, ok: true, "已开始精修。")
+    }
+
+    private func refineStored(_ stored: MeetingSession) {
+        let id = stored.id
+        let settings = preferences
+        let limit = cloudChunkSeconds
+        storedRefine = StoredRefine(session: stored)
+        Task { [weak self] in
+            let key = await Task.detached { AppModel.volcKey() }.value
+            let planned = await Task.detached { AppModel.cloudUploads(session: id, limit: limit) }.value
+            guard let self, let lines = self.storedRefine?.session.lines else { return }
+            let uploads = planned.filter { VolcRecording.unfinished(lines, source: $0.source, spans: $0.spans) }
+            self.storedRefine?.total = uploads.count
+            let splitMic = Set(planned.map(\.source)).count > 1
+            var failure: String? = key.isEmpty ? "还没有填写豆包语音识别的 API Key。" : nil
+            if failure == nil {
+                do {
+                    try await AppModel.recognize(uploads, session: id,
+                                                 client: VolcFileClient(key: key, resourceID: settings.volcFileResourceID),
+                                                 hotwords: settings.hotwordList, splitMic: splitMic) { [weak self] index, utterances in
+                        guard let self, var run = self.storedRefine else { return }
+                        let upload = uploads[index]
+                        if VolcRecording.apply(utterances, spans: upload.spans, source: upload.source,
+                                               split: splitMic && upload.source == EchoFilter.micSource, to: &run.session.lines) {
+                            run.changed += 1
+                        }
+                        run.done += 1
+                        self.storedRefine = run
+                        try? SessionStore.save(run.session)      // what is done survives a quit
+                    }
+                } catch {
+                    failure = error.localizedDescription
+                }
+            }
+            guard var run = self.storedRefine else { return }
+            self.storedRefine = nil
+            if let failure {
+                self.lastRefine = .init(sessionID: id, ok: false, message: "精修中断：\(failure) 已完成的 \(run.done) 段保留，暂存录音仍在，可以再试一次。", finished: Date())
+            } else {
+                AudioStore.deleteStream(id)
+                if run.changed > 0 { run.session.refinedAt = Date() }
+                try? SessionStore.save(run.session)
+                let seconds = uploads.reduce(0) { $0 + $1.seconds }
+                self.lastRefine = .init(sessionID: id, ok: true, message: uploads.isEmpty ? "这场会话已经精修过，暂存音频已删除。"
+                    : "全文精修完成：\(uploads.count) 段、约 \(Self.minutes(seconds))的音频由豆包录音文件识别重新识别，其中 \(run.changed) 段文字有改动。暂存音频已删除。", finished: Date())
+            }
+            self.history = SessionStore.all()
+        }
     }
 
     nonisolated private static func minutes(_ seconds: TimeInterval) -> String {
@@ -1042,6 +1152,7 @@ final class AppModel: ObservableObject {
         if modelLoading, let since = loadingSince, current.timeIntervalSince(since) > 120 { failWorker("本地模型加载超时，请检查 Python 环境与模型路径。") }
         if autoOrganize && !isOrganizing && !isImportingImages && hasOrganizationContext && (session.unorganizedCount > 0 || organizationImagesChanged || organizationStale) &&
             current.timeIntervalSince(lastOrganizationAttempt) >= 30 { organize() }
+        serveAgents()
     }
 
     /// `volcKey` is nil when the field was left as loaded, so a key that could
@@ -1294,6 +1405,8 @@ final class AppModel: ObservableObject {
     }
     func openSession(_ value: MeetingSession) {
         guard canChangeSession else { return }
+        // Its file is being rewritten; a copy opened now would overwrite that.
+        if value.id == storedRefine?.session.id { showHistory = false; notice = "这场会话正在后台精修，完成后再打开。"; return }
         persist()
         session = value
         keptStreamSeconds = 0
@@ -1307,7 +1420,7 @@ final class AppModel: ObservableObject {
         showHistory = false
     }
     func persist() {
-        if Bundle.main.bundleIdentifier == "local.ListenFlow.preview" { return }
+        guard SessionStore.writes else { return }
         guard !session.lines.isEmpty || !session.chat.isEmpty || !session.imageLibrary.isEmpty else { return }
         do { try SessionStore.save(session); history = SessionStore.all() }
         catch { self.error = "会话保存失败：\(error.localizedDescription)" }
@@ -1327,6 +1440,7 @@ final class AppModel: ObservableObject {
         persist()
         cancelStreams()
         worker.shutdown()
+        if SessionStore.writes { AgentBridge.withdraw() }
     }
 }
 
@@ -1340,7 +1454,9 @@ extension AppModel {
         let env = ProcessInfo.processInfo.environment
         guard Bundle.main.bundleIdentifier == "local.ListenFlow.preview", let path = env["LISTENFLOW_REPLAY"],
               var out = env["LISTENFLOW_REPLAY_OUT"] else { return }
-        AudioStore.rootOverride = FileManager.default.temporaryDirectory.appendingPathComponent("listenflow-replay-audio")
+        if AudioStore.rootOverride == nil {
+            AudioStore.rootOverride = FileManager.default.temporaryDirectory.appendingPathComponent("listenflow-replay-audio")
+        }
         Task { @MainActor in
             let wav = (try? Data(contentsOf: URL(fileURLWithPath: path))) ?? Data()
             // Raw 16 kHz mono Int16 LE, no header: WAV headers vary in length.
@@ -1350,6 +1466,11 @@ extension AppModel {
                 preferences.engine = .volc
                 await replayCloud(app: samples, mic: track.withUnsafeBytes { Array($0.bindMemory(to: Int16.self)) }.map { Float($0) / 32768 },
                                   env: env, out: out)
+                // Stay up for a while so the command line tool can be tried against
+                // a session that has just ended.
+                if let hold = env["LISTENFLOW_REPLAY_HOLD"].flatMap(Double.init) {
+                    try? await Task.sleep(nanoseconds: UInt64(hold * 1_000_000_000))
+                }
                 guard env["LISTENFLOW_REPLAY_THEN_LOCAL"] == "1" else { NSApp.terminate(nil); return }
                 // Switch engines in the same process, the way the settings sheet
                 // does. The question API is blanked so no key is written.
@@ -1420,7 +1541,7 @@ extension AppModel {
         volcKeyPresent = true
         if let resource = env["LISTENFLOW_REPLAY_RESOURCE"] { preferences.volcResourceID = resource }
         let refine = env["LISTENFLOW_REPLAY_REFINE"] == "1"
-        preferences.keepAudioForRefine = refine
+        preferences.keepAudioForRefine = refine || env["LISTENFLOW_REPLAY_KEEP"] == "1"
         if let seconds = env["LISTENFLOW_REPLAY_CHUNK"].flatMap(Double.init) { cloudChunkSeconds = seconds }
         if let resource = env["LISTENFLOW_REPLAY_FILE_RESOURCE"] { preferences.volcFileResourceID = resource }
         updateRecognitionModeForReplay()

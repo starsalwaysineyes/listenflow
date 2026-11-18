@@ -191,6 +191,37 @@ enum VolcRecording {
         }
     }
 
+    /// What one upload's result does to a transcript: the live lines its audio
+    /// produced are replaced by the recognized sentences, unless the result
+    /// lost most of the words. `split` says the upload was a microphone
+    /// recorded next to an app, cut on pauses. Returns whether the text changed.
+    static func apply(_ utterances: [VolcUtterance], spans: [AudioSpan], source: String, split: Bool,
+                      to lines: inout [TranscriptLine]) -> Bool {
+        var fresh = VolcRecording.lines(utterances, spans: spans, source: source)
+        // The recording has the echo in it again; the live pass had dropped it.
+        if source == EchoFilter.micSource { fresh.removeAll { EchoFilter.isEcho($0, among: lines) } }
+        let old = covered(lines, source: source, spans: spans)
+        if split { fresh = (fresh + uncovered(old, by: fresh)).sorted { $0.start < $1.start } }
+        let before = old.map(\.text).joined(), after = fresh.map(\.text).joined()
+        if before == after {
+            // Nothing to improve; keep the lines (and their place in an organized
+            // draft) and only note that this stretch is done.
+            let ids = Set(old.map(\.id))
+            for index in lines.indices where ids.contains(lines[index].id) { lines[index].refined = true }
+            return false
+        }
+        guard acceptable(original: before, refined: after) else { return false }
+        replace(old, with: fresh, in: &lines)
+        return true
+    }
+
+    /// Uploads still to do: a run that was interrupted has already replaced
+    /// some stretches, and those are not sent, or paid for, twice.
+    static func unfinished(_ lines: [TranscriptLine], source: String, spans: [AudioSpan]) -> Bool {
+        let old = covered(lines, source: source, spans: spans)
+        return old.isEmpty || old.contains { $0.refined != true }
+    }
+
     /// Swap the live lines of one upload for the recognized ones.
     static func replace(_ old: [TranscriptLine], with new: [TranscriptLine], in lines: inout [TranscriptLine]) {
         let gone = Set(old.map(\.id))

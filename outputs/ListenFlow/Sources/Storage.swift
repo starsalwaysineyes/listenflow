@@ -309,9 +309,18 @@ struct MeetingSession: Codable, Identifiable {
     }
 }
 enum SessionStore {
+    /// Tests, and preview builds that are told to, keep sessions somewhere else.
+    nonisolated(unsafe) static var folderOverride: URL?
     static var folder: URL {
-        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        folderOverride ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("ListenFlow/Sessions", isDirectory: true)
+    }
+    /// Preview builds are driven by fixtures and never write, unless a test has
+    /// pointed them at a folder of its own.
+    static var writes: Bool { !ListenFlowHome.isPreview || folderOverride != nil }
+    static func load(_ id: UUID) -> MeetingSession? {
+        (try? Data(contentsOf: folder.appendingPathComponent(id.uuidString + ".json")))
+            .flatMap { try? JSONDecoder().decode(MeetingSession.self, from: $0) }
     }
     static func save(_ session: MeetingSession) throws {
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true,
