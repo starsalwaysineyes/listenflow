@@ -5,7 +5,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var model: AppModel?
     private var hotKeys: [GlobalHotKey] = []
 
+    /// Replays and offscreen snapshots are logic checks driven from a terminal:
+    /// they must not put a window on screen or take focus from whoever is
+    /// using the Mac. Preview builds only.
+    static let headless: Bool = {
+        let env = ProcessInfo.processInfo.environment
+        return Bundle.main.bundleIdentifier == "local.ListenFlow.preview"
+            && (env["LISTENFLOW_REPLAY"] != nil || env["LISTENFLOW_PREVIEW_SNAPSHOT"] != nil)
+    }()
+
     func applicationDidFinishLaunching(_ notification: Notification) {
+        if Self.headless {
+            NSApp.setActivationPolicy(.accessory)
+            // Belt and braces: the scene is told not to open a window, and any
+            // that appears anyway (state restoration) is taken off screen.
+            for delay in [0.0, 0.2, 1.0] {
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                    NSApp.windows.filter { $0.canBecomeMain }.forEach { $0.orderOut(nil) }
+                }
+            }
+            return
+        }
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
         // Both shortcuts work from any app, so a class or meeting can be captured
@@ -35,8 +55,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 @main
 struct ListenFlowApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
-    @StateObject private var model = AppModel()
+    /// One instance, whoever asks first: the views, or a headless run that has no
+    /// window to create it.
+    private static let sharedModel = AppModel()
+    @StateObject private var model = ListenFlowApp.sharedModel
     init() {
+        if AppDelegate.headless { DispatchQueue.main.async { _ = Self.sharedModel } }
         if CommandLine.arguments.contains("--configure-deepseek") {
             let data = FileHandle.standardInput.readDataToEndOfFile()
             let key = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -57,6 +81,7 @@ struct ListenFlowApp: App {
             ContentView(model: model).onAppear { delegate.model = model }
         }
         .defaultSize(width: 1220, height: 800)
+        .defaultLaunchBehavior(AppDelegate.headless ? .suppressed : .automatic)
         .windowStyle(.hiddenTitleBar)
         .commands {
             CommandGroup(replacing: .newItem) {
@@ -76,7 +101,7 @@ struct ListenFlowApp: App {
             }
         }
 
-        MenuBarExtra {
+        MenuBarExtra(isInserted: .constant(!AppDelegate.headless)) {
             menuContent
         } label: {
             // The glyph itself shows whether audio is being captured right now.
