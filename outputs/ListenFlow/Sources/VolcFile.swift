@@ -201,7 +201,11 @@ enum VolcRecording {
         // The recording has the echo in it again; the live pass had dropped it.
         if source == EchoFilter.micSource { fresh.removeAll { EchoFilter.isEcho($0, among: lines) } }
         let old = covered(lines, source: source, spans: spans)
-        if split { fresh = (fresh + uncovered(old, by: fresh)).sorted { $0.start < $1.start } }
+        if split {
+            // Kept as they are, and done with: they count as refined from here on.
+            let kept = uncovered(old, by: fresh).map { line -> TranscriptLine in var line = line; line.refined = true; return line }
+            fresh = (fresh + kept).sorted { $0.start < $1.start }
+        }
         let before = old.map(\.text).joined(), after = fresh.map(\.text).joined()
         if before == after {
             // Nothing to improve; keep the lines (and their place in an organized
@@ -214,6 +218,47 @@ enum VolcRecording {
         replace(old, with: fresh, in: &lines)
         return true
     }
+
+    /// A pause this long between two sentences starts a new paragraph.
+    static let paragraphGap: TimeInterval = 1.5
+    /// A paragraph is not grown past this; the same length local refinement uses.
+    static let paragraphSeconds: TimeInterval = 30
+
+    /// Recording-file recognition returns one sentence at a time — a row every
+    /// few seconds, several times as many rows as the live transcript it
+    /// replaces, and a microphone cut on pauses comes back in still smaller
+    /// pieces (measured on a real session: 79 rows for 6 minutes, 1.6 s each).
+    /// Refined sentences that follow one another without a real pause, from the
+    /// same source and with nothing from another source in between, become
+    /// one paragraph. Breaks always fall between sentences.
+    static func paragraphs(_ lines: [TranscriptLine]) -> [TranscriptLine] {
+        var out: [TranscriptLine] = []
+        for line in lines.sorted(by: { $0.start < $1.start }) {
+            // Lines with audio references belong to the local engine's refinement.
+            if let last = out.last, last.refined == true, line.refined == true, last.audio == nil, line.audio == nil,
+               last.source == line.source, line.start.timeIntervalSince(last.end) <= paragraphGap,
+               line.end.timeIntervalSince(last.start) <= paragraphSeconds {
+                // Latin words need a space between them; Chinese does not.
+                let latin = last.text.last.map { $0.isASCII && ($0.isLetter || $0.isNumber) } == true
+                    && line.text.first.map { $0.isASCII && ($0.isLetter || $0.isNumber) } == true
+                out[out.count - 1] = TranscriptLine(id: last.id, start: last.start, end: max(last.end, line.end), source: last.source,
+                                                    text: last.text + (latin ? " " : "") + line.text, latency: last.latency, refined: true)
+            } else {
+                out.append(line)
+            }
+        }
+        return out
+    }
+
+    /// Seconds during which both `spans` and `others` have sound. A microphone
+    /// only needs cutting on pauses where the app was audible at the same time.
+    static func overlap(_ spans: [AudioSpan], with others: [AudioSpan]) -> TimeInterval {
+        spans.reduce(0) { total, span in
+            total + others.reduce(0) { $0 + max(0, min(span.end, $1.end).timeIntervalSince(max(span.start, $1.start))) }
+        }
+    }
+    /// Less simultaneous sound than this is a notification, not a conversation.
+    static let echoOverlap: TimeInterval = 3
 
     /// Uploads still to do: a run that was interrupted has already replaced
     /// some stretches, and those are not sent, or paid for, twice.

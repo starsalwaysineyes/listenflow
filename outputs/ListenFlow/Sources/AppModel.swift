@@ -877,6 +877,9 @@ final class AppModel: ObservableObject {
     private struct CloudUpload: Sendable {
         let source: String
         let spans: [AudioSpan]
+        /// A microphone recorded while the app was audible: sentences are cut on
+        /// pauses, so the echo can be told from the reply one phrase at a time.
+        var split = false
         var seconds: TimeInterval { Double(spans.reduce(0) { $0 + $1.count }) / 16000 }
     }
 
@@ -887,19 +890,23 @@ final class AppModel: ObservableObject {
         let spans = AudioStore.streamSpans(session)
         // App sources first: the microphone's echo check reads their text.
         let sources = spans.keys.sorted { ($0 == EchoFilter.micSource ? 1 : 0, $0) < ($1 == EchoFilter.micSource ? 1 : 0, $1) }
+        let played = spans.filter { $0.key != EchoFilter.micSource }.flatMap(\.value)
         return sources.flatMap { source in
             VolcRecording.plan(spans[source] ?? [], limit: Int(limit * 16000),
                                search: Int(VolcRecording.cutSearchSeconds * 16000)) { range in
                 guard let pcm = AudioStore.readStream(session: session, source: source, offset: range.lowerBound,
                                                       count: range.count) else { return range.upperBound }
                 return range.lowerBound + VolcRecording.quietest(in: pcm)
-            }.map { CloudUpload(source: source, spans: $0) }
+            }.map { part in
+                CloudUpload(source: source, spans: part, split: source == EchoFilter.micSource
+                            && VolcRecording.overlap(part, with: played) >= VolcRecording.echoOverlap)
+            }
         }
     }
 
     /// Two uploads at a time; each result is handed over as soon as it is in.
     nonisolated private static func recognize(_ uploads: [CloudUpload], session: UUID, client: VolcFileClient,
-                                              hotwords: [String], splitMic: Bool,
+                                              hotwords: [String],
                                               apply: @MainActor @Sendable (Int, [VolcUtterance]) -> Void) async throws {
         try await withThrowingTaskGroup(of: (Int, [VolcUtterance]).self) { group in
             var next = 0, running = 0
@@ -916,8 +923,7 @@ final class AppModel: ObservableObject {
                             parts.append(pcm)
                         }
                         let body = VolcRecording.submitBody(wav: VolcRecording.wav(parts, spans: upload.spans),
-                                                            uid: UUID().uuidString, hotwords: hotwords,
-                                                            splitOnPauses: splitMic && upload.source == EchoFilter.micSource)
+                                                            uid: UUID().uuidString, hotwords: hotwords, splitOnPauses: upload.split)
                         return (index, try await client.recognize(body: body, seconds: upload.seconds))
                     }
                     next += 1; running += 1
@@ -957,14 +963,11 @@ final class AppModel: ObservableObject {
             self.postRefineTotal = uploads.count
             let seconds = uploads.reduce(0) { $0 + $1.seconds }
             var failure: String?
-            // A microphone recorded next to an app has the app's sound in it.
-            let splitMic = Set(planned.map(\.source)).count > 1
             do {
                 try await AppModel.recognize(uploads, session: sessionID,
                                              client: VolcFileClient(key: key, resourceID: settings.volcFileResourceID),
-                                             hotwords: settings.hotwordList, splitMic: splitMic) { [weak self] index, utterances in
-                    self?.applyCloud(uploads[index], utterances, session: sessionID,
-                                     split: splitMic && uploads[index].source == EchoFilter.micSource)
+                                             hotwords: settings.hotwordList) { [weak self] index, utterances in
+                    self?.applyCloud(uploads[index], utterances, session: sessionID)
                 }
             } catch {
                 failure = error.localizedDescription
@@ -978,6 +981,8 @@ final class AppModel: ObservableObject {
             }
             AudioStore.deleteStream(sessionID)
             self.keptStreamSeconds = 0
+            // The service answers sentence by sentence; show paragraphs.
+            self.session.lines = VolcRecording.paragraphs(self.session.lines)
             if self.postRefineChanged > 0 { self.session.refinedAt = Date() }
             self.persist()
             self.notice = planned.isEmpty ? "这段会话没有可用的暂存音频。"
@@ -987,9 +992,9 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func applyCloud(_ upload: CloudUpload, _ utterances: [VolcUtterance], session id: UUID, split: Bool) {
+    private func applyCloud(_ upload: CloudUpload, _ utterances: [VolcUtterance], session id: UUID) {
         guard isPostRefining, session.id == id else { return }
-        if VolcRecording.apply(utterances, spans: upload.spans, source: upload.source, split: split, to: &session.lines) {
+        if VolcRecording.apply(utterances, spans: upload.spans, source: upload.source, split: upload.split, to: &session.lines) {
             postRefineChanged += 1
         }
         postRefineDone += 1
@@ -1077,17 +1082,16 @@ final class AppModel: ObservableObject {
             guard let self, let lines = self.storedRefine?.session.lines else { return }
             let uploads = planned.filter { VolcRecording.unfinished(lines, source: $0.source, spans: $0.spans) }
             self.storedRefine?.total = uploads.count
-            let splitMic = Set(planned.map(\.source)).count > 1
             var failure: String? = key.isEmpty ? "还没有填写豆包语音识别的 API Key。" : nil
             if failure == nil {
                 do {
                     try await AppModel.recognize(uploads, session: id,
                                                  client: VolcFileClient(key: key, resourceID: settings.volcFileResourceID),
-                                                 hotwords: settings.hotwordList, splitMic: splitMic) { [weak self] index, utterances in
+                                                 hotwords: settings.hotwordList) { [weak self] index, utterances in
                         guard let self, var run = self.storedRefine else { return }
                         let upload = uploads[index]
                         if VolcRecording.apply(utterances, spans: upload.spans, source: upload.source,
-                                               split: splitMic && upload.source == EchoFilter.micSource, to: &run.session.lines) {
+                                               split: upload.split, to: &run.session.lines) {
                             run.changed += 1
                         }
                         run.done += 1
@@ -1104,6 +1108,7 @@ final class AppModel: ObservableObject {
                 self.lastRefine = .init(sessionID: id, ok: false, message: "精修中断：\(failure) 已完成的 \(run.done) 段保留，暂存录音仍在，可以再试一次。", finished: Date())
             } else {
                 AudioStore.deleteStream(id)
+                run.session.lines = VolcRecording.paragraphs(run.session.lines)
                 if run.changed > 0 { run.session.refinedAt = Date() }
                 try? SessionStore.save(run.session)
                 let seconds = uploads.reduce(0) { $0 + $1.seconds }

@@ -518,6 +518,44 @@ enum CaptureFailure: LocalizedError {
                      && applyKept.count == 2 && applyKept[0].refined == nil, "A result that lost the words is refused")
         precondition(VolcRecording.unfinished([], source: "腾讯会议", spans: recPair), "Audio without lines is still worth sending")
 
+        // --- Refined sentences shown as paragraphs ---
+        func sentence(_ at: Double, _ length: Double, _ source: String, _ text: String, refined: Bool? = true, audio: AudioRef? = nil) -> TranscriptLine {
+            TranscriptLine(start: recT0.addingTimeInterval(at), end: recT0.addingTimeInterval(at + length), source: source, text: text, latency: 0, audio: audio, refined: refined)
+        }
+        let paraIn = [sentence(0, 5, "电脑声音", "今天讲梯度下降。"), sentence(5.3, 11, "电脑声音", "上一节课讲到损失函数。"), sentence(16.6, 4, "电脑声音", "学习率怎么选？"),
+                      sentence(21, 2, "麦克风", "老师，"), sentence(23.2, 3, "麦克风", "这个会考吗？"),             // a reply from another source breaks the paragraph
+                      sentence(27, 6, "电脑声音", "会考。"), sentence(36, 4, "电脑声音", "下面看动量法。"),            // 3 s pause: a new paragraph
+                      sentence(40.2, 12, "电脑声音", "它把之前几步的方向累积起来，"), sentence(52.4, 10, "电脑声音", "像滚下山坡的小球。"),
+                      sentence(62.6, 9, "电脑声音", "遇到平地也能继续向前。")]                                          // would pass 30 s: starts the next
+        let paraOut = VolcRecording.paragraphs(paraIn.shuffled())
+        precondition(paraOut.map(\.text) == ["今天讲梯度下降。上一节课讲到损失函数。学习率怎么选？", "老师，这个会考吗？", "会考。",
+                                             "下面看动量法。它把之前几步的方向累积起来，像滚下山坡的小球。", "遇到平地也能继续向前。"], "\(paraOut.map(\.text))")
+        precondition(paraOut[0].id == paraIn[0].id && paraOut[0].start == paraIn[0].start && paraOut[0].end == paraIn[2].end && paraOut.allSatisfy { $0.refined == true })
+        precondition(paraOut[3].end.timeIntervalSince(paraOut[3].start) <= VolcRecording.paragraphSeconds)
+        precondition(VolcRecording.paragraphs(paraOut).map(\.text) == paraOut.map(\.text), "Doing it twice changes nothing")
+        // Live lines, and the local engine's lines (which point into its audio file), are left alone.
+        let paraMixed = [sentence(0, 4, "麦克风", "第一句", refined: nil), sentence(4.2, 4, "麦克风", "第二句"), sentence(8.4, 4, "麦克风", "第三句", audio: AudioRef(offset: 0, count: 9)),
+                         sentence(12.6, 3, "麦克风", "open the"), sentence(15.8, 2, "麦克风", "settings 页面"), sentence(18, 2, "麦克风", "3 次")]
+        precondition(VolcRecording.paragraphs(paraMixed).map(\.text) == ["第一句", "第二句", "第三句", "open the settings 页面3 次"], "A space between Latin words only")
+        precondition(VolcRecording.paragraphs([]).isEmpty)
+
+        // The microphone is cut on pauses only where the app was audible at the same time.
+        let micSpans = [AudioSpan(offset: 0, count: 160_000, start: recT0), AudioSpan(offset: 160_000, count: 320_000, start: recT0.addingTimeInterval(60))]   // 0–10 s, 60–80 s
+        precondition(VolcRecording.overlap(micSpans, with: []) == 0)
+        precondition(VolcRecording.overlap(micSpans, with: [AudioSpan(offset: 0, count: 64_000, start: recT0.addingTimeInterval(20))]) == 0, "A sound while the microphone was quiet")
+        precondition(abs(VolcRecording.overlap(micSpans, with: [AudioSpan(offset: 0, count: 64_000, start: recT0.addingTimeInterval(8))]) - 2) < 0.001
+                     && VolcRecording.overlap(micSpans, with: [AudioSpan(offset: 0, count: 64_000, start: recT0.addingTimeInterval(8))]) < VolcRecording.echoOverlap, "A notification is not a conversation")
+        precondition(abs(VolcRecording.overlap(micSpans, with: [AudioSpan(offset: 0, count: 1_600_000, start: recT0.addingTimeInterval(5))]) - 25) < 0.001)
+
+        // Live lines that splitting on pauses lost are kept, and count as done.
+        var keptLines = [recLine(0, "麦克风", "关于新版本的设计"), recLine(5.2, "麦克风", "第一"), recLine(6.3, "麦克风", "很多人没有注意到")]
+        let keptSpans = [AudioSpan(offset: 0, count: 160_000, start: recT0)]
+        precondition(VolcRecording.apply([VolcUtterance(text: "关于新版本的设计。", definite: false, startMS: 100, endMS: 1000),
+                                          VolcUtterance(text: "很多人没有注意到。", definite: false, startMS: 6400, endMS: 7300)],
+                                         spans: keptSpans, source: "麦克风", split: true, to: &keptLines))
+        precondition(keptLines.map(\.text) == ["关于新版本的设计。", "第一", "很多人没有注意到。"] && keptLines.allSatisfy { $0.refined == true }
+                     && !VolcRecording.unfinished(keptLines, source: "麦克风", spans: keptSpans))
+
         // --- lstf: arguments ---
         func cliFails(_ arguments: [String], usage: Bool = true) -> Bool {
             do { _ = try Lstf.parse(arguments); return false } catch let error as LstfError { return error.usage == usage } catch { return false }
@@ -641,7 +679,7 @@ enum CaptureFailure: LocalizedError {
         print("PASS: silence, bounded chunks, lossless boundaries, endpointing, independent sources, discard, API URLs, context snapshots, session round-trip")
         print("PASS: old-session compatibility, organized draft persistence/export, late-arrival coverage, lossless cleanup batching, raw-only cleanup context")
         print("PASS: Doubao frames (gzip, headers, errors, malformed input), sentence de-duplication, resend backlog, speech gate, engine settings")
-        print("PASS: recording refinement (span index, upload planning and cutting, clock mapping, WAV, request, replacement guards), kept speech store, key file")
+        print("PASS: recording refinement (span index, upload planning and cutting, clock mapping, WAV, request, replacement guards, paragraphs, when to cut on pauses), kept speech store, key file")
         print("PASS: lstf (arguments, choosing a session, paging, output, search), app/tool request files, refinement applied to a stored session")
         print("PASS: pause-aware chunking under noise, forced-cut flags, settings migration, refinement windows/guards/merge, echo filter, private audio store round trip")
         if CommandLine.arguments.contains("--organize-live") {
