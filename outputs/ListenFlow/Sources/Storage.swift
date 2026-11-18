@@ -622,6 +622,18 @@ enum SessionStore {
         try save(session)
         return session
     }
+    /// Takes a session off the disk: its file, then its pictures. `remove` says
+    /// how — the app moves them to the Trash. Kept audio is not touched here.
+    /// A session that is not there is not an error.
+    static func delete(_ id: UUID, remove: (URL) throws -> Void) throws {
+        let fm = FileManager.default
+        // The file first: once it is gone the session is gone, whatever becomes of the pictures.
+        for url in [folder.appendingPathComponent(id.uuidString + ".json"), ImageAttachmentStore.folder(for: id)]
+        where fm.fileExists(atPath: url.path) {
+            try remove(url)
+        }
+    }
+    static func trash(_ url: URL) throws { try FileManager.default.trashItem(at: url, resultingItemURL: nil) }
     static func all() -> [MeetingSession] {
         let files = (try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? []
         return files.filter { $0.pathExtension == "json" }.compactMap {

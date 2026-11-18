@@ -932,12 +932,58 @@ enum CaptureFailure: LocalizedError {
             precondition(Lstf.listRow(Lstf.Info(session: stored!, keptSeconds: 0, localAudio: false, open: false, recording: false, refining: nil)).contains("「需求评审 · 第二场」"))
         }
 
+        // --- 0.11.2: a session can be deleted ---
+        do {
+            let goneRoot = FileManager.default.temporaryDirectory.appendingPathComponent("lf-gone-\(UUID().uuidString)")
+            defer { try? FileManager.default.removeItem(at: goneRoot) }
+            SessionStore.folderOverride = goneRoot.appendingPathComponent("Sessions")
+            defer { SessionStore.folderOverride = nil }
+            let fm = FileManager.default
+            let forever: (URL) throws -> Void = { try fm.removeItem(at: $0) }
+
+            var doomed = MeetingSession(title: "要删的", created: Date(timeIntervalSince1970: 1_800_000_000))
+            doomed.lines = [TranscriptLine(start: doomed.created, end: doomed.created.addingTimeInterval(4), source: "电脑声音", text: "一句", latency: 1)]
+            var kept = MeetingSession(title: "留下的", created: Date(timeIntervalSince1970: 1_800_000_500))
+            kept.lines = doomed.lines
+            try SessionStore.save(doomed)
+            try SessionStore.save(kept)
+            for id in [doomed.id, kept.id] {
+                try fm.createDirectory(at: ImageAttachmentStore.folder(for: id), withIntermediateDirectories: true)
+                try Data([1, 2, 3]).write(to: ImageAttachmentStore.folder(for: id).appendingPathComponent("shot-20270115-160000.jpg"))
+            }
+            var removed: [String] = []
+            try SessionStore.delete(doomed.id) { removed.append($0.lastPathComponent); try forever($0) }
+            precondition(removed == [doomed.id.uuidString + ".json", doomed.id.uuidString], "The file first, then the pictures; nothing else")
+            precondition(SessionStore.load(doomed.id) == nil && !fm.fileExists(atPath: ImageAttachmentStore.folder(for: doomed.id).path))
+            precondition(SessionStore.all().map(\.id) == [kept.id] && SessionStore.summaries().map(\.id) == [kept.id]
+                         && fm.fileExists(atPath: ImageAttachmentStore.folder(for: kept.id).appendingPathComponent("shot-20270115-160000.jpg").path),
+                         "The other session and its pictures are untouched")
+            var calls = 0
+            try SessionStore.delete(doomed.id) { _ in calls += 1 }
+            try SessionStore.delete(UUID()) { _ in calls += 1 }
+            precondition(calls == 0, "Nothing there is nothing to do, not an error")
+            // No pictures: only the file goes.
+            try fm.removeItem(at: ImageAttachmentStore.folder(for: kept.id))
+            var stopped = false
+            do { try SessionStore.delete(kept.id) { _ in throw CaptureFailure.message("废纸篓不可用") } } catch { stopped = true }
+            precondition(stopped && SessionStore.load(kept.id) != nil, "When it cannot be moved away it stays, and the caller hears why")
+            removed = []
+            try SessionStore.delete(kept.id) { removed.append($0.lastPathComponent); try forever($0) }
+            precondition(removed == [kept.id.uuidString + ".json"] && SessionStore.all().isEmpty)
+            for command in [["delete"], ["delete", "latest"], ["rm", "3F2A91BC"], ["remove"]] {
+                var usage = false
+                do { _ = try Lstf.parse(command) } catch let error as LstfError { usage = error.usage }
+                precondition(usage, "lstf has no way to delete a session")
+            }
+        }
+
         print("PASS: silence, bounded chunks, lossless boundaries, endpointing, independent sources, discard, API URLs, context snapshots, session round-trip")
         print("PASS: old-session compatibility, organized draft persistence/export, late-arrival coverage, lossless cleanup batching, raw-only cleanup context")
         print("PASS: Doubao frames (gzip, headers, errors, malformed input), sentence de-duplication, resend backlog, speech gate, engine settings")
         print("PASS: recording refinement (span index, upload planning and cutting, clock mapping, WAV, request, replacement guards, paragraphs, when to cut on pauses), kept speech store, key file")
         print("PASS: lstf (arguments, choosing a session, paging, output, search), app/tool request files, refinement applied to a stored session")
         print("PASS: session list summaries, saving off the main thread, paragraphs on the page, screenshots kept by time and shown to lstf, hot word file and lstf hotword, console tables, kept-audio files held open")
+        print("PASS: deleting a session (its file and pictures, nothing else; refused when it cannot be moved away; not from lstf)")
         print("PASS: naming a session (clean names, the stored file, the list, the export), lstf rename (arguments, the request, output)")
         print("PASS: pause-aware chunking under noise, forced-cut flags, settings migration, refinement windows/guards/merge, echo filter, private audio store round trip")
         if CommandLine.arguments.contains("--organize-live") {

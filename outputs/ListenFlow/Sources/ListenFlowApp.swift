@@ -12,7 +12,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let env = ProcessInfo.processInfo.environment
         return Bundle.main.bundleIdentifier == "local.ListenFlow.preview"
             && (env["LISTENFLOW_REPLAY"] != nil || env["LISTENFLOW_PREVIEW_SNAPSHOT"] != nil
-                || env["LISTENFLOW_PREVIEW_SCROLLCHECK"] != nil || env["LISTENFLOW_PREVIEW_SERVE"] != nil)
+                || env["LISTENFLOW_PREVIEW_SCROLLCHECK"] != nil || env["LISTENFLOW_PREVIEW_SERVE"] != nil
+                || env["LISTENFLOW_PREVIEW_DELETECHECK"] != nil)
     }()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -93,6 +94,10 @@ struct ListenFlowApp: App {
                     model.showMainWindow()
                     model.renameToken += 1
                 }
+                Button("删除这场会话…") {
+                    model.showMainWindow()
+                    model.askToDelete(model.session.id)
+                }.disabled(model.sessionIsEmpty)
             }
             CommandGroup(replacing: .appSettings) {
                 Button("设置…") { model.showSettings = true }.keyboardShortcut(",")

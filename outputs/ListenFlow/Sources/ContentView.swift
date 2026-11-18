@@ -118,6 +118,16 @@ struct ContentView: View {
         .tint(Palette.stream)
         .frame(minWidth: 780, minHeight: 520)
         .sheet(isPresented: $model.showSettings) { SettingsView(model: model) }
+        .alert("删除「\(model.deleteCandidate?.name ?? "")」？",
+               isPresented: Binding(get: { model.deleteCandidate != nil }, set: { if !$0 { model.deleteCandidate = nil } }),
+               presenting: model.deleteCandidate) { row in
+            Button("删除", role: .destructive) {
+                if let problem = model.deleteSession(row.id) { model.error = problem }
+            }
+            Button("取消", role: .cancel) {}
+        } message: { row in
+            Text(model.deleteDetail(row))
+        }
         .task { if !ListenFlowHome.isPreview { model.prepareEngine() } }
         // The app list is only looked at before a session starts.
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
@@ -304,7 +314,11 @@ private struct SessionRow: View {
                 .opacity(current || model.canChangeSession ? 1 : 0.5)
                 .help(current || model.canChangeSession ? row.title : "暂停转写并等识别完成后，才能换到别的会话")
                 // Outside `disabled`: a session can be renamed while another one is recording.
-                .contextMenu { Button("改名…") { renaming = true } }
+                .contextMenu {
+                    Button("改名…") { renaming = true }
+                    Divider()
+                    Button("删除…", role: .destructive) { model.askToDelete(row.id) }
+                }
         }
     }
 }

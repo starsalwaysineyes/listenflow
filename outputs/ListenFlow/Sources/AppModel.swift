@@ -120,6 +120,8 @@ final class AppModel: ObservableObject {
     @Published var showSettings = false
     /// Bumped by the menu command; the title in the main window turns into a field.
     @Published var renameToken = 0
+    /// The session the window is asking about deleting.
+    @Published var deleteCandidate: SessionSummary?
     @Published var source: AudioSource = .all
     /// What a running session is actually capturing, decided at start time so the
     /// user can change the picker freely while stopped.
@@ -352,6 +354,9 @@ final class AppModel: ObservableObject {
         // answer requests for this many seconds, then quit as a user would.
         if ListenFlowHome.isPreview, let seconds = ProcessInfo.processInfo.environment["LISTENFLOW_PREVIEW_SERVE"].flatMap(Double.init) {
             DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { NSApp.terminate(nil) }
+        }
+        if ListenFlowHome.isPreview, let path = ProcessInfo.processInfo.environment["LISTENFLOW_PREVIEW_DELETECHECK"] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.deleteCheck(to: path) }
         }
         if ListenFlowHome.isPreview, let path = ProcessInfo.processInfo.environment["LISTENFLOW_PREVIEW_SCROLLCHECK"] {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.scrollCheck(to: path) }
@@ -1408,6 +1413,9 @@ final class AppModel: ObservableObject {
     func newSession() {
         guard canChangeSession else { return }
         persist()
+        startFresh()
+    }
+    private func startFresh() {
         session = MeetingSession()
         keptStreamSeconds = 0
         echoDropped = 0
@@ -1439,6 +1447,50 @@ final class AppModel: ObservableObject {
         lastLatency = 0
         error = nil
         notice = nil
+    }
+    /// Why a session cannot be deleted at the moment; nil when it can.
+    func deleteBlocker(_ id: UUID) -> String? {
+        if id == session.id {
+            if isRecording { return "这场会话正在录制，暂停转写后才能删除。" }
+            if !canChangeSession { return "这场会话还在识别、精修或整理，完成后才能删除。" }
+        }
+        if id == storedRefine?.session.id { return "这场会话正在后台精修，完成后才能删除。" }
+        return nil
+    }
+    /// What deleting it takes away, for the question the window asks.
+    func deleteDetail(_ row: SessionSummary) -> String {
+        var parts = [row.lineCount > 0 ? "\(row.lineCount) 句转写" : "这场会话"]
+        if row.hasDraft { parts.append("整理稿") }
+        if row.imageCount > 0 { parts.append("\(row.imageCount) 张图片") }
+        return parts.joined(separator: "、") + "会移到废纸篓。"
+            + (AudioStore.hasAudio(row.id) ? "暂存的录音直接删除，之后不能再精修。" : "")
+    }
+    /// The window asks first; this only raises the question.
+    func askToDelete(_ id: UUID) {
+        if let blocker = deleteBlocker(id) { error = blocker; return }
+        deleteCandidate = id == session.id ? (sessionIsEmpty ? nil : SessionSummary(session)) : history.first { $0.id == id }
+    }
+    /// Deletes a session: its file and pictures go to the Trash, its kept audio
+    /// is removed. Only a person does this, in the window; `lstf` cannot.
+    /// Returns why it could not, or nil when it is done.
+    @discardableResult
+    func deleteSession(_ id: UUID) -> String? {
+        if let blocker = deleteBlocker(id) { return blocker }
+        let open = id == session.id
+        let name = open ? session.name : history.first { $0.id == id }?.name
+        writer.flush()      // a save still on its way would bring the file back
+        if SessionStore.writes {
+            // Preview builds are checks run from a terminal: they stay out of the user's Trash.
+            do { try SessionStore.delete(id, remove: ListenFlowHome.isPreview ? { try FileManager.default.removeItem(at: $0) } : SessionStore.trash) }
+            catch { return "没有删掉：\(error.localizedDescription)" }
+            AudioStore.delete(id)
+        }
+        history.removeAll { $0.id == id }
+        if lastRefine?.sessionID == id { lastRefine = nil }
+        if open { startFresh() }
+        error = nil
+        notice = "已删除「\(name ?? "会话")」，文件在废纸篓里。"
+        return nil
     }
     /// Gives a session a name of the user's (or their agent's) choosing: the
     /// one that is open, recording or not, or any other in the list. Returns
@@ -1800,6 +1852,57 @@ extension AppModel {
         }
         isRecording = false
         NSApp.terminate(nil)
+    }
+
+    /// Deleting sessions, checked without a window in a store of the check's
+    /// own that holds at least three sessions: one that is not open, the open
+    /// one with a save still on its way, and one that is recording. What is
+    /// left on disk and in the list each time is written out. Preview builds only.
+    func deleteCheck(to path: String) {
+        let fm = FileManager.default
+        var result: [String: Any] = [:]
+        func finish() {
+            if let data = try? JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys]) {
+                try? data.write(to: URL(fileURLWithPath: path))
+            }
+            NSApp.terminate(nil)
+        }
+        func there(_ id: UUID) -> [String: Bool] {
+            ["file": fm.fileExists(atPath: SessionStore.folder.appendingPathComponent(id.uuidString + ".json").path),
+             "pictures": fm.fileExists(atPath: ImageAttachmentStore.folder(for: id).path),
+             "audio": AudioStore.hasAudio(id), "listed": history.contains { $0.id == id }]
+        }
+        let stored = SessionStore.all()
+        guard SessionStore.folderOverride != nil, stored.count >= 3 else { result["error"] = "needs LISTENFLOW_PREVIEW_STORE with three sessions"; finish(); return }
+        history = SessionStore.summaries()
+        let recording = stored[0], open = stored[1], other = stored[2]
+
+        result["1 not open, before"] = there(other.id)
+        result["1 asked"] = deleteDetail(SessionSummary(other))
+        result["1 refused"] = deleteSession(other.id) ?? ""
+        result["1 not open, after"] = there(other.id)
+
+        openSession(open.id)
+        session.lines.append(TranscriptLine(start: Date(), end: Date(), source: AudioSource.systemName, text: "删除前刚定稿的一句", latency: 0.5))
+        persist()       // on its way to disk when the session is deleted
+        result["2 open, before"] = there(open.id)
+        result["2 refused"] = deleteSession(open.id) ?? ""
+        writer.flush()
+        result["2 open, after"] = there(open.id)
+        result["2 window moved to a new empty session"] = session.id != open.id && sessionIsEmpty
+        result["2 notice"] = notice ?? ""
+
+        openSession(recording.id)
+        isRecording = true
+        result["3 refused"] = deleteSession(recording.id) ?? ""
+        result["3 recording, after"] = there(recording.id)
+        isRecording = false
+
+        persist()
+        writer.flush()
+        result["4 sessions left on disk"] = SessionStore.all().map(\.id.uuidString)
+        result["4 rows left in the list"] = history.map(\.id.uuidString)
+        finish()
     }
 
     private func write(_ path: String, extra: [String: Any]) {
