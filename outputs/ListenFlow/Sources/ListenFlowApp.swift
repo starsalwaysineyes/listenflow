@@ -88,9 +88,9 @@ struct ListenFlowApp: App {
     private var menuContent: some View {
         if model.isRecording {
             Text("正在转写 · \(model.session.lines.count) 段")
-            if model.pendingCount > 0 { Text("识别中 \(model.pendingCount) 段") }
+            if model.pendingCount > 0 && !model.usesCloud { Text("识别中 \(model.pendingCount) 段") }
         } else {
-            Text(model.modelReady ? "已就绪，未在转写" : model.modelStatus)
+            Text(model.engineReady ? "已就绪，未在转写" : model.engineStatus)
         }
         Divider()
         Button(model.isRecording ? "暂停转写（⌥⌘R）" : "开始转写（⌥⌘R）") {

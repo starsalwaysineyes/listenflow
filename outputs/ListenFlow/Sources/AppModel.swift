@@ -28,6 +28,35 @@ final class AudioLevels: ObservableObject {
     @Published var mic: Float = 0
 }
 
+/// Text the cloud engine is still revising, per source. Kept off `AppModel` for
+/// the same reason as `AnswerStream`: it changes several times a second.
+@MainActor
+final class LivePreview: ObservableObject {
+    struct Item: Identifiable, Equatable {
+        let source: String
+        var text: String
+        var id: String { source }
+    }
+    @Published private(set) var items: [Item] = []
+    func set(_ source: String, _ text: String) {
+        var next = items.filter { $0.source != source }
+        if !text.isEmpty { next.append(Item(source: source, text: text)) }
+        if next != items { items = next }
+    }
+    func clear() { if !items.isEmpty { items = [] } }
+}
+
+/// Hands captured audio to the right stream straight from the capture queue,
+/// without a hop through the main actor for every buffer.
+final class StreamRouter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var streams: [String: VolcStream] = [:]
+    func set(_ source: String, _ stream: VolcStream?) { lock.withLock { streams[source] = stream } }
+    func append(_ source: String, _ samples: [Float], _ end: Date) {
+        lock.withLock { streams[source] }?.append(samples, end: end)
+    }
+}
+
 @MainActor
 final class OrganizationPreview: ObservableObject {
     @Published var text = ""
@@ -109,10 +138,25 @@ final class AppModel: ObservableObject {
     /// compared with what the app said at the same time (see `EchoFilter`).
     private struct HeldLine {
         let line: TranscriptLine
-        let chunk: AudioChunk
+        let chunk: AudioChunk?
         let since: Date
     }
     private var heldMic: [HeldLine] = []
+    // Cloud engine: one stream per audio source, kept until its last result is in.
+    let livePreview = LivePreview()
+    /// Whether a Doubao key is stored; read once, not on every view update.
+    @Published var volcKeyPresent = false
+    @Published var cloudActivity = VolcStream.Activity.waiting
+    /// Preview text exists, so the transcript is no longer empty.
+    @Published var hasLivePartial = false
+    private let router = StreamRouter()
+    private var streamsByID: [UUID: VolcStream] = [:]
+    private var activeStreams: [String: UUID] = [:]
+    private var drainingStreams: Set<UUID> = []
+    private var streamActivity: [UUID: VolcStream.Activity] = [:]
+    private var partials: [String: String] = [:]
+    private var replayLog: [[String: Any]]?
+    private var replayStarted = Date()
     /// The replay harness's app chunker, standing in for live capture.
     private var replayAppChunker: AudioChunker?
     /// A joined stretch of one source's lines waiting to be re-recognized as a whole.
@@ -147,8 +191,22 @@ final class AppModel: ObservableObject {
     private var lastMicSignal = Date.distantPast
     var canChangeSession: Bool { !isRecording && !isBusy && !isAsking && !isOrganizing && !isImportingImages && pendingCount == 0 && !isPostRefining }
     /// A microphone session can start with no app selected.
+    var usesCloud: Bool { preferences.engine == .volc }
+    /// The engine in use can take audio: a loaded local model, or a stored cloud key.
+    var engineReady: Bool { usesCloud ? volcKeyPresent : modelReady }
+    var engineStatus: String {
+        guard usesCloud else { return modelStatus }
+        guard volcKeyPresent else { return "未填写豆包 API Key" }
+        guard isRecording || pendingCount > 0 else { return "豆包云端识别已就绪" }
+        switch cloudActivity {
+        case .waiting: return "豆包 · 等待声音"
+        case .connecting: return "豆包 · 正在连接"
+        case .live: return "豆包 · 识别中"
+        case .reconnecting: return "豆包 · 正在重连"
+        }
+    }
     var canStartRecording: Bool {
-        guard modelReady, !isBusy, !isRecording, !isPostRefining else { return false }
+        guard engineReady, !isBusy, !isRecording, !isPostRefining else { return false }
         return source == .microphone || selectedPID != 0
     }
     /// Whether the start/pause control is actionable right now. Stopping must stay
@@ -170,7 +228,7 @@ final class AppModel: ObservableObject {
     /// last re-recognized one: everything above it is settled, everything from it
     /// down is short live chunks that may still be merged and replaced.
     var liveTailStart: UUID? {
-        guard isRecording || pendingCount > 0,
+        guard !usesCloud, isRecording || pendingCount > 0,
               let last = session.lines.lastIndex(where: { $0.refined == true }),
               last + 1 < session.lines.count else { return nil }
         return session.lines[last + 1].id
@@ -183,7 +241,7 @@ final class AppModel: ObservableObject {
     }
     /// Audio for this session is kept and there is at least one multi-line window to redo.
     var canRefineSession: Bool {
-        !isRecording && !isBusy && pending.isEmpty && !isPostRefining && modelReady
+        !usesCloud && !isRecording && !isBusy && pending.isEmpty && !isPostRefining && modelReady
             && session.lines.contains { $0.audio != nil }
             && !Refinement.windows(session.lines, limit: Refinement.postWindow).isEmpty
     }
@@ -208,6 +266,7 @@ final class AppModel: ObservableObject {
             await self.stop()
         } }
         worker.onEvent = { [weak self] event in self?.receive(event) }
+        refreshVolcKey()
         refreshApps()
         history = SessionStore.all()
         DispatchQueue.global(qos: .utility).async { AudioStore.purgeExpired() }
@@ -251,6 +310,10 @@ final class AppModel: ObservableObject {
                 self.island = NotchIslandController(model: self)
             }
         }
+        if Bundle.main.bundleIdentifier == "local.ListenFlow.preview",
+           let folder = ProcessInfo.processInfo.environment["LISTENFLOW_PREVIEW_SNAPSHOT"] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.snapshotViews(to: folder) }
+        }
         // Lets UI checks capture the settings sheet without synthesizing keystrokes.
         if Bundle.main.bundleIdentifier == "local.ListenFlow.preview",
            ProcessInfo.processInfo.environment["LISTENFLOW_PREVIEW_SETTINGS"] == "1" { showSettings = true }
@@ -264,8 +327,30 @@ final class AppModel: ObservableObject {
         if !apps.contains(where: { $0.id == selectedPID }) { selectedPID = apps.first?.id ?? 0 }
     }
 
+    /// Called when the window appears: only the local engine has anything to load.
+    func prepareEngine() {
+        if usesCloud { refreshVolcKey() } else if !modelReady && !modelLoading { loadModel() }
+    }
+
+    /// The key is read off the main thread: the Keychain may put up a prompt.
+    private func refreshVolcKey() {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let present = !AppModel.volcKey().isEmpty
+            DispatchQueue.main.async { if self?.volcKeyPresent != present { self?.volcKeyPresent = present } }
+        }
+    }
+
+    /// Preview and test builds take the key from the environment and never touch
+    /// the Keychain; the real app only ever reads the Keychain.
+    nonisolated private static func volcKey() -> String {
+        if Bundle.main.bundleIdentifier == "local.ListenFlow.preview" {
+            return ProcessInfo.processInfo.environment["VOLC_ASR_API_KEY"] ?? ""
+        }
+        return SecretStore.read(account: SecretStore.volcAccount)
+    }
+
     func loadModel() {
-        guard !isRecording, !isBusy, pending.isEmpty, !modelLoading else { return }
+        guard !usesCloud, !isRecording, !isBusy, pending.isEmpty, !modelLoading else { return }
         error = nil
         modelLoading = true
         modelReady = false
@@ -291,7 +376,7 @@ final class AppModel: ObservableObject {
     }
 
     func start() async {
-        guard modelReady, !isBusy, !isRecording else { return }
+        guard engineReady, !isBusy, !isRecording else { return }
         // A microphone-only session never needs a target app; an app session does.
         let app: AudioApp?
         switch source {
@@ -308,6 +393,18 @@ final class AppModel: ObservableObject {
             session.title = "\(label) · \(Date().formatted(date: .abbreviated, time: .shortened))"
         }
         do {
+            if usesCloud {
+                let key = await Task.detached { AppModel.volcKey() }.value
+                guard !key.isEmpty else {
+                    volcKeyPresent = false
+                    throw CaptureFailure.message("还没有填写豆包语音识别的 API Key。请在「模型与 API 设置」里填写，或切换到本地模型。")
+                }
+                cloudKey = key
+                capture.onAudio = { [router] source, samples, end in router.append(source, samples, end) }
+                openStream(app?.name ?? EchoFilter.micSource)
+            } else {
+                capture.onAudio = nil
+            }
             if let app {
                 try await capture.start(pid: app.id, name: app.name)
             } else {
@@ -316,7 +413,10 @@ final class AppModel: ObservableObject {
             activeSource = source
             isRecording = true
             micEnabled = source == .microphone
-        } catch { self.error = error.localizedDescription }
+        } catch {
+            self.error = error.localizedDescription
+            cancelStreams()
+        }
         isBusy = false
     }
 
@@ -324,6 +424,8 @@ final class AppModel: ObservableObject {
         guard !isBusy else { return }
         isBusy = true
         await capture.stop()
+        // The cloud engine still owes the last sentence: ask for it and wait.
+        for source in Array(activeStreams.keys) { finishStream(source) }
         isRecording = false
         micEnabled = false
         micBusy = false
@@ -338,10 +440,117 @@ final class AppModel: ObservableObject {
         guard isRecording, !isBusy, !micBusy else { return }
         micBusy = true
         do {
+            if usesCloud && value { openStream(EchoFilter.micSource) }
             try await capture.setMicrophone(value)
             micEnabled = value
         } catch { self.error = error.localizedDescription; micEnabled = false }
+        if usesCloud && !micEnabled { finishStream(EchoFilter.micSource) }
         micBusy = false
+    }
+
+    // MARK: - Cloud engine
+
+    private var cloudKey = ""
+
+    private func openStream(_ source: String) {
+        guard activeStreams[source] == nil else { return }
+        let id = UUID()
+        var settings = VolcStream.Settings(key: cloudKey, resourceID: preferences.volcResourceID,
+                                           hotwords: preferences.hotwordList)
+        // A microphone running next to an app hears the app through the speakers.
+        // Measured: with the usual 1 s window an echo ran straight into the user's
+        // reply as one 20 s sentence, and the service's final text kept only the
+        // echo — 7 s of speech gone. At 200 ms each phrase is its own line, so
+        // echoes are judged, and dropped, one phrase at a time.
+        if source == EchoFilter.micSource && activeStreams.keys.contains(where: { $0 != EchoFilter.micSource }) {
+            settings.endWindowMS = 200
+        }
+        let stream = VolcStream(source: source, settings: settings) { [weak self] event in
+            self?.receive(event, from: id, source: source)
+        }
+        streamsByID[id] = stream
+        activeStreams[source] = id
+        router.set(source, stream)
+    }
+
+    /// No more audio for this source; its stream stays until the last result is in.
+    private func finishStream(_ source: String) {
+        guard let id = activeStreams.removeValue(forKey: source), let stream = streamsByID[id] else { return }
+        router.set(source, nil)
+        drainingStreams.insert(id)
+        stream.finish()
+        refreshPending()
+    }
+
+    private func cancelStreams() {
+        for (source, _) in activeStreams { router.set(source, nil) }
+        streamsByID.values.forEach { $0.cancel() }
+        streamsByID.removeAll(); activeStreams.removeAll(); drainingStreams.removeAll()
+        streamActivity.removeAll(); partials.removeAll()
+        livePreview.clear()
+        if hasLivePartial { hasLivePartial = false }
+        refreshPending()
+    }
+
+    private func receive(_ event: VolcStream.Event, from id: UUID, source: String) {
+        guard streamsByID[id] != nil else { return }
+        switch event {
+        case let .line(text, start, end):
+            let line = TranscriptLine(start: start, end: end, source: source, text: text,
+                                      latency: max(0, Date().timeIntervalSince(end)))
+            replayLog?.append(["event": "line", "source": source, "text": text, "at": Date().timeIntervalSince(replayStarted)])
+            if source == EchoFilter.micSource {
+                heldMic.append(HeldLine(line: line, chunk: nil, since: Date()))
+            } else {
+                accept(line, chunk: nil)
+            }
+            settleHeldMic()
+        case let .partial(text):
+            if partials[source] != text {
+                partials[source] = text.isEmpty ? nil : text
+                if !text.isEmpty { replayLog?.append(["event": "partial", "source": source, "chars": text.count, "at": Date().timeIntervalSince(replayStarted)]) }
+                refreshPreview()
+            }
+        case let .activity(value):
+            streamActivity[id] = value
+            refreshCloudActivity()
+        case let .failed(message):
+            error = message
+            if isRecording { Task { await stop() } }
+        case .drained:
+            streamsByID[id] = nil
+            streamActivity[id] = nil
+            drainingStreams.remove(id)
+            if activeStreams[source] == id { activeStreams[source] = nil; router.set(source, nil) }
+            if activeStreams[source] == nil { partials[source] = nil }
+            refreshPreview()
+            refreshCloudActivity()
+            settleHeldMic()
+            refreshPending()
+            persist()
+        }
+    }
+
+    /// The microphone's preview is hidden while it only repeats what the app is
+    /// saying, so an echo does not flicker in before its line is dropped.
+    private func refreshPreview() {
+        let appText = partials.filter { $0.key != EchoFilter.micSource }.values.joined()
+            + session.lines.suffix(3).filter { $0.source != EchoFilter.micSource }.map(\.text).joined()
+        for source in Set(partials.keys).union(livePreview.items.map(\.source)) {
+            var text = partials[source] ?? ""
+            if source == EchoFilter.micSource, !appText.isEmpty,
+               EchoFilter.overlap(text, in: appText) >= EchoFilter.threshold { text = "" }
+            livePreview.set(source, text)
+        }
+        let has = !livePreview.items.isEmpty
+        if hasLivePartial != has { hasLivePartial = has }
+    }
+
+    private func refreshCloudActivity() {
+        let all = Set(streamActivity.values)
+        let value: VolcStream.Activity = all.contains(.reconnecting) ? .reconnecting
+            : all.contains(.live) ? .live : all.contains(.connecting) ? .connecting : .waiting
+        if cloudActivity != value { cloudActivity = value }
     }
 
     private func submit(_ chunk: AudioChunk) {
@@ -400,16 +609,16 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func accept(_ line: TranscriptLine, chunk: AudioChunk) {
-        lastLatency = Date().timeIntervalSince(chunk.start)
+    private func accept(_ line: TranscriptLine, chunk: AudioChunk?) {
+        lastLatency = chunk.map { Date().timeIntervalSince($0.start) } ?? line.latency
         session.lines.append(line)
         session.lines.sort { $0.start < $1.start }
         persist()
-        if qualityActive { addToWindow(chunk, lineID: line.id, text: line.text) }
+        if qualityActive, let chunk { addToWindow(chunk, lineID: line.id, text: line.text) }
     }
 
     private func refreshPending() {
-        let count = pending.count + heldMic.count
+        let count = pending.count + heldMic.count + drainingStreams.count
         if pendingCount != count { pendingCount = count }
     }
 
@@ -418,15 +627,27 @@ final class AppModel: ObservableObject {
     /// Normally that is well under a second; 12 s is only a backstop.
     private func settleHeldMic(force: Bool = false) {
         guard !heldMic.isEmpty else { return }
-        let buffered = replayAppChunker?.bufferedSince ?? capture.appBufferedSince()
+        // Cloud engine: app speech that has not been settled into a line yet.
+        let appStreams = streamsByID.values.filter { $0.source != EchoFilter.micSource }
+        let cloudOpen = appStreams.compactMap(\.openSpeechSince).min()
+        let buffered = cloudOpen ?? replayAppChunker?.bufferedSince ?? capture.appBufferedSince()
         let now = Date()
+        // What the app is saying right now counts too, even before it settles:
+        // a cloud sentence can stay open for 20 s.
+        var reference = session.lines
+        for (source, text) in partials where source != EchoFilter.micSource {
+            reference.append(TranscriptLine(start: cloudOpen ?? now.addingTimeInterval(-20), end: now, source: source, text: text, latency: 0))
+        }
+        // The cloud engine's preview of the app arrives within about a second, so
+        // an echo is recognizable long before the app's sentence settles.
+        let backstop: TimeInterval = appStreams.isEmpty ? 12 : 4
         var waiting: [HeldLine] = []
         for held in heldMic {
-            if EchoFilter.isEcho(held.line, among: session.lines) { echoDropped += 1; continue }
+            if EchoFilter.isEcho(held.line, among: reference) { echoDropped += 1; continue }
             let end = held.line.end
             let appPending = pending.values.contains { $0.source != EchoFilter.micSource && $0.start < end }
             let appBuffering = buffered.map { $0 < end } ?? false
-            if force || (!appPending && !appBuffering) || now.timeIntervalSince(held.since) > 12 {
+            if force || (!appPending && !appBuffering) || now.timeIntervalSince(held.since) > backstop {
                 accept(held.line, chunk: held.chunk)
             } else {
                 waiting.append(held)
@@ -439,14 +660,14 @@ final class AppModel: ObservableObject {
     // MARK: - Replay hooks
     func submitForReplay(_ chunk: AudioChunk) { submit(chunk) }
     func updateRecognitionModeForReplay() { updateRecognitionMode() }
-    var replayIdle: Bool { pending.isEmpty && heldMic.isEmpty && refineQueue.isEmpty && refineInFlight == nil && openWindows.isEmpty }
+    var replayIdle: Bool { pending.isEmpty && heldMic.isEmpty && streamsByID.isEmpty && refineQueue.isEmpty && refineInFlight == nil && openWindows.isEmpty }
 
     // MARK: - Second-pass recognition
 
     private func updateRecognitionMode() {
         let ac = PowerSource.onAC
         if ac != onAC { onAC = ac }
-        let quality = PowerSource.wantsQuality(preferences.recognitionMode)
+        let quality = !usesCloud && PowerSource.wantsQuality(preferences.recognitionMode)
         if quality != qualityActive {
             qualityActive = quality
             // Switching to economy mid-session: stop joining, but let windows that
@@ -608,16 +829,39 @@ final class AppModel: ObservableObject {
             current.timeIntervalSince(lastOrganizationAttempt) >= 30 { organize() }
     }
 
-    func applyPreferences(_ value: Preferences, key: String) throws {
+    /// `volcKey` is nil when the field was left as loaded, so a key that could
+    /// not be read is never overwritten with nothing.
+    func applyPreferences(_ value: Preferences, key: String, volcKey: String? = nil) throws {
+        let engineChanged = preferences.engine != value.engine
         let changed = preferences.python != value.python || preferences.asrModel != value.asrModel
-        if changed && (isRecording || isBusy || pendingCount > 0 || modelLoading) {
-            throw CaptureFailure.message("请先暂停转写并等待识别完成，再切换本地模型。")
+        if (changed || engineChanged) && (isRecording || isBusy || pendingCount > 0 || modelLoading) {
+            throw CaptureFailure.message("请先暂停转写并等待识别完成，再切换识别引擎或本地模型。")
+        }
+        if value.engine == .volc && value.volcResourceID.trimmingCharacters(in: .whitespaces).isEmpty {
+            throw CaptureFailure.message("请填写豆包的资源 ID，小时版为 volc.seedasr.sauc.duration。")
         }
         if !value.apiBase.isEmpty { _ = try LLMClient.endpoint(value.apiBase) }
         if !value.apiBase.isEmpty { try SecretStore.save(key, account: value.apiBase) }
+        if let volcKey {
+            let trimmed = volcKey.trimmingCharacters(in: .whitespacesAndNewlines)
+            try SecretStore.save(trimmed, account: SecretStore.volcAccount)
+            volcKeyPresent = !trimmed.isEmpty
+        }
         preferences = value
-        value.save()
-        if changed { loadModel() }
+        preferences.volcResourceID = value.volcResourceID.trimmingCharacters(in: .whitespaces)
+        preferences.save()
+        updateRecognitionMode()
+        if value.engine == .local {
+            if changed || engineChanged || (!modelReady && !modelLoading) { loadModel() }
+        } else if engineChanged {
+            // The local model holds about 2.7 GB; release it while the cloud is in use.
+            worker.shutdown()
+            modelReady = false
+            modelLoading = false
+            loadingSince = nil
+            modelStatus = "模型尚未加载"
+            resetRefinement()
+        }
     }
 
     func ask(_ prompt: String? = nil) {
@@ -860,6 +1104,7 @@ final class AppModel: ObservableObject {
         askTask?.cancel()
         organizeTask?.cancel()
         persist()
+        cancelStreams()
         worker.shutdown()
     }
 }
@@ -873,13 +1118,30 @@ extension AppModel {
     func runReplayIfRequested() {
         let env = ProcessInfo.processInfo.environment
         guard Bundle.main.bundleIdentifier == "local.ListenFlow.preview", let path = env["LISTENFLOW_REPLAY"],
-              let out = env["LISTENFLOW_REPLAY_OUT"] else { return }
+              var out = env["LISTENFLOW_REPLAY_OUT"] else { return }
         AudioStore.rootOverride = FileManager.default.temporaryDirectory.appendingPathComponent("listenflow-replay-audio")
         Task { @MainActor in
             let wav = (try? Data(contentsOf: URL(fileURLWithPath: path))) ?? Data()
             // Raw 16 kHz mono Int16 LE, no header: WAV headers vary in length.
             let samples = wav.withUnsafeBytes { Array($0.bindMemory(to: Int16.self)) }.map { Float($0) / 32768 }
-            loadModel()
+            if env["LISTENFLOW_REPLAY_ENGINE"] == "volc" {
+                let track = env["LISTENFLOW_REPLAY_MIC"].flatMap { try? Data(contentsOf: URL(fileURLWithPath: $0)) } ?? Data()
+                preferences.engine = .volc
+                await replayCloud(app: samples, mic: track.withUnsafeBytes { Array($0.bindMemory(to: Int16.self)) }.map { Float($0) / 32768 },
+                                  env: env, out: out)
+                guard env["LISTENFLOW_REPLAY_THEN_LOCAL"] == "1" else { NSApp.terminate(nil); return }
+                // Switch engines in the same process, the way the settings sheet
+                // does. The question API is blanked so no key is written.
+                var next = preferences
+                next.engine = .local
+                next.apiBase = ""
+                do { try applyPreferences(next, key: "") }
+                catch { write(out + "-local-live.json", extra: ["error": error.localizedDescription]); NSApp.terminate(nil); return }
+                out += "-local"
+            } else {
+                preferences.engine = .local
+                loadModel()
+            }
             while !modelReady { try? await Task.sleep(nanoseconds: 200_000_000) }
             preferences.recognitionMode = RecognitionMode(rawValue: env["LISTENFLOW_REPLAY_MODE"] ?? "") ?? .economy
             preferences.keepAudioForRefine = true
@@ -926,9 +1188,93 @@ extension AppModel {
         }
     }
 
+    /// The cloud engine end to end: the same streams, events and stop path as a
+    /// live session, fed from a file on the capture clock. Costs real audio time.
+    private func replayCloud(app: [Float], mic: [Float], env: [String: String], out: String) async {
+        cloudKey = AppModel.volcKey()
+        guard !cloudKey.isEmpty else {
+            write(out + "-live.json", extra: ["error": "VOLC_ASR_API_KEY is not set"])
+            return
+        }
+        volcKeyPresent = true
+        if let resource = env["LISTENFLOW_REPLAY_RESOURCE"] { preferences.volcResourceID = resource }
+        updateRecognitionModeForReplay()
+        session = MeetingSession(title: "replay", created: Date())
+        replayStarted = session.created
+        replayLog = []
+        isRecording = true
+        activeSource = .app
+        openStream("回放")
+        if !mic.isEmpty { openStream(EchoFilter.micSource); micEnabled = true }
+        let speed = Double(env["LISTENFLOW_REPLAY_SPEED"] ?? "1") ?? 1
+        let dropAt = env["LISTENFLOW_REPLAY_DROP_AT"].flatMap(Double.init)
+        var dropped = false
+        var offset = 0
+        let total = max(app.count, mic.count)
+        while offset < total && isRecording {
+            let n = min(1024, total - offset)
+            let end = session.created.addingTimeInterval(Double(offset + n) / 16000)
+            if offset < app.count { router.append("回放", Array(app[offset..<min(offset + n, app.count)]), end) }
+            if offset < mic.count { router.append(EchoFilter.micSource, Array(mic[offset..<min(offset + n, mic.count)]), end) }
+            offset += n
+            if let dropAt, !dropped, Double(offset) / 16000 >= dropAt {
+                dropped = true
+                streamsByID.values.forEach { $0.simulateDrop() }
+                replayLog?.append(["event": "drop", "at": Date().timeIntervalSince(replayStarted)])
+            }
+            // Paced against the clock, not by summing sleeps, so it stays real time.
+            let due = replayStarted.addingTimeInterval(Double(offset) / 16000 / speed).timeIntervalSinceNow
+            if due > 0 { try? await Task.sleep(nanoseconds: UInt64(due * 1_000_000_000)) }
+        }
+        let fed = Date()
+        replayLog?.append(["event": "pause", "at": fed.timeIntervalSince(replayStarted)])
+        for source in Array(activeStreams.keys) { finishStream(source) }      // what stop() does
+        isRecording = false
+        micEnabled = false
+        activeSource = nil
+        while !replayIdle { try? await Task.sleep(nanoseconds: 100_000_000) }
+        write(out + "-live.json", extra: ["fedSeconds": fed.timeIntervalSince(replayStarted),
+                                          "drainSeconds": Date().timeIntervalSince(fed), "echoDropped": echoDropped,
+                                          "events": replayLog ?? [], "error": error ?? ""])
+        replayLog = nil
+    }
+
+    /// Renders the main window and the settings sheet for both engines to PNG files
+    /// without putting a window on screen, so layout can be checked on a locked
+    /// or headless Mac. Preview builds only.
+    func snapshotViews(to folder: String) {
+        func shot<V: View>(_ view: V, _ size: NSSize, _ name: String) {
+            let host = NSHostingView(rootView: view.frame(width: size.width, height: size.height))
+            host.frame = NSRect(origin: .zero, size: size)
+            let window = NSWindow(contentRect: host.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+            window.contentView = host
+            host.layoutSubtreeIfNeeded()
+            RunLoop.main.run(until: Date().addingTimeInterval(0.8))
+            guard let rep = host.bitmapImageRepForCachingDisplay(in: host.bounds) else { return }
+            host.cacheDisplay(in: host.bounds, to: rep)
+            try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: folder + "/" + name + ".png"))
+        }
+        showSettings = false
+        for engine in RecognitionEngine.allCases {
+            preferences.engine = engine
+            volcKeyPresent = true
+            if engine == .volc {
+                livePreview.set(apps.first?.name ?? "App", "接下来说一下用户访谈的情况，这周一共约到了")
+                hasLivePartial = true
+                cloudActivity = .live
+            } else {
+                livePreview.clear()
+                hasLivePartial = false
+            }
+            shot(ContentView(model: self), NSSize(width: 1220, height: 800), "main-\(engine.rawValue)")
+            shot(SettingsView(model: self), NSSize(width: 650, height: 690), "settings-\(engine.rawValue)")
+        }
+        NSApp.terminate(nil)
+    }
+
     private func write(_ path: String, extra: [String: Any]) {
         var object: [String: Any] = extra
-        object["lines"] = session.lines.map { ["text": $0.text, "source": $0.source, "start": $0.start.timeIntervalSince(session.created),
+        object["lines"] = session.lines.map { ["text": $0.text, "source": $0.source, "latency": $0.latency, "start": $0.start.timeIntervalSince(session.created),
                                                 "end": $0.end.timeIntervalSince(session.created)] }
         if let data = try? JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted]) {
             try? data.write(to: URL(fileURLWithPath: path))

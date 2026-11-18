@@ -23,7 +23,21 @@ enum RecognitionMode: String, Codable, CaseIterable, Identifiable {
     }
 }
 
+/// Where speech is turned into text. Doubao streams audio to Volcengine and returns
+/// text while the speaker is still talking; the local model keeps everything on
+/// this Mac and works offline.
+enum RecognitionEngine: String, Codable, CaseIterable, Identifiable {
+    case volc, local
+    var id: String { rawValue }
+    var label: String { self == .volc ? "豆包（云端）" : "本地模型" }
+}
+
 struct Preferences: Codable {
+    var engine = RecognitionEngine.volc
+    /// The hour-based plan of Doubao streaming ASR 2.0. The concurrency plan
+    /// (`volc.seedasr.sauc.concurrent`) needs its own quota; a handshake that
+    /// succeeds does not mean the resource is usable.
+    var volcResourceID = "volc.seedasr.sauc.duration"
     var python = "/Users/aurora/Desktop/workspace/asr-realtime-lab/.venv/bin/python"
     var asrModel = "mlx-community/Qwen3-ASR-1.7B-8bit"
     var language = ""
@@ -51,6 +65,8 @@ struct Preferences: Codable {
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         let d = Preferences()
+        engine = (try? c.decodeIfPresent(RecognitionEngine.self, forKey: .engine)) ?? d.engine
+        volcResourceID = try c.decodeIfPresent(String.self, forKey: .volcResourceID) ?? d.volcResourceID
         python = try c.decodeIfPresent(String.self, forKey: .python) ?? d.python
         asrModel = try c.decodeIfPresent(String.self, forKey: .asrModel) ?? d.asrModel
         language = try c.decodeIfPresent(String.self, forKey: .language) ?? d.language
@@ -65,6 +81,10 @@ struct Preferences: Codable {
         islandWidth = try c.decodeIfPresent(Double.self, forKey: .islandWidth) ?? d.islandWidth
     }
 
+    var hotwordList: [String] {
+        hotwords.split(whereSeparator: { $0 == "," || $0 == "，" || $0 == "\n" }).map(String.init)
+    }
+
     static func load() -> Preferences {
         guard let data = UserDefaults.standard.data(forKey: "preferences"),
               let value = try? JSONDecoder().decode(Preferences.self, from: data) else { return Preferences() }
@@ -74,6 +94,8 @@ struct Preferences: Codable {
 }
 
 enum SecretStore {
+    /// Keychain account of the Doubao speech recognition key.
+    static let volcAccount = "volcengine-asr"
     private static let service = "local.ListenFlow.llm"
     private static func query(_ account: String) -> [String: Any] {
         [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service,

@@ -85,7 +85,7 @@ struct ContentView: View {
         .preferredColorScheme(.light)
         .sheet(isPresented: $model.showSettings) { SettingsView(model: model) }
         .sheet(isPresented: $model.showHistory) { historySheet }
-        .task { if Bundle.main.bundleIdentifier != "local.ListenFlow.preview" && !model.modelReady && !model.modelLoading { model.loadModel() } }
+        .task { if Bundle.main.bundleIdentifier != "local.ListenFlow.preview" { model.prepareEngine() } }
     }
 
     private var sidebar: some View {
@@ -174,17 +174,25 @@ struct ContentView: View {
             Spacer(minLength: 8)
             VStack(alignment: .leading, spacing: 9) {
                 HStack(spacing: 7) {
-                    Circle().fill(model.modelReady ? teal : .orange)
+                    Circle().fill(model.engineReady ? teal : .orange)
                         .frame(width: 6, height: 6)
-                        .shadow(color: (model.modelReady ? teal : .orange).opacity(0.6), radius: 3)
-                    Text(model.modelStatus).font(.system(size: 11, weight: .medium))
+                        .shadow(color: (model.engineReady ? teal : .orange).opacity(0.6), radius: 3)
+                    Text(model.engineStatus).font(.system(size: 11, weight: .medium))
                 }
-                Text(model.preferences.asrModel.components(separatedBy: "/").last ?? "本地 ASR")
-                    .font(.system(size: 9.5, design: .monospaced)).foregroundStyle(muted).lineLimit(1)
-                Text(recognitionStatus).font(.system(size: 10)).foregroundStyle(muted).lineLimit(1)
-                    .help(model.preferences.recognitionMode.detail)
-                if !model.modelReady && !model.modelLoading {
-                    Button("重新加载模型") { model.loadModel() }.font(.system(size: 11))
+                if model.usesCloud {
+                    Text("Doubao Seed-ASR 2.0").font(.system(size: 9.5, design: .monospaced)).foregroundStyle(muted).lineLimit(1)
+                    Text("云端识别 · 音频发送到火山引擎").font(.system(size: 10)).foregroundStyle(muted).lineLimit(1)
+                    if !model.volcKeyPresent {
+                        Button("填写 API Key") { model.showSettings = true }.font(.system(size: 11))
+                    }
+                } else {
+                    Text(model.preferences.asrModel.components(separatedBy: "/").last ?? "本地 ASR")
+                        .font(.system(size: 9.5, design: .monospaced)).foregroundStyle(muted).lineLimit(1)
+                    Text(recognitionStatus).font(.system(size: 10)).foregroundStyle(muted).lineLimit(1)
+                        .help(model.preferences.recognitionMode.detail)
+                    if !model.modelReady && !model.modelLoading {
+                        Button("重新加载模型") { model.loadModel() }.font(.system(size: 11))
+                    }
                 }
                 Divider().padding(.vertical, 2)
                 sideButton("模型与 API 设置", icon: "slider.horizontal.3") { model.showSettings = true }
@@ -205,14 +213,15 @@ struct ContentView: View {
 
     /// Spoken guidance depends on what the session is actually listening to.
     private var emptyStateDetail: String {
+        let cloud = model.usesCloud
         if model.isRecording {
-            return model.activeSource == .microphone
-                ? "说话即可，转写会自动出现在这里。\n停顿时更新，连续讲话约每 4 秒更新一次。"
-                : "让所选 App 播放音频，转写会自动出现在这里。\n停顿时更新，连续讲话约每 4 秒更新一次。"
+            let pace = cloud ? "边说边出字，一句说完后定稿。" : "停顿时更新，连续讲话约每 4 秒更新一次。"
+            return (model.activeSource == .microphone ? "说话即可，转写会自动出现在这里。\n" : "让所选 App 播放音频，转写会自动出现在这里。\n") + pace
         }
+        let place = cloud ? "音频发送到火山引擎豆包识别；可在设置里换成本地模型。" : "音频在这台 Mac 上识别。"
         return model.source == .microphone
-            ? "选择左侧「我的麦克风」后点击「开始转写」。\n适合线下课堂与线下会议，音频在这台 Mac 上识别。"
-            : "在左侧选择一个正在播放声音的 App，再点击「开始转写」。\n音频在这台 Mac 上识别。"
+            ? "选择左侧「我的麦克风」后点击「开始转写」。\n适合线下课堂与线下会议，" + place
+            : "在左侧选择一个正在播放声音的 App，再点击「开始转写」。\n" + place
     }
 
     private var header: some View {
@@ -276,7 +285,7 @@ struct ContentView: View {
             Divider().padding(.horizontal, 26)
             if model.showOrganized {
                 organizedContent
-            } else if model.session.lines.isEmpty {
+            } else if model.session.lines.isEmpty && !model.hasLivePartial {
                 VStack(spacing: 16) {
                     Image(systemName: model.isRecording ? (model.activeSource == .microphone ? "mic.fill" : "waveform") : "waveform.path")
                         .font(.system(size: 42, weight: .ultraLight)).foregroundStyle(teal.opacity(0.7))
@@ -296,8 +305,13 @@ struct ContentView: View {
                                 if line.id == tailStart { LiveTailDivider() }
                                 TranscriptRow(line: line, sessionCreated: model.session.created)
                             }
-                            if model.pendingCount > 0 {
-                                HStack(spacing: 8) { ProgressView().controlSize(.mini); Text("正在识别 \(model.pendingCount) 段音频…").font(.system(size: 11)).foregroundStyle(muted) }
+                            LivePreviewRows(preview: model.livePreview) { proxy.scrollTo("bottom", anchor: .bottom) }
+                            if model.pendingCount > 0 && !model.hasLivePartial {
+                                HStack(spacing: 8) {
+                                    ProgressView().controlSize(.mini)
+                                    Text(model.usesCloud ? "正在等待最后一句…" : "正在识别 \(model.pendingCount) 段音频…")
+                                        .font(.system(size: 11)).foregroundStyle(muted)
+                                }
                             }
                             Color.clear.frame(height: 1).id("bottom")
                         }.padding(26)
@@ -455,10 +469,12 @@ struct ContentView: View {
 
     private var footer: some View {
         HStack(spacing: 14) {
-            Label("音频本地处理", systemImage: "lock.shield")
+            Label(model.usesCloud ? "云端识别 · 音频发送到火山引擎" : "音频本地处理",
+                  systemImage: model.usesCloud ? "cloud" : "lock.shield")
                 .font(.system(size: 10))
             if model.lastLatency > 0 {
-                Text(String(format: "最近片段延迟 %.1f 秒", model.lastLatency)).font(.system(size: 10)).monospacedDigit()
+                Text(String(format: model.usesCloud ? "最近一句定稿延迟 %.1f 秒" : "最近片段延迟 %.1f 秒", model.lastLatency))
+                    .font(.system(size: 10)).monospacedDigit()
             }
             if model.oldestPending > 10 {
                 Label("识别延迟较高，正在处理积压", systemImage: "exclamationmark.triangle")
@@ -502,6 +518,31 @@ private struct TranscriptRow: View {
             Text(line.text).font(.system(size: 15)).lineSpacing(6).textSelection(.enabled)
         }
         .id(line.id)
+    }
+}
+
+/// Sentences the cloud engine is still revising, shown dimmed under the settled
+/// lines. Observes its own object, so the several updates a second redraw only
+/// these rows.
+private struct LivePreviewRows: View {
+    @ObservedObject var preview: LivePreview
+    var onGrow: () -> Void
+    var body: some View {
+        ForEach(preview.items) { item in
+            VStack(alignment: .leading, spacing: 7) {
+                HStack(spacing: 7) {
+                    Text(item.source)
+                        .font(.system(size: 9.5, weight: .semibold))
+                        .foregroundStyle(item.source == "麦克风" ? Color.orange : teal)
+                        .padding(.horizontal, 6).padding(.vertical, 1.5)
+                        .background((item.source == "麦克风" ? Color.orange : teal).opacity(0.11), in: Capsule())
+                    Text("正在听…").font(.system(size: 9.5)).foregroundStyle(muted)
+                    Spacer()
+                }
+                Text(item.text).font(.system(size: 15)).lineSpacing(6).foregroundStyle(ink.opacity(0.5))
+            }
+        }
+        .onChange(of: preview.items.map(\.text.count).reduce(0, +)) { _, _ in onGrow() }
     }
 }
 
@@ -669,6 +710,8 @@ struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var draft = Preferences()
     @State private var key = ""
+    @State private var volcKey = ""
+    @State private var volcKeyLoaded = ""
     @State private var error: String?
     @State private var initialized = false
     var body: some View {
@@ -678,28 +721,48 @@ struct SettingsView: View {
                 VStack(alignment: .leading, spacing: 18) {
                     GroupBox {
                         VStack(alignment: .leading, spacing: 12) {
-                            Text("本地语音识别").font(.headline)
-                            Picker("模型", selection: $draft.asrModel) {
-                                Text("Qwen3-ASR 1.7B · 默认").tag("mlx-community/Qwen3-ASR-1.7B-8bit")
-                                Text("Qwen3-ASR 0.6B · 更轻量").tag("mlx-community/Qwen3-ASR-0.6B-8bit")
-                            }.disabled(model.isRecording || model.pendingCount > 0 || model.modelLoading)
-                            Picker("识别语言", selection: $draft.language) {
-                                Text("自动识别").tag("")
-                                Text("中文").tag("Chinese")
-                                Text("English").tag("English")
-                            }
-                            field("Python 路径", text: $draft.python)
-                                .disabled(model.isRecording || model.pendingCount > 0 || model.modelLoading)
-                            field("人名、术语（逗号分隔，可选）", text: $draft.hotwords)
-                            Picker("识别档位", selection: $draft.recognitionMode) {
-                                ForEach(RecognitionMode.allCases) { Text($0.label).tag($0) }
+                            Text("语音识别").font(.headline)
+                            Picker("识别引擎", selection: $draft.engine) {
+                                ForEach(RecognitionEngine.allCases) { Text($0.label).tag($0) }
                             }.pickerStyle(.segmented)
-                            Text(draft.recognitionMode.detail + "。高精度约多用一半算力，错字约再少两到三成。")
-                                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                            Toggle("暂存录音，用于事后「精修全文」", isOn: $draft.keepAudioForRefine)
-                            Text("音频只保存在这台 Mac，精修完成后删除，最长保留 7 天。关闭后不保存任何原始音频。")
-                                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                            Text("复用本机模型缓存，模型加载和转写均为离线运行。").font(.caption).foregroundStyle(.secondary)
+                                .disabled(model.isRecording || model.pendingCount > 0 || model.modelLoading)
+                            if draft.engine == .volc {
+                                Label("云端识别：转写时，音频会发送到火山引擎（豆包）。边说边出字，一句说完后由服务端再识别一遍定稿。",
+                                      systemImage: "cloud")
+                                    .font(.caption).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
+                                VStack(alignment: .leading, spacing: 5) {
+                                    Text("豆包语音 API Key").font(.system(size: 11)).foregroundStyle(.secondary)
+                                    SecureField("密钥存入 macOS 钥匙串", text: $volcKey).textFieldStyle(.roundedBorder)
+                                }
+                                field("资源 ID", text: $draft.volcResourceID, prompt: "volc.seedasr.sauc.duration")
+                                Text("小时版填 volc.seedasr.sauc.duration，按送入的音频时长计费；并发版填 volc.seedasr.sauc.concurrent，需要单独开通。只在有人说话时连接和发送音频，静音不计费。")
+                                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                                field("人名、术语（逗号分隔，可选）", text: $draft.hotwords)
+                                Text("识别档位、合并重识别和事后精修只用于本地模型；豆包自带二遍识别。没有网络时可以切换到本地模型。")
+                                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                            } else {
+                                Picker("模型", selection: $draft.asrModel) {
+                                    Text("Qwen3-ASR 1.7B · 默认").tag("mlx-community/Qwen3-ASR-1.7B-8bit")
+                                    Text("Qwen3-ASR 0.6B · 更轻量").tag("mlx-community/Qwen3-ASR-0.6B-8bit")
+                                }.disabled(model.isRecording || model.pendingCount > 0 || model.modelLoading)
+                                Picker("识别语言", selection: $draft.language) {
+                                    Text("自动识别").tag("")
+                                    Text("中文").tag("Chinese")
+                                    Text("English").tag("English")
+                                }
+                                field("Python 路径", text: $draft.python)
+                                    .disabled(model.isRecording || model.pendingCount > 0 || model.modelLoading)
+                                field("人名、术语（逗号分隔，可选）", text: $draft.hotwords)
+                                Picker("识别档位", selection: $draft.recognitionMode) {
+                                    ForEach(RecognitionMode.allCases) { Text($0.label).tag($0) }
+                                }.pickerStyle(.segmented)
+                                Text(draft.recognitionMode.detail + "。高精度约多用一半算力，错字约再少两到三成。")
+                                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                                Toggle("暂存录音，用于事后「精修全文」", isOn: $draft.keepAudioForRefine)
+                                Text("音频只保存在这台 Mac，精修完成后删除，最长保留 7 天。关闭后不保存任何原始音频。")
+                                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                                Text("复用本机模型缓存，模型加载和转写均为离线运行，音频不离开这台 Mac。").font(.caption).foregroundStyle(.secondary)
+                            }
                         }.padding(12)
                     }
                     GroupBox {
@@ -751,12 +814,17 @@ struct SettingsView: View {
                 Text("密钥不会出现在项目源码或导出记录里。").font(.caption).foregroundStyle(.secondary)
                 Spacer()
                 Button("保存设置") {
-                    do { try model.applyPreferences(draft, key: key); dismiss() }
+                    do { try model.applyPreferences(draft, key: key, volcKey: volcKey == volcKeyLoaded ? nil : volcKey); dismiss() }
                     catch { self.error = error.localizedDescription }
                 }.buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
             }
         }.padding(28).frame(width: 650, height: 690).tint(teal)
             .onAppear { draft = model.preferences; key = SecretStore.read(account: draft.apiBase)
+                // Preview builds never touch the Keychain.
+                if Bundle.main.bundleIdentifier != "local.ListenFlow.preview" {
+                    volcKeyLoaded = SecretStore.read(account: SecretStore.volcAccount)
+                    volcKey = volcKeyLoaded
+                }
                 DispatchQueue.main.async { initialized = true }
             }
     }

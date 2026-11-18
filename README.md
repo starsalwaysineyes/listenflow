@@ -6,12 +6,12 @@
 
 **把会议、网课和线下课堂的声音，在你自己的 Mac 上实时变成文字。**
 
-边听边问，会后一键整理成稿。语音不出本机。
+边听边问，会后一键整理成稿。默认用豆包云端流式识别，边说边出字；也可以切到本地模型，语音不出本机。
 
 [![macOS 15+](https://img.shields.io/badge/macOS-15%2B-000000?logo=apple&logoColor=white)](#安装)
 [![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-M1%20及以后-2f6f5e)](#安装)
 [![Swift](https://img.shields.io/badge/SwiftUI-原生-F05138?logo=swift&logoColor=white)](outputs/ListenFlow/Sources)
-[![ASR](https://img.shields.io/badge/识别-Qwen3--ASR%201.7B%20·%20本地-4b5bd6)](#它是怎么工作的)
+[![ASR](https://img.shields.io/badge/识别-豆包流式%20·%20可切本地%20Qwen3--ASR-4b5bd6)](#它是怎么工作的)
 [![Release](https://img.shields.io/github/v/release/starsalwaysineyes/listenflow?label=下载&color=2f6f5e)](https://github.com/starsalwaysineyes/listenflow/releases/latest)
 
 [下载](https://github.com/starsalwaysineyes/listenflow/releases/latest) · [详细手册](outputs/ListenFlow/README.md) · [实测记录](outputs/ListenFlow/TESTING.md)
@@ -38,8 +38,8 @@
 </td>
 <td width="50%" valign="top">
 
-### 🔒 识别完全在本机
-Qwen3-ASR 1.7B 通过 MLX 跑在 Apple Silicon 上，实时率约 0.05。音频不上传，只有你主动提问或整理时，才把**文字**发给你配置的 API。
+### ☁️ 云端出字快，本地不出本机
+默认用火山引擎豆包流式识别：说话不到 1 秒就出字，一句说完由服务端再识别一遍定稿。这时**音频会发送到火山引擎**。想让语音留在本机或没有网络时，在设置里切到本地 Qwen3-ASR 1.7B（MLX，Apple Silicon）。
 
 </td>
 </tr>
@@ -47,13 +47,13 @@ Qwen3-ASR 1.7B 通过 MLX 跑在 Apple Silicon 上，实时率约 0.05。音频�
 <td valign="top">
 
 ### ✂️ 在停顿处切，而不是硬切
-按滚动底噪判断讲话的间隙，只看 200 Hz 以上的能量，空调、风扇的低频嗡声不会让它误判。远场、低音量收音（笔记本放在教室后排）也能切得干净。
+本地模型按滚动底噪判断讲话的间隙，只看 200 Hz 以上的能量，空调、风扇的低频嗡声不会让它误判。豆包引擎由服务端断句，同一套判断只用来决定什么时候有人说话：静音不上传、不计费。
 
 </td>
 <td valign="top">
 
 ### 🔁 先出字，再变准
-高精度档先实时出短片段，再把约 20 秒的内容合起来重新识别、整行替换。用电池录完也没关系，会后点「精修全文」按 30 秒一段重识别整场。
+豆包引擎自带二遍识别：灰色预览先出，句子结束后换成定稿。本地模型的高精度档先实时出短片段，再把约 20 秒的内容合起来重新识别、整行替换。用电池录完也没关系，会后点「精修全文」按 30 秒一段重识别整场。
 
 </td>
 </tr>
@@ -89,9 +89,11 @@ Qwen3-ASR 1.7B 通过 MLX 跑在 Apple Silicon 上，实时率约 0.05。音频�
 flowchart LR
     A["指定 App 声音<br/>ScreenCaptureKit"] --> C
     B["麦克风<br/>AVAudioEngine"] --> C
-    C["16 kHz 单声道<br/>按停顿切段"] --> D["本地 Qwen3-ASR<br/>MLX · 常驻进程"]
-    D --> E["实时转写"]
-    E -->|"高精度档 / 事后精修"| F["合并 20–30 秒<br/>重新识别并替换"]
+    C["16 kHz 单声道"] -->|"默认：有人说话时<br/>流式上传"| V[("豆包流式识别<br/>火山引擎")]
+    V -->|"实时预览 + 定稿分句"| E["实时转写"]
+    C -->|"可选：按停顿切段"| D["本地 Qwen3-ASR<br/>MLX · 常驻进程"]
+    D --> E
+    E -->|"本地：高精度档 / 事后精修"| F["合并 20–30 秒<br/>重新识别并替换"]
     F --> E
     E --> G["灵动岛"]
     E --> H["上下文问答"]
@@ -102,7 +104,9 @@ flowchart LR
 
 ### 实测
 
-2224 字中文语音、带底噪，经真实 app 流程回放，统计错字数（越少越好）：
+豆包引擎（30 秒讲课式语音经真实 app 流程回放）：开始说话后约 0.8 秒出现第一段预览，句子结束后约 0.5 秒定稿；暂停时正在说的半句不丢；连接中途断开会自动重连并补发未定稿的音频。
+
+本地模型：2224 字中文语音、带底噪，经真实 app 流程回放，统计错字数（越少越好）：
 
 | 方案 | 有底噪 | 快语速、几乎无停顿 |
 | --- | ---: | ---: |
@@ -117,7 +121,7 @@ flowchart LR
 
 > 需要 Apple Silicon（M1 及以后）的 Mac，macOS 15 或更新。
 
-1. **准备识别环境**并下载模型（约 2 GB）：
+1. （只在要用本地模型时需要）**准备识别环境**并下载模型（约 2 GB）：
 
    ```sh
    python3.12 -m venv ~/listenflow-venv
@@ -132,7 +136,9 @@ flowchart LR
    xattr -dr com.apple.quarantine /Applications/ListenFlow.app
    ```
 
-4. 打开听流 →「模型与 API 设置」，把 Python 路径填成 `~/listenflow-venv/bin/python` 的完整路径，等左下角出现「本地模型已就绪」。
+4. 打开听流 →「模型与 API 设置」，选识别引擎：
+   - **豆包（云端，默认）**：填入火山引擎「豆包流式语音识别」的 API Key；资源 ID 默认是 2.0 小时版 `volc.seedasr.sauc.duration`，按送入的音频时长计费。
+   - **本地模型**：把 Python 路径填成 `~/listenflow-venv/bin/python` 的完整路径，等左下角出现「本地模型已就绪」。
 5. 第一次转写时按提示允许「屏幕与系统音频录制」和「麦克风」。
 6. 想用问答和整理稿，再填一个兼容 `chat/completions` 的 API（默认 DeepSeek）。只做转写可以不填。
 
@@ -157,7 +163,9 @@ flowchart LR
 
 ## 隐私
 
-- **音频**：只在本机识别。「暂存录音」开启时会在本机保存 16 kHz 音频用于精修（目录权限仅本人可读），精修完成后删除，最长保留 7 天。
+- **音频**：取决于识别引擎，界面左下角和底栏始终标明当前是哪一种。
+  - 豆包（默认）：有人说话时，音频实时发送到火山引擎识别；静音不发送。听流不在本机保存音频。
+  - 本地模型：只在本机识别，音频不离开这台 Mac。「暂存录音」开启时会在本机保存 16 kHz 音频用于精修（目录权限仅本人可读），精修完成后删除，最长保留 7 天。
 - **文字**：会话保存在 `~/Library/Application Support/ListenFlow/`；只有提问和整理时才发送给你配置的 API。
 - **密钥**：保存在 macOS 钥匙串，不写入任何文件。
 - **灵动岛**：不进入屏幕共享和截图。
@@ -181,7 +189,9 @@ outputs/ListenFlow/
 │   ├── CaptureEngine.swift     指定 App 音频 + 麦克风采集，转 16 kHz 单声道
 │   ├── AudioChunker.swift      滚动底噪 + 200 Hz 高通，在停顿处切段
 │   ├── Recognition.swift       识别档位、音频暂存、精修窗口与替换
-│   ├── ASRBridge.swift         与 Python 识别进程的 JSON lines 管道
+│   ├── VolcProtocol.swift      豆包流式识别的帧编解码、分句去重、补发缓存、说话检测
+│   ├── VolcStream.swift        每个音频来源一条豆包连接：流式上传、重连、收尾
+│   ├── ASRBridge.swift         与本地 Python 识别进程的 JSON lines 管道
 │   ├── NotchIsland.swift       刘海灵动岛
 │   ├── LLMClient.swift         上下文快照、流式问答
 │   ├── MarkdownDocument.swift  回答的 Markdown 解析与渲染
@@ -201,10 +211,12 @@ work/asr-lab/                   切分与精修方案的对比实验脚本
 - 区分「App」和「麦克风」两路来源，不区分会议里的不同讲话人。
 - 远场收音时讲话只比底噪高约 10 dB，错字仍多于近距离收音；麦克风靠近说话人最有效。
 - 准确率数据来自合成语音加底噪；多人插话、背景音乐、口音等情况还需要更多实测。
+- 豆包引擎需要网络和可用的账户额度；连续几小时的真实课堂、两路同时长时间识别还没有实测。
 - 目前只在 16 寸 M1 Max MacBook Pro 上实测过。
 
 ## 致谢
 
+- [豆包流式语音识别](https://www.volcengine.com/docs/6561/1354869)（火山引擎）：默认的云端识别
 - [Qwen3-ASR](https://huggingface.co/Qwen) 与 [mlx-audio](https://github.com/Blaizzy/mlx-audio)：本地语音识别
 - [Notchly](https://github.com/lglglglglg/Notchly)：刘海灵动岛的交互灵感
 - [DeepSeek](https://api-docs.deepseek.com/)：默认的问答与整理接口

@@ -11,6 +11,11 @@ enum CaptureFailure: LocalizedError {
 /// App audio and microphone have separate lifetimes and separate chunkers.
 final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
     var onChunk: ((AudioChunk) -> Void)?
+    /// Set for streaming recognition: converted audio is handed over as it arrives
+    /// (source name, 16 kHz mono samples, capture time) and no chunker runs.
+    /// Called on the capture queue.
+    var onAudio: ((String, [Float], Date) -> Void)?
+    private var appSourceName = "App"
     var onLevel: ((String, Float) -> Void)?
     var onError: ((String) -> Void)?
     private let queue = DispatchQueue(label: "ListenFlow.capture", qos: .userInitiated)
@@ -53,7 +58,8 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         // No screen/video output is attached or persisted.
         try newStream.addStreamOutput(self, type: .audio, sampleHandlerQueue: queue)
         queue.sync {
-            appChunker = AudioChunker(source: name) { [weak self] in self?.onChunk?($0) }
+            appSourceName = name
+            appChunker = onAudio == nil ? AudioChunker(source: name) { [weak self] in self?.onChunk?($0) } : nil
             appConverter = nil
             acceptingApp = true
             startIdleFlushTimer()
@@ -122,7 +128,7 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
             throw CaptureFailure.message("没有可用的麦克风输入设备。")
         }
         queue.sync {
-            micChunker = AudioChunker(source: "麦克风") { [weak self] in self?.onChunk?($0) }
+            micChunker = onAudio == nil ? AudioChunker(source: "麦克风") { [weak self] in self?.onChunk?($0) } : nil
             micConverter = nil
             acceptingMic = true
         }
@@ -211,6 +217,7 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
             onLevel?(source, min(1, rms * 8))
             lastLevels[source] = date
         }
-        (microphone ? micChunker : appChunker)?.append(samples, end: date)
+        if let onAudio { onAudio(microphone ? "麦克风" : appSourceName, samples, date) }
+        else { (microphone ? micChunker : appChunker)?.append(samples, end: date) }
     }
 }

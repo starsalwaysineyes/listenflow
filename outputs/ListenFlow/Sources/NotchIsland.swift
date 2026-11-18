@@ -123,7 +123,7 @@ final class NotchIslandController {
         let mode: IslandState.Mode
         if preview == "expanded" || model.islandPinned || hoverExpanded {
             mode = .expanded
-        } else if preview == "compact" || (model.preferences.islandShowLatest && active && !model.session.lines.isEmpty) {
+        } else if preview == "compact" || (model.preferences.islandShowLatest && active && (!model.session.lines.isEmpty || model.hasLivePartial)) {
             mode = .compact
         } else {
             mode = .hidden
@@ -313,7 +313,7 @@ struct NotchIslandView: View {
                 // Eager on purpose: 40 rows are cheap, and a lazy stack measured late
                 // left the newest line below the fold when the island opened.
                 VStack(alignment: .leading, spacing: 12) {
-                    if lines.isEmpty {
+                    if lines.isEmpty && !model.hasLivePartial {
                         Text(model.isRecording ? "正在听，第一句识别出来后会显示在这里。" : "开始转写后，最近的内容会显示在这里。")
                             .font(.system(size: 13)).foregroundStyle(.white.opacity(0.5))
                             .frame(maxWidth: .infinity).padding(.top, 40)
@@ -324,7 +324,8 @@ struct NotchIslandView: View {
                         }
                         row(line, distance: lines.count - 1 - index, tags: tags)
                     }
-                    if model.pendingCount > 0 {
+                    IslandPreviewRows(preview: model.livePreview, tags: tags) { proxy.scrollTo("end", anchor: .bottom) }
+                    if model.pendingCount > 0 && !model.hasLivePartial {
                         HStack(spacing: 7) {
                             ProgressView().controlSize(.mini)
                             Text("正在识别…").font(.system(size: 11)).foregroundStyle(.white.opacity(0.45))
@@ -378,14 +379,45 @@ struct NotchIslandView: View {
     private var compact: some View {
         VStack(spacing: 0) {
             Color.clear.frame(height: state.notch.height)
-            if let line = model.session.lines.last {
-                HStack(spacing: 8) {
-                    if showSources { SourceTag(source: line.source) }
-                    Text(line.text).font(.system(size: 12.5)).foregroundStyle(.white.opacity(0.92))
-                        .lineLimit(1).truncationMode(.head)
-                }
-                .padding(.horizontal, 18).frame(height: 30)
+            IslandCompactLine(preview: model.livePreview, last: model.session.lines.last, tags: showSources)
+        }
+    }
+}
+
+/// What is being said right now (cloud engine), dimmer than settled lines.
+private struct IslandPreviewRows: View {
+    @ObservedObject var preview: LivePreview
+    let tags: Bool
+    var onGrow: () -> Void
+    var body: some View {
+        ForEach(preview.items) { item in
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("···").font(.system(size: 10, design: .monospaced)).foregroundStyle(.white.opacity(0.38))
+                    if tags { SourceTag(source: item.source) }
+                }.frame(width: 52, alignment: .leading)
+                Text(item.text).font(.system(size: 14)).foregroundStyle(.white.opacity(0.6)).lineSpacing(4)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
+        }
+        .onChange(of: preview.items.map(\.text.count).reduce(0, +)) { _, _ in onGrow() }
+    }
+}
+
+/// The always-on strip: the sentence in progress if there is one, else the newest line.
+private struct IslandCompactLine: View {
+    @ObservedObject var preview: LivePreview
+    let last: TranscriptLine?
+    let tags: Bool
+    var body: some View {
+        let live = preview.items.last
+        if let text = live?.text ?? last?.text, let source = live?.source ?? last?.source {
+            HStack(spacing: 8) {
+                if tags { SourceTag(source: source) }
+                Text(text).font(.system(size: 12.5)).foregroundStyle(.white.opacity(live == nil ? 0.92 : 0.7))
+                    .lineLimit(1).truncationMode(.head)
+            }
+            .padding(.horizontal, 18).frame(height: 30)
         }
     }
 }

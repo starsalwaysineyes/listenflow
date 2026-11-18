@@ -232,8 +232,136 @@ enum CaptureFailure: LocalizedError {
         let refinedRound = try JSONDecoder().decode(MeetingSession.self, from: JSONEncoder().encode(refinedSession))
         precondition(refinedRound.refinedAt != nil)
 
+        // --- Doubao streaming protocol ---
+        // Real gzip, not raw deflate: magic bytes, and a round trip through the bounded inflater.
+        let sample = Data((0..<5000).map { UInt8(truncatingIfNeeded: $0 &* 7) })
+        let zipped = Gzip.compress(sample)!
+        precondition(zipped.prefix(2) == Data([0x1f, 0x8b]), "gzip header")
+        precondition(Gzip.decompress(zipped) == sample && Gzip.decompress(Data()) == Data())
+        precondition(Gzip.decompress(zipped.prefix(zipped.count / 2)) == nil, "Truncated input is refused")
+        precondition(Gzip.decompress(Gzip.compress(Data(count: 4096))!, limit: 1024) == nil, "Output is bounded")
+
+        // Requests: 4-byte header, big-endian length, gzip payload.
+        let audioFrame = VolcFrame.audio(sample, last: false)!, lastFrame = VolcFrame.audio(Data(), last: true)!
+        precondition([UInt8](audioFrame.prefix(4)) == [0x11, 0x20, 0x01, 0x00] && [UInt8](lastFrame.prefix(4)) == [0x11, 0x22, 0x01, 0x00])
+        let declared = audioFrame[4..<8].reduce(0) { $0 << 8 | Int($1) }
+        precondition(declared == audioFrame.count - 8 && Gzip.decompress(audioFrame.dropFirst(8)) == sample)
+        let config = VolcFrame.configuration(uid: "u", hotwords: ["梯度下降", " ", "损失函数"])
+        precondition([UInt8](VolcFrame.fullRequest(config)!.prefix(4)) == [0x11, 0x10, 0x11, 0x00])
+        let configObject = try JSONSerialization.jsonObject(with: config) as! [String: Any]
+        let configRequest = configObject["request"] as! [String: Any]
+        precondition(configRequest["enable_nonstream"] as? Bool == true && configRequest["show_utterances"] as? Bool == true
+                     && configRequest["end_window_size"] as? Int == 1000 && configRequest["result_type"] as? String == "single")
+        let corpus = (configRequest["corpus"] as! [String: Any])["context"] as! String
+        precondition(corpus.contains("梯度下降") && corpus.contains("损失函数") && !corpus.contains("\" \""), "Hot words, blanks dropped")
+        precondition((VolcFrame.configuration(uid: "u", hotwords: []).count) > 0
+                     && !String(decoding: VolcFrame.configuration(uid: "u", hotwords: []), as: UTF8.self).contains("corpus"))
+        let longWords = (0..<60).map { "术语编号\($0)" }
+        let capped = String(decoding: VolcFrame.configuration(uid: "u", hotwords: longWords), as: UTF8.self)
+        precondition(capped.contains("术语编号0") && !capped.contains("术语编号59"), "Hot words stay within the service's budget")
+        precondition(VolcFrame.pcm([0, 1, -1, 2, 0.5]) == Data([0, 0, 0xff, 0x7f, 0x01, 0x80, 0xff, 0x7f, 0xff, 0x3f]), "Float to 16-bit LE, clamped")
+
+        // Responses, as the service sends them.
+        func response(_ header: [UInt8], sequence: Int32? = nil, code: UInt32? = nil, _ json: String, gzip: Bool = true) -> Data {
+            var out = Data(header)
+            if let sequence { withUnsafeBytes(of: sequence.bigEndian) { out.append(contentsOf: $0) } }
+            if let code { withUnsafeBytes(of: code.bigEndian) { out.append(contentsOf: $0) } }
+            let body = gzip ? Gzip.compress(Data(json.utf8))! : Data(json.utf8)
+            withUnsafeBytes(of: UInt32(body.count).bigEndian) { out.append(contentsOf: $0) }
+            return out + body
+        }
+        let resultJSON = #"{"audio_info":{"duration":8002},"result":{"text":"上一节","utterances":[{"definite":true,"start_time":0,"end_time":6892,"text":"今天继续讨论梯度下降方法。"},{"definite":false,"start_time":7312,"end_time":8002,"text":"上一节","words":[{"text":"上"}]}]}}"#
+        let middle = try VolcFrame.parse(response([0x11, 0x91, 0x11, 0x00], sequence: 14, resultJSON))
+        precondition(middle.messageType == 9 && middle.sequence == 14 && !middle.isLast && !middle.isError)
+        let parsed = VolcFrame.utterances(in: middle.payload)!
+        precondition(parsed.text == "上一节" && parsed.utterances == [
+            VolcUtterance(text: "今天继续讨论梯度下降方法。", definite: true, startMS: 0, endMS: 6892),
+            VolcUtterance(text: "上一节", definite: false, startMS: 7312, endMS: 8002)])
+        let lastSequenced = try VolcFrame.parse(response([0x11, 0x93, 0x11, 0x00], sequence: -15, resultJSON))
+        let lastPlain = try VolcFrame.parse(response([0x11, 0x92, 0x11, 0x00], resultJSON))
+        precondition(lastSequenced.isLast && lastSequenced.sequence == -15, "Flag bit 1 and negative sequence")
+        precondition(lastPlain.isLast && lastPlain.sequence == nil, "Last without a sequence")
+        let first = try VolcFrame.parse(response([0x11, 0x90, 0x10, 0x00], #"{"result":{"text":""}}"#, gzip: false))
+        precondition(first.sequence == nil && VolcFrame.utterances(in: first.payload)?.utterances.isEmpty == true, "Uncompressed, no sequence")
+        let failure = try VolcFrame.parse(response([0x11, 0xf0, 0x10, 0x00], code: 45000292, #"{"error":"quota exceeded for types: concurrency"}"#, gzip: false))
+        precondition(failure.isError && failure.errorCode == 45000292 && VolcFrame.errorMessage(failure.payload) == "quota exceeded for types: concurrency")
+        precondition(VolcFrame.errorMessage(Data("plain text reason".utf8)) == "plain text reason")
+        precondition(VolcFrame.errorMessage(Data(#"{"error":"[resource_id=x] requested resource not granted"}"#.utf8)).contains("not granted"), "Handshake refusal body")
+        for bad in [Data([0x11, 0x90]), Data([0x11, 0x91, 0x11, 0x00, 0, 0]), Data([0x11, 0x90, 0x11, 0x00, 0, 0, 0, 9, 1, 2])] {
+            precondition((try? VolcFrame.parse(bad)) == nil, "Malformed frames throw instead of crashing")
+        }
+
+        // A settled sentence becomes one line exactly once, however often it is resent.
+        func u(_ text: String, _ definite: Bool, _ start: Int, _ end: Int) -> VolcUtterance {
+            VolcUtterance(text: text, definite: definite, startMS: start, endMS: end)
+        }
+        var tracker = VolcUtteranceTracker()
+        var step = tracker.update([u("各位同学", false, 0, 2600)], final: false)
+        precondition(step.finished.isEmpty && step.partial == "各位同学" && step.partialStartMS == 0)
+        step = tracker.update([u("各位同学，今天继续。", true, 0, 6892)], final: false)
+        precondition(step.finished.map(\.text) == ["各位同学，今天继续。"] && step.partial.isEmpty)
+        step = tracker.update([u("各位同学，今天继续。", true, 0, 6892), u("上一节", false, 7312, 8800)], final: false)
+        precondition(step.finished.isEmpty && step.partial == "上一节" && step.partialStartMS == 7312, "Resent sentence is not repeated")
+        step = tracker.update([u("各位同学，今天继续。", true, 0, 6892), u("上一节课讲到损失函数。", true, 7312, 22011), u("很多", false, 22011, 22602)], final: false)
+        precondition(step.finished.map(\.text) == ["上一节课讲到损失函数。"] && step.partial == "很多")
+        step = tracker.update([u("很多同学课后问我", false, 22011, 24000)], final: true)
+        precondition(step.finished.map(\.text) == ["很多同学课后问我"] && step.partial.isEmpty, "The last result settles what is open")
+        precondition(tracker.update([u("很多同学课后问我", true, 22011, 24922)], final: true).finished.isEmpty, "…and only once")
+        var blank = VolcUtteranceTracker()
+        precondition(blank.update([u("  ", true, 0, 500)], final: false).finished.isEmpty, "Blank sentences make no line")
+        var untimed = VolcUtteranceTracker()
+        precondition(untimed.update([u("好的。", true, 0, 0)], final: false).finished.count == 1
+                     && untimed.update([u("好的。", true, 0, 0)], final: false).finished.isEmpty, "Without timestamps, text identifies the sentence")
+
+        // Unsettled audio is kept for a resend, in the service's packet size, on the capture clock.
+        var backlog = VolcBacklog(start: start)
+        backlog.append(Data(count: 32000 * 3 + 100))                    // 3 s and a bit
+        var packets = 0
+        while backlog.nextPacket(flush: false) != nil { packets += 1 }
+        precondition(packets == 15 && backlog.unsent == 100, "200 ms packets; a short tail waits")
+        precondition(backlog.date(ms: 1500) == start.addingTimeInterval(1.5))
+        backlog.settle(throughMS: 2000)
+        precondition(backlog.start == start.addingTimeInterval(2) && backlog.pcm.count == 32100 && backlog.unsent == 100)
+        precondition(backlog.date(ms: 2500) == start.addingTimeInterval(2.5), "Timestamps still count from the connection's first audio")
+        backlog.settle(throughMS: 60_000)
+        precondition(backlog.pcm.count == 100 && backlog.unsent == 100, "Never drops audio that was not sent")
+        backlog.append(Data(count: 6400))
+        backlog.restart()                                                // connection replaced
+        precondition(backlog.unsent == 6500 && backlog.date(ms: 100) == start.addingTimeInterval(3.1), "Resend starts at the first retained sample")
+        precondition(backlog.nextPacket(flush: true)?.count == 6400 && backlog.nextPacket(flush: true)?.count == 100 && backlog.nextPacket(flush: true) == nil)
+        var music = VolcBacklog(start: start)
+        music.append(Data(count: 32000 * 100))
+        while music.nextPacket(flush: false) != nil {}
+        music.trimSent(keeping: 45)
+        precondition(music.pcm.count == 32000 * 45 && music.start == start.addingTimeInterval(55) && music.date(ms: 60_000) == start.addingTimeInterval(60),
+                     "Audio with no sentence coming back does not pile up")
+
+        // Silence is not streamed: a connection opens on speech, not on a click or a hum.
+        var gate = SpeechGate()
+        precondition(gate.process([Float](repeating: 0, count: 16000)) == (false, false))
+        precondition(gate.process(tone(160, 0.3)).onset == false, "10 ms is not speech")
+        var hum = SpeechGate()
+        let rumble = (0..<16000).map { 0.2 * sin(2 * Float.pi * 60 * Float($0) / 16000) }
+        _ = hum.process(rumble)
+        precondition(hum.process(rumble).onset == false, "Low-frequency room noise does not open a connection")
+        var speaking = SpeechGate()
+        _ = speaking.process([Float](repeating: 0.0005, count: 16000))
+        let heard = speaking.process(tone(3200))
+        precondition(heard.any && heard.onset, "200 ms of voice does")
+        _ = speaking.process([Float](repeating: 0.0005, count: 1600))        // the filter rings briefly after speech
+        precondition(speaking.process([Float](repeating: 0.0005, count: 8000)) == (false, false), "Quiet again once speech stops")
+
+        // Settings saved before the engine existed take the new default; a saved choice survives.
+        precondition(prefs.engine == .volc && prefs.volcResourceID == "volc.seedasr.sauc.duration")
+        var localPrefs = Preferences(); localPrefs.engine = .local; localPrefs.volcResourceID = "volc.seedasr.sauc.concurrent"
+        let localRound = try JSONDecoder().decode(Preferences.self, from: JSONEncoder().encode(localPrefs))
+        precondition(localRound.engine == .local && localRound.volcResourceID == "volc.seedasr.sauc.concurrent")
+        var listed = Preferences(); listed.hotwords = "小林，梯度下降,损失函数\n听流"
+        precondition(listed.hotwordList == ["小林", "梯度下降", "损失函数", "听流"])
+
         print("PASS: silence, bounded chunks, lossless boundaries, endpointing, independent sources, discard, API URLs, context snapshots, session round-trip")
         print("PASS: old-session compatibility, organized draft persistence/export, late-arrival coverage, lossless cleanup batching, raw-only cleanup context")
+        print("PASS: Doubao frames (gzip, headers, errors, malformed input), sentence de-duplication, resend backlog, speech gate, engine settings")
         print("PASS: pause-aware chunking under noise, forced-cut flags, settings migration, refinement windows/guards/merge, echo filter, private audio store round trip")
         if CommandLine.arguments.contains("--organize-live") {
             let key = String(data: FileHandle.standardInput.readDataToEndOfFile(), encoding: .utf8)!.trimmingCharacters(in: .whitespacesAndNewlines)
