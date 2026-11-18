@@ -1,50 +1,67 @@
 import SwiftUI
 import AppKit
 
-private let ink = Color(red: 0.12, green: 0.17, blue: 0.22)
-private let teal = Color(red: 0.05, green: 0.48, blue: 0.43)
-private let paper = Color(red: 0.965, green: 0.967, blue: 0.955)
-private let muted = Color(red: 0.47, green: 0.51, blue: 0.53)
-
-/// Shared visual tokens. Centralising these keeps the surfaces consistent and makes
-/// the palette adjustable in one place rather than scattered across modifier chains.
-private enum Look {
-    static let sidebar = Color(red: 0.960, green: 0.963, blue: 0.953)
-    static let card = Color.white
-    static let canvas = Color(red: 0.988, green: 0.989, blue: 0.984)
-    static let hairline = Color.black.opacity(0.075)
-    static let accentSoft = teal.opacity(0.10)
-
-    static let radiusCard: CGFloat = 12
-    static let radiusRow: CGFloat = 10
-    static let radiusControl: CGFloat = 8
-
-    /// A restrained card: hairline border plus a very soft shadow, so surfaces read
-    /// as layered without the heavy drop shadows that look dated on macOS.
-    static func cardStyle(_ radius: CGFloat = radiusCard) -> some ViewModifier { CardSurface(radius: radius) }
-}
-
-private struct CardSurface: ViewModifier {
-    let radius: CGFloat
-    func body(content: Content) -> some View {
-        content
-            .background(Look.card, in: RoundedRectangle(cornerRadius: radius, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: radius, style: .continuous).strokeBorder(Look.hairline, lineWidth: 1))
-            .shadow(color: .black.opacity(0.045), radius: 5, y: 2)
+/// Colours that follow the system appearance. Two of them carry meaning: what
+/// the Mac plays and what the microphone hears are told apart by colour
+/// everywhere — the bar beside a paragraph, a level meter, a label.
+enum Palette {
+    private static func rgb(_ hex: UInt32) -> NSColor {
+        NSColor(srgbRed: CGFloat((hex >> 16) & 0xFF) / 255, green: CGFloat((hex >> 8) & 0xFF) / 255,
+                blue: CGFloat(hex & 0xFF) / 255, alpha: 1)
     }
+    private static func dynamic(_ light: UInt32, _ dark: UInt32) -> Color {
+        Color(nsColor: NSColor(name: nil) { $0.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua ? rgb(dark) : rgb(light) })
+    }
+    static let page = dynamic(0xFFFFFF, 0x1E1F21)
+    static let rail = dynamic(0xF1F2F0, 0x161718)
+    static let ink = Color(nsColor: .labelColor)
+    static let muted = Color(nsColor: .secondaryLabelColor)
+    static let faint = Color(nsColor: .tertiaryLabelColor)
+    static let hairline = Color(nsColor: .separatorColor)
+    /// What the Mac plays.
+    static let stream = dynamic(0x0B7468, 0x5FD0BF)
+    /// What the microphone hears: the user's own side.
+    static let voice = dynamic(0xAD5710, 0xF0A75E)
+    static let live = dynamic(0xD2362F, 0xFF6B62)
+    static let warning = dynamic(0xB36200, 0xF5B14C)
+    static func source(_ name: String) -> Color { name == EchoFilter.micSource ? voice : stream }
 }
 
-private extension View {
-    func surfaceCard(_ radius: CGFloat = Look.radiusCard) -> some View { modifier(CardSurface(radius: radius)) }
+private enum Format {
+    static let zh = Locale(identifier: "zh_CN")
+    private static func formatter(_ pattern: String) -> DateFormatter {
+        let formatter = DateFormatter()
+        formatter.locale = zh
+        formatter.dateFormat = pattern
+        return formatter
+    }
+    private static let dayFormat = formatter("M月d日 EEE")
+    private static let timeFormat = formatter("HH:mm")
+
+    static func day(_ date: Date, now: Date = Date()) -> String {
+        let calendar = Calendar.current
+        if calendar.isDate(date, inSameDayAs: now) { return "今天" }
+        if let yesterday = calendar.date(byAdding: .day, value: -1, to: now), calendar.isDate(date, inSameDayAs: yesterday) { return "昨天" }
+        return dayFormat.string(from: date)
+    }
+    static func time(_ date: Date) -> String { timeFormat.string(from: date) }
+    static func length(_ seconds: TimeInterval) -> String {
+        let minutes = Int((seconds / 60).rounded())
+        if seconds < 45 { return "不到 1 分钟" }
+        if minutes < 60 { return "\(max(minutes, 1)) 分钟" }
+        return minutes % 60 == 0 ? "\(minutes / 60) 小时" : "\(minutes / 60) 小时 \(minutes % 60) 分钟"
+    }
+    /// Titles are "<what was recorded> · <date>"; the list already shows the date.
+    static func name(_ title: String) -> String { title.components(separatedBy: " · ").first ?? title }
 }
 
-/// A slow breathing pulse on the recording dot. Kept as its own modifier so it
+/// A slow breathing pulse on the recording dot. Its own modifier, so it
 /// animates without invalidating any sibling view.
 private struct Pulse: ViewModifier {
     @State private var on = false
     func body(content: Content) -> some View {
         content
-            .opacity(on ? 0.45 : 1)
+            .opacity(on ? 0.4 : 1)
             .animation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true), value: on)
             .onAppear { on = true }
     }
@@ -54,800 +71,578 @@ struct ContentView: View {
     @ObservedObject var model: AppModel
     var body: some View {
         HStack(spacing: 0) {
-            sidebar.frame(width: 242)
-            Divider()
+            SessionRail(model: model).frame(width: 236)
+            Rectangle().fill(Palette.hairline).frame(width: 1)
             VStack(spacing: 0) {
-                header
-                if let error = model.error {
-                    HStack(alignment: .top, spacing: 9) {
-                        Image(systemName: "exclamationmark.circle.fill").foregroundStyle(.orange)
-                        Text(error).font(.system(size: 12)).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
-                        Button { model.error = nil } label: { Image(systemName: "xmark") }.buttonStyle(.plain)
-                    }.padding(12).background(Color.orange.opacity(0.09))
-                }
-                if let notice = model.notice {
-                    HStack(alignment: .top, spacing: 9) {
-                        Image(systemName: "checkmark.circle.fill").foregroundStyle(teal)
-                        Text(notice).font(.system(size: 12)).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
-                        Button { model.notice = nil } label: { Image(systemName: "xmark") }.buttonStyle(.plain)
-                    }.padding(12).background(teal.opacity(0.07))
-                }
-                HSplitView {
-                    transcript.frame(minWidth: 310)
-                    askPanel.frame(minWidth: 300, idealWidth: 380)
-                }
-                footer
-            }.background(Color.white)
+                Transport(model: model)
+                banners
+                viewBar
+                Rectangle().fill(Palette.hairline).frame(height: 1)
+                if model.showOrganized { DraftPage(model: model) } else { TranscriptPage(model: model) }
+                StatusBar(model: model)
+            }.background(Palette.page)
         }
-        .foregroundStyle(ink)
-        .tint(teal)
-        .frame(minWidth: 1020, minHeight: 650)
-        .preferredColorScheme(.light)
+        .foregroundStyle(Palette.ink)
+        .tint(Palette.stream)
+        .frame(minWidth: 780, minHeight: 520)
         .sheet(isPresented: $model.showSettings) { SettingsView(model: model) }
-        .sheet(isPresented: $model.showHistory) { historySheet }
-        .task { if Bundle.main.bundleIdentifier != "local.ListenFlow.preview" { model.prepareEngine() } }
-    }
-
-    private var sidebar: some View {
-        VStack(alignment: .leading, spacing: 22) {
-            // The app mark reuses the icon's mark-and-ripple idea at a small size.
-            HStack(spacing: 11) {
-                Image(systemName: "waveform")
-                    .font(.system(size: 19, weight: .semibold)).foregroundStyle(.white)
-                    .frame(width: 38, height: 38)
-                    .background(
-                        LinearGradient(colors: [teal, Color(red: 0.06, green: 0.36, blue: 0.52)],
-                                       startPoint: .topLeading, endPoint: .bottomTrailing),
-                        in: RoundedRectangle(cornerRadius: 11, style: .continuous))
-                    .shadow(color: teal.opacity(0.28), radius: 6, y: 2)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("听流").font(.system(size: 21, weight: .semibold))
-                    Text("LISTENFLOW").font(.system(size: 8.5, weight: .medium, design: .monospaced))
-                        .tracking(2.2).foregroundStyle(muted)
-                }
-            }.padding(.top, 10)
-
-            VStack(alignment: .leading, spacing: 11) {
-                sectionLabel("音频来源")
-                Picker("音频来源", selection: $model.source) {
-                    ForEach(AudioSource.allCases) { source in
-                        Text(source.shortLabel).tag(source)
-                    }
-                }.labelsHidden().pickerStyle(.segmented).frame(maxWidth: .infinity)
-                    .disabled(model.isRecording || model.isBusy)
-                Text(model.source.detail).font(.system(size: 11)).foregroundStyle(muted)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .lineSpacing(2)
-
-                if model.source == .app {
-                    HStack {
-                        Text("指定 App").font(.system(size: 12, weight: .medium)).foregroundStyle(muted)
-                        Spacer()
-                        Button { model.refreshApps() } label: { Image(systemName: "arrow.clockwise") }
-                            .buttonStyle(.plain).foregroundStyle(muted).help("刷新正在运行的 App")
-                            .disabled(model.isRecording || model.isBusy)
-                    }.padding(.top, 3)
-                    Picker("指定 App", selection: $model.selectedPID) {
-                        if model.apps.isEmpty { Text("先打开一个 App").tag(pid_t(0)) }
-                        ForEach(model.apps) { Text($0.name).tag($0.id) }
-                    }.labelsHidden().pickerStyle(.menu).frame(maxWidth: .infinity)
-                        .disabled(model.isRecording || model.isBusy)
-                }
-
-                AudioLevelMeter(levels: model.levels, microphone: model.source == .microphone)
-            }
-            .padding(14)
-            .surfaceCard()
-
-            if model.source != .microphone, model.isRecording {
-                // With speakers, the microphone re-records the app's own sound; those
-                // repeated lines are dropped (EchoFilter), so the switch is safe to use.
-                VStack(alignment: .leading, spacing: 10) {
-                    HStack {
-                        Image(systemName: model.micEnabled ? "mic.fill" : "mic.slash.fill")
-                            .foregroundStyle(model.micEnabled ? teal : muted)
-                        Text("同时录麦克风").font(.system(size: 12, weight: .medium))
-                        Spacer()
-                        Toggle("同时录麦克风", isOn: Binding(get: { model.micEnabled }, set: { value in
-                            Task { await model.toggleMic(value) }
-                        })).labelsHidden().toggleStyle(.switch).controlSize(.small)
-                            .disabled(model.isBusy || model.micBusy)
-                    }
-                    AudioLevelMeter(levels: model.levels, microphone: true)
-                    if model.micEnabled {
-                        Text(model.echoDropped > 0 ? "外放录到的 App 声音会自动去掉，本次已去掉 \(model.echoDropped) 句"
-                                                   : "外放录到的 App 声音会自动去掉，你自己的话照常保留")
-                            .font(.system(size: 10)).foregroundStyle(muted)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                }.padding(14).surfaceCard()
-            }
-
-            VStack(alignment: .leading, spacing: 6) {
-                sectionLabel("会话").padding(.bottom, 2)
-                sideButton("新建会话", icon: "plus.square") { model.newSession() }.disabled(!model.canChangeSession)
-                sideButton("历史记录", icon: "clock.arrow.circlepath") { model.showHistory = true }.disabled(!model.canChangeSession)
-                sideButton("导出转写与问答", icon: "square.and.arrow.up") { model.export() }
-                    .disabled(model.session.lines.isEmpty && model.session.chat.isEmpty && model.session.imageLibrary.isEmpty)
-            }
-
-            Spacer(minLength: 8)
-            VStack(alignment: .leading, spacing: 9) {
-                HStack(spacing: 7) {
-                    Circle().fill(model.engineReady ? teal : .orange)
-                        .frame(width: 6, height: 6)
-                        .shadow(color: (model.engineReady ? teal : .orange).opacity(0.6), radius: 3)
-                    Text(model.engineStatus).font(.system(size: 11, weight: .medium))
-                }
-                if model.usesCloud {
-                    Text("Doubao Seed-ASR 2.0").font(.system(size: 9.5, design: .monospaced)).foregroundStyle(muted).lineLimit(1)
-                    Text("云端识别 · 音频发送到火山引擎").font(.system(size: 10)).foregroundStyle(muted).lineLimit(1)
-                    if !model.volcKeyPresent {
-                        Button("填写 API Key") { model.showSettings = true }.font(.system(size: 11))
-                    }
-                } else {
-                    Text(model.preferences.asrModel.components(separatedBy: "/").last ?? "本地 ASR")
-                        .font(.system(size: 9.5, design: .monospaced)).foregroundStyle(muted).lineLimit(1)
-                    Text(recognitionStatus).font(.system(size: 10)).foregroundStyle(muted).lineLimit(1)
-                        .help(model.preferences.recognitionMode.detail)
-                    if !model.modelReady && !model.modelLoading {
-                        Button("重新加载模型") { model.loadModel() }.font(.system(size: 11))
-                    }
-                }
-                Divider().padding(.vertical, 2)
-                sideButton("模型与 API 设置", icon: "slider.horizontal.3") { model.showSettings = true }
-            }
-        }
-        .padding(.horizontal, 20).padding(.vertical, 22)
-        // A whisper of a gradient gives the sidebar depth without competing with content.
-        .background(
-            LinearGradient(colors: [Look.sidebar, Look.sidebar.opacity(0.94)],
-                           startPoint: .top, endPoint: .bottom))
-    }
-
-    private var recognitionStatus: String {
-        let level = model.qualityActive ? "高精度" : "省电"
-        guard model.preferences.recognitionMode == .auto else { return "识别：\(level)" }
-        return "识别：\(level) · 自动（\(model.onAC ? "接电源" : "电池")）"
-    }
-
-    /// Spoken guidance depends on what the session is actually listening to.
-    private var emptyStateDetail: String {
-        let cloud = model.usesCloud
-        if model.isRecording {
-            let pace = cloud ? "边说边出字，一句说完后定稿。" : "停顿时更新，连续讲话约每 4 秒更新一次。"
-            let hint = switch model.activeSource {
-            case .microphone: "说话即可，转写会自动出现在这里。\n"
-            case .app: "让所选 App 播放音频，转写会自动出现在这里。\n"
-            default: "电脑上播放的声音和你说的话都会转写，自动出现在这里。\n"
-            }
-            return hint + pace
-        }
-        let place = cloud ? "音频发送到火山引擎豆包识别；可在设置里换成本地模型。" : "音频在这台 Mac 上识别。"
-        switch model.source {
-        case .all: return "点击「开始转写」，电脑上所有 App 的声音和麦克风一起转写。\n" + place
-        case .microphone: return "选择左侧「我的麦克风」后点击「开始转写」。\n适合线下课堂与线下会议，" + place
-        case .app: return "在左侧选择一个正在播放声音的 App，再点击「开始转写」。\n" + place
+        .task { if !ListenFlowHome.isPreview { model.prepareEngine() } }
+        // The app list is only looked at before a session starts.
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            if !model.isRecording && !ListenFlowHome.isPreview { model.refreshApps() }
         }
     }
 
-    private var header: some View {
+    @ViewBuilder private var banners: some View {
+        if let error = model.error {
+            banner(error, icon: "exclamationmark.triangle.fill", color: Palette.warning) { model.error = nil }
+        }
+        if let notice = model.notice {
+            banner(notice, icon: "checkmark.circle.fill", color: Palette.stream) { model.notice = nil }
+        }
+    }
+
+    private func banner(_ text: String, icon: String, color: Color, dismiss: @escaping () -> Void) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 9) {
+            Image(systemName: icon).foregroundStyle(color)
+            Text(text).font(.system(size: 12)).lineSpacing(3).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+            Button(action: dismiss) { Image(systemName: "xmark").font(.system(size: 10, weight: .semibold)) }
+                .buttonStyle(.plain).foregroundStyle(Palette.muted).help("关闭这条提示")
+        }
+        .padding(.horizontal, 28).padding(.vertical, 10)
+        .background(color.opacity(0.1))
+    }
+
+    /// Which reading of the session is shown, and what can be done with it.
+    private var viewBar: some View {
         HStack(spacing: 14) {
-            VStack(alignment: .leading, spacing: 5) {
-                HStack(spacing: 9) {
-                    Text(model.isRecording ? "正在聆听" : "实时转写")
-                        .font(.system(size: 23, weight: .semibold))
-                    if model.isRecording {
-                        Circle().fill(teal).frame(width: 7, height: 7)
-                            .shadow(color: teal.opacity(0.7), radius: 4)
-                            .modifier(Pulse())
-                    }
-                }
-                Text(model.session.lines.isEmpty && model.session.chat.isEmpty && model.session.imageLibrary.isEmpty ? "让声音留下，也让问题有据可循。" : model.session.title)
-                    .font(.system(size: 12)).foregroundStyle(muted).lineLimit(1)
-            }
-            Spacer()
-            if model.isRecording {
-                // Isolated in its own timeline so the ticking clock redraws one label
-                // instead of publishing a value the whole window observes.
-                TimelineView(.periodic(from: model.session.created, by: 1)) { context in
-                    Text(SessionStore.timestamp(context.date, relativeTo: model.session.created))
-                        .font(.system(size: 13, weight: .medium, design: .monospaced))
-                        .foregroundStyle(muted)
-                        .monospacedDigit()
-                        .padding(.horizontal, 9).padding(.vertical, 4)
-                        .background(Look.hairline, in: Capsule())
-                }
-            }
-            Button { Task { if model.isRecording { await model.stop() } else { await model.start() } } } label: {
-                HStack(spacing: 8) {
-                    if model.isBusy { ProgressView().controlSize(.small) }
-                    else { Image(systemName: model.isRecording ? "pause.fill" : "play.fill") }
-                    Text(model.isBusy ? "请稍候" : model.isRecording ? "暂停转写" : "开始转写").fontWeight(.medium)
-                }.padding(.horizontal, 14).padding(.vertical, 10)
-            }.buttonStyle(.plain).foregroundStyle(.white).background(teal, in: Capsule())
-                .opacity(model.canToggleRecording ? 1 : 0.45)
-                .disabled(!model.canToggleRecording)
-                .keyboardShortcut("r", modifiers: [.command])
-        }.padding(.horizontal, 26).padding(.vertical, 23)
-    }
-
-    private var transcript: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack {
-                Picker("记录视图", selection: $model.showOrganized) {
-                    Text("原始转写").tag(false)
-                    Text("整理稿").tag(true)
-                }.labelsHidden().pickerStyle(.segmented).frame(width: 180)
-                Spacer()
-                if !model.showOrganized { refineControl }
-                Text("\(model.session.lines.count) 段").font(.system(size: 11)).foregroundStyle(muted)
-                Button {
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(model.showOrganized ? model.session.organized?.text ?? "" : SessionStore.transcript(model.session), forType: .string)
-                } label: { Image(systemName: "doc.on.doc") }.buttonStyle(.plain).help("复制当前视图的完整记录")
-                    .disabled(model.showOrganized ? model.session.organized == nil || model.isOrganizing : model.session.lines.isEmpty)
-            }.padding(.horizontal, 22).padding(.vertical, 16)
-            if model.showOrganized { organizationControls }
-            Divider().padding(.horizontal, 26)
-            if model.showOrganized {
-                organizedContent
-            } else if model.session.lines.isEmpty && !model.hasLivePartial {
-                VStack(spacing: 16) {
-                    Image(systemName: model.isRecording ? (model.activeSource == .microphone ? "mic.fill" : "waveform") : "waveform.path")
-                        .font(.system(size: 42, weight: .ultraLight)).foregroundStyle(teal.opacity(0.7))
-                    Text(model.isRecording
-                         ? (model.activeSource == .microphone ? "正在聆听麦克风"
-                            : model.activeSource == .all ? "正在聆听电脑声音和麦克风" : "正在等待 App 中的声音")
-                         : "从一段声音开始").font(.system(size: 18, weight: .medium))
-                    Text(emptyStateDetail)
-                        .font(.system(size: 12)).foregroundStyle(muted).multilineTextAlignment(.center).lineSpacing(5)
-                    if model.modelLoading { ProgressView("正在准备本地模型…").controlSize(.small).font(.system(size: 11)) }
-                }.frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                ScrollViewReader { proxy in
-                    ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 24) {
-                            let tailStart = model.liveTailStart
-                            ForEach(model.session.lines) { line in
-                                if line.id == tailStart { LiveTailDivider() }
-                                TranscriptRow(line: line, sessionCreated: model.session.created)
-                            }
-                            LivePreviewRows(preview: model.livePreview) { proxy.scrollTo("bottom", anchor: .bottom) }
-                            if model.pendingCount > 0 && !model.hasLivePartial {
-                                HStack(spacing: 8) {
-                                    ProgressView().controlSize(.mini)
-                                    Text(model.usesCloud ? "正在等待最后一句…" : "正在识别 \(model.pendingCount) 段音频…")
-                                        .font(.system(size: 11)).foregroundStyle(muted)
-                                }
-                            }
-                            Color.clear.frame(height: 1).id("bottom")
-                        }.padding(26)
-                    }.onChange(of: model.session.lines.count) { _, _ in withAnimation { proxy.scrollTo("bottom", anchor: .bottom) } }
-                }
-            }
+            Picker("记录视图", selection: $model.showOrganized) {
+                Text("原始转写").tag(false)
+                Text("整理稿").tag(true)
+            }.labelsHidden().pickerStyle(.segmented).frame(width: 168)
+            Spacer(minLength: 8)
+            if !model.showOrganized { refineControl }
+            Text(counts).font(.system(size: 11)).monospacedDigit().foregroundStyle(Palette.muted).lineLimit(1)
+            Button { model.captureScreenshot() } label: { Image(systemName: "camera.viewfinder") }
+                .buttonStyle(.plain).disabled(model.isCapturingShot)
+                .help("截下整个屏幕，按时间存进这场会话（⇧⌘J）")
+            Button {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(model.showOrganized ? model.session.organized?.text ?? "" : SessionStore.transcript(model.session), forType: .string)
+            } label: { Image(systemName: "doc.on.doc") }
+                .buttonStyle(.plain).help(model.showOrganized ? "复制整理稿" : "复制全部转写")
+                .disabled(model.showOrganized ? model.session.organized == nil || model.isOrganizing : model.session.lines.isEmpty)
+            Button { model.export() } label: { Image(systemName: "square.and.arrow.up") }
+                .buttonStyle(.plain).help("导出为 Markdown 文件").disabled(model.sessionIsEmpty)
         }
+        .font(.system(size: 13))
+        .padding(.horizontal, 28).padding(.bottom, 12)
     }
 
-    /// Whole-transcript re-recognition from kept audio, for sessions recorded in
-    /// economy mode. Hidden when there is nothing to redo.
+    private var counts: String {
+        let lines = model.session.lines.count, shots = model.session.imageLibrary.count
+        if lines == 0 && shots == 0 { return "" }
+        return shots > 0 ? "\(lines) 句，\(shots) 张图" : "\(lines) 句"
+    }
+
+    /// Whole-transcript re-recognition from kept audio. Hidden when there is nothing to redo.
     @ViewBuilder private var refineControl: some View {
         if model.isPostRefining {
             HStack(spacing: 7) {
                 ProgressView(value: Double(model.postRefineDone), total: Double(max(model.postRefineTotal, 1)))
                     .frame(width: 70).controlSize(.small)
-                Text("精修 \(model.postRefineDone)/\(model.postRefineTotal)").font(.system(size: 11)).foregroundStyle(teal)
+                Text("精修 \(model.postRefineDone)/\(model.postRefineTotal)").font(.system(size: 11)).foregroundStyle(Palette.stream)
                     .monospacedDigit()
                 Button("停止") { model.cancelRefineSession() }.font(.system(size: 11))
-            }.padding(.trailing, 6)
+            }
         } else if model.canRefineSession {
             Button { model.refineSession() } label: {
-                Label("精修全文", systemImage: "wand.and.stars").font(.system(size: 11))
-            }.buttonStyle(.plain).foregroundStyle(teal).padding(.trailing, 6)
+                Label("精修全文", systemImage: "wand.and.stars").font(.system(size: 12, weight: .medium))
+            }.buttonStyle(.plain).foregroundStyle(Palette.stream)
                 .help(model.usesCloud
                       ? "把本机暂存的约 \(Int((model.keptStreamSeconds / 60).rounded(.up))) 分钟录音上传到豆包录音文件识别，重新识别全文，更准确；按音频时长另外计费，完成后删除暂存录音"
                       : "用暂存的音频，以约 30 秒为一段重新识别全文，更准确；完成后删除暂存音频")
         }
     }
+}
 
-    private var organizationControls: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 12) {
-                if model.isOrganizing {
-                    ProgressView().controlSize(.small)
-                    Text("正在整理…").font(.system(size: 12)).foregroundStyle(teal)
-                    Button("停止") { model.cancelOrganization() }.font(.system(size: 11))
-                } else {
-                    Button { model.organize() } label: {
-                        Label(model.session.organized == nil ? "整理当前记录" : "更新整理稿", systemImage: "text.badge.checkmark")
-                    }.buttonStyle(.borderedProminent).controlSize(.small).disabled(!model.hasOrganizationContext || model.isImportingImages)
-                }
-                Spacer(minLength: 4)
-                Toggle("自动更新", isOn: Binding(get: { model.autoOrganize }, set: { model.setAutoOrganize($0) }))
-                    .font(.system(size: 11)).toggleStyle(.switch).controlSize(.mini)
-                    .help("开启后，有新增转写时约每 30 秒用问答 API 更新整理稿")
-            }
-            if let organized = model.session.organized {
-                Text((organized.sourceLineIDs.isEmpty ? "已整理图片资料" : "已整理至 \(SessionStore.timestamp(organized.through, relativeTo: model.session.created))") +
-                     (model.session.unorganizedCount > 0 ? " · 另有 \(model.session.unorganizedCount) 段新内容" : "") +
-                     ((organized.imageIDs?.isEmpty == false) ? " · 参考 \(organized.imageIDs!.count) 张图" : "") +
-                     (model.organizationImagesChanged ? " · 图片选择已变化" : "") +
-                     (model.organizationStale ? " · 原文已精修，更新时整篇重整" : ""))
-                    .font(.system(size: 10)).foregroundStyle(muted)
-            } else {
-                Text("用已配置的 API 整理全文 · 自动更新间隔约 30 秒").font(.system(size: 10)).foregroundStyle(muted)
-            }
-            ImageAttachmentPicker(model: model, forOrganization: true)
-        }.padding(.horizontal, 22).padding(.bottom, 14)
+// MARK: - Session list
+
+/// Every session, newest first. This is where the window starts: pick up an old
+/// session with one click instead of opening a sheet to look for it.
+private struct SessionRail: View {
+    @ObservedObject var model: AppModel
+
+    private struct Day: Identifiable {
+        let id: String
+        var sessions: [SessionSummary]
     }
 
-    private var organizedContent: some View {
-        OrganizationDocument(preview: model.organizationPreview, savedText: model.session.organized?.text ?? "",
-                             isGenerating: model.isOrganizing)
+    private var days: [Day] {
+        var rows = model.history
+        // A session with nothing in it yet has no file, but it is still the one open.
+        if !rows.contains(where: { $0.id == model.session.id }) { rows.insert(SessionSummary(model.session), at: 0) }
+        var out: [Day] = []
+        for row in rows {
+            let label = Format.day(row.created)
+            if out.last?.id == label { out[out.count - 1].sessions.append(row) }
+            else { out.append(Day(id: label, sessions: [row])) }
+        }
+        return out
     }
 
-    private var askPanel: some View {
+    var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 8) {
-                Image(systemName: "sparkle").font(.system(size: 12)).foregroundStyle(teal)
-                Text("问问这段内容").font(.system(size: 13.5, weight: .semibold))
-                Spacer()
-                Button { model.showSettings = true } label: {
-                    Image(systemName: "gearshape").font(.system(size: 12))
-                }.buttonStyle(.plain).foregroundStyle(muted)
-            }.padding(.horizontal, 20).padding(.top, 16).padding(.bottom, 6)
-            Text(model.connectionLabel).font(.system(size: 10)).foregroundStyle(muted).padding(.horizontal, 20)
-            if model.session.chat.isEmpty {
-                VStack(alignment: .leading, spacing: 15) {
-                    Text(model.askImages.isEmpty ? "边听，边理解。" : "看图，也结合上下文。")
-                        .font(.system(size: 21, weight: .medium))
-                    Text(model.askImages.isEmpty ? "基于当前会话已经转写的内容回答。\n提问期间，转写会继续。" : "结合选中的图片与已有转写回答。\n没有录音，也可以直接提问图片内容。")
-                        .font(.system(size: 12)).foregroundStyle(muted).lineSpacing(5)
-                    VStack(alignment: .leading, spacing: 8) {
-                        suggestion("总结目前的讨论", icon: "text.alignleft")
-                        suggestion("有哪些待办事项？", icon: "checklist")
-                        suggestion("解释一下刚才的内容", icon: "lightbulb")
-                    }.padding(.top, 7)
-                }.padding(24).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
-            } else {
-                ScrollViewReader { proxy in
-                    ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 22) {
-                            ForEach(model.session.chat) { message in
-                                ChatRow(message: message, model: model)
-                            }
-                            Color.clear.frame(height: 1).id("chatBottom")
-                        }.padding(22)
-                    }.onChange(of: model.answerStream.state.text) { _, _ in proxy.scrollTo("chatBottom", anchor: .bottom) }
-                }
-            }
-            VStack(alignment: .leading, spacing: 10) {
-                ImageAttachmentPicker(model: model, forOrganization: false)
-                QuestionInput(text: $model.question, onPaste: { model.pasteAskImages(from: $0) }, onSubmit: { model.ask() }, focusToken: model.questionFocusToken)
-                HStack {
-                    Text(model.askImages.isEmpty ? (!model.hasAskContext ? "添加图片或转写内容后即可提问" : "发送当前会话文字给问答 API") : "发送会话文字及选中的 \(model.askImages.count) 张图片")
-                        .font(.system(size: 9)).foregroundStyle(muted)
+            Button { model.newSession() } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "square.and.pencil").frame(width: 16)
+                    Text("新建会话")
                     Spacer()
-                    if model.isAsking {
-                        Button { model.cancelAsk() } label: { Image(systemName: "stop.fill") }.buttonStyle(.bordered).help("停止回答")
-                    } else {
-                        Button { model.ask() } label: { Image(systemName: "arrow.up").fontWeight(.bold).frame(width: 22, height: 22) }
-                            .buttonStyle(.borderedProminent).clipShape(Circle())
-                            .disabled((model.question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && model.askImages.isEmpty) || !model.hasAskContext || model.isImportingImages)
-                            .keyboardShortcut(.return, modifiers: [.command])
+                    Text("⌘N").font(.system(size: 11)).foregroundStyle(Palette.faint)
+                }
+                .font(.system(size: 13, weight: .medium))
+                .padding(.horizontal, 10).frame(height: 32)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain).disabled(!model.canChangeSession)
+            .padding(.horizontal, 10).padding(.top, 12).padding(.bottom, 6)
+
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 1) {
+                    ForEach(days) { day in
+                        Text(day.id).font(.system(size: 11, weight: .medium)).foregroundStyle(Palette.muted)
+                            .padding(.horizontal, 10).padding(.top, 14).padding(.bottom, 4)
+                        ForEach(day.sessions) { row in SessionRow(model: model, row: row) }
                     }
-                }
-            }.padding(14).background(Color.white, in: RoundedRectangle(cornerRadius: 14))
-                .overlay(RoundedRectangle(cornerRadius: 14).stroke(teal.opacity(0.15))).padding(18)
-        }.background(paper.opacity(0.55))
+                }.padding(.horizontal, 10).padding(.bottom, 12)
+            }
+
+            Rectangle().fill(Palette.hairline).frame(height: 1)
+            EngineFooter(model: model)
+        }
+        .background(Palette.rail)
+    }
+}
+
+private struct SessionRow: View {
+    @ObservedObject var model: AppModel
+    let row: SessionSummary
+
+    private var detail: String {
+        if row.lineCount == 0 { return row.imageCount > 0 ? "\(row.imageCount) 张图" : "还没有内容" }
+        return Format.length(row.seconds) + "，\(row.lineCount) 句" + (row.hasDraft ? "，有整理稿" : "")
     }
 
-
-    private var historySheet: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            HStack { Text("历史会话").font(.title2.bold()); Spacer(); Button("完成") { model.showHistory = false } }
-            if model.history.isEmpty { Text("还没有保存的会话。转写后会自动保存在本机。").foregroundStyle(muted).padding(.vertical, 60) }
-            else {
-                List(model.history) { session in
-                    Button { model.openSession(session) } label: {
-                        VStack(alignment: .leading, spacing: 5) {
-                            Text(session.title).font(.headline)
-                            Text("\(session.lines.count) 段转写 · \(session.chat.count / 2) 次问答" + (session.imageLibrary.isEmpty ? "" : " · \(session.imageLibrary.count) 张图"))
-                                .font(.caption).foregroundStyle(muted)
-                        }.padding(.vertical, 5)
-                    }.buttonStyle(.plain)
+    var body: some View {
+        let current = row.id == model.session.id
+        Button { model.openSession(row.id) } label: {
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    if current && model.isRecording {
+                        Circle().fill(Palette.live).frame(width: 6, height: 6).modifier(Pulse())
+                    }
+                    Text(Format.name(row.title)).font(.system(size: 13, weight: current ? .semibold : .regular)).lineLimit(1)
+                    Spacer(minLength: 4)
+                    Text(Format.time(row.created)).font(.system(size: 11)).monospacedDigit().foregroundStyle(Palette.muted)
                 }
+                Text(detail).font(.system(size: 11)).foregroundStyle(Palette.muted).lineLimit(1)
             }
-        }.padding(26).frame(width: 600, height: 420)
-    }
-    private func suggestion(_ text: String, icon: String) -> some View {
-        Button { model.ask(text) } label: {
-            HStack(spacing: 10) {
-                Image(systemName: icon).foregroundStyle(teal).frame(width: 17)
-                Text(text)
-                Spacer()
-                Image(systemName: "arrow.up.left").font(.system(size: 10)).foregroundStyle(muted)
-            }
-            .font(.system(size: 12))
-            .padding(.horizontal, 13).padding(.vertical, 11)
-            .surfaceCard(Look.radiusRow)
+            .padding(.horizontal, 10).padding(.vertical, 7)
+            .background(current ? Palette.ink.opacity(0.08) : .clear, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .disabled(!model.hasAskContext || model.isAsking || model.isImportingImages)
-        .opacity(model.hasAskContext ? 1 : 0.55)
-    }
-
-    private var footer: some View {
-        HStack(spacing: 14) {
-            Label(model.usesCloud ? "云端识别 · 音频发送到火山引擎" : "音频本地处理",
-                  systemImage: model.usesCloud ? "cloud" : "lock.shield")
-                .font(.system(size: 10))
-            if model.lastLatency > 0 {
-                Text(String(format: model.usesCloud ? "最近一句定稿延迟 %.1f 秒" : "最近片段延迟 %.1f 秒", model.lastLatency))
-                    .font(.system(size: 10)).monospacedDigit()
-            }
-            if model.oldestPending > 10 {
-                Label("识别延迟较高，正在处理积压", systemImage: "exclamationmark.triangle")
-                    .font(.system(size: 10)).foregroundStyle(.orange)
-            }
-            Spacer()
-            Text(!model.session.imageLibrary.isEmpty ? "会话与图片已保存在本机" : model.session.lines.isEmpty ? "会话文字自动保存在本机"
-                 : model.keepsAudio ? "已自动保存 · 音频暂存本机，精修后删除" : "已自动保存 · 不保存原始音频")
-                .font(.system(size: 10))
-        }
-        .foregroundStyle(muted)
-        .padding(.horizontal, 24).padding(.vertical, 10)
-        .background(Look.canvas)
-        .overlay(alignment: .top) { Rectangle().fill(Look.hairline).frame(height: 1) }
-    }
-    private func sectionLabel(_ text: String) -> some View { Text(text).font(.system(size: 10, weight: .medium)).tracking(1).foregroundStyle(muted) }
-    private func sideButton(_ title: String, icon: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) { HStack(spacing: 10) { Image(systemName: icon).frame(width: 16); Text(title); Spacer() }.font(.system(size: 12)).padding(.vertical, 5) }.buttonStyle(.plain)
+        .disabled(!current && !model.canChangeSession)
+        .opacity(current || model.canChangeSession ? 1 : 0.5)
+        .help(current || model.canChangeSession ? row.title : "暂停转写并等识别完成后，才能换到别的会话")
     }
 }
 
-/// One transcribed segment. A monospaced timestamp and a colour-coded source chip
-/// give the list a scannable rhythm without adding visual noise.
-private struct TranscriptRow: View {
-    let line: TranscriptLine
-    let sessionCreated: Date
-    private var microphone: Bool { line.source == "麦克风" }
+/// Which engine is listening, whether it is ready, and the way into settings.
+private struct EngineFooter: View {
+    @ObservedObject var model: AppModel
+
+    private var recognitionStatus: String {
+        let level = model.qualityActive ? "高精度" : "省电"
+        guard model.preferences.recognitionMode == .auto else { return "识别档位：\(level)" }
+        return "识别档位：\(level)（自动，\(model.onAC ? "接电源" : "电池")）"
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 7) {
+        VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 7) {
-                Text(SessionStore.timestamp(line.start, relativeTo: sessionCreated))
-                    .font(.system(size: 10, weight: .medium, design: .monospaced))
-                    .foregroundStyle(muted).monospacedDigit()
-                Text(line.source)
-                    .font(.system(size: 9.5, weight: .semibold))
-                    .foregroundStyle(microphone ? Color.orange : teal)
-                    .padding(.horizontal, 6).padding(.vertical, 1.5)
-                    .background((microphone ? Color.orange : teal).opacity(0.11), in: Capsule())
-                Spacer()
+                Circle().fill(model.engineReady ? Palette.stream : Palette.warning).frame(width: 6, height: 6)
+                Text(model.engineStatus).font(.system(size: 11, weight: .medium)).lineLimit(1)
             }
-            Text(line.text).font(.system(size: 15)).lineSpacing(6).textSelection(.enabled)
+            if model.usesCloud {
+                if !model.volcKeyPresent {
+                    Button("填写 API Key") { model.showSettings = true }.font(.system(size: 11))
+                }
+            } else {
+                Text(recognitionStatus).font(.system(size: 10)).foregroundStyle(Palette.muted).lineLimit(1)
+                    .help(model.preferences.recognitionMode.detail)
+                if !model.modelReady && !model.modelLoading {
+                    Button("重新加载模型") { model.loadModel() }.font(.system(size: 11))
+                }
+            }
+            Button { model.showSettings = true } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "gearshape").frame(width: 16)
+                    Text("设置")
+                    Spacer()
+                    Text("⌘,").font(.system(size: 11)).foregroundStyle(Palette.faint)
+                }.font(.system(size: 12)).frame(height: 24).contentShape(Rectangle())
+            }.buttonStyle(.plain)
         }
-        .id(line.id)
+        .padding(.horizontal, 20).padding(.vertical, 14)
     }
 }
 
-/// Sentences the cloud engine is still revising, shown dimmed under the settled
-/// lines. Observes its own object, so the several updates a second redraw only
+// MARK: - Title and recording controls
+
+/// The session's name and what it is doing on the left; on the right, what to
+/// listen to and the one button that starts and pauses it.
+private struct Transport: View {
+    @ObservedObject var model: AppModel
+
+    private var title: String {
+        if !model.sessionIsEmpty { return Format.name(model.session.title) }
+        return model.isRecording ? "正在听" : "新的会话"
+    }
+
+    private var listening: String {
+        let mic = model.micEnabled
+        switch model.activeSource {
+        case .microphone: return "在听麦克风"
+        case .app: return "在听 \(model.selectedApp?.name ?? "所选 App")" + (mic ? "和麦克风" : "")
+        default: return mic ? "在听电脑上的声音和麦克风" : "在听电脑上的声音，麦克风没有打开"
+        }
+    }
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 14) {
+            VStack(alignment: .leading, spacing: 5) {
+                Text(title).font(.system(size: 19, weight: .semibold)).lineLimit(1)
+                subtitle.font(.system(size: 12)).foregroundStyle(Palette.muted).lineLimit(1)
+            }
+            Spacer(minLength: 10)
+            if model.isRecording { liveControls } else { sourceMenu }
+            recordButton
+        }
+        .padding(.horizontal, 28).padding(.top, 16).padding(.bottom, 14)
+    }
+
+    @ViewBuilder private var subtitle: some View {
+        if model.isRecording {
+            HStack(spacing: 7) {
+                Circle().fill(Palette.live).frame(width: 7, height: 7).modifier(Pulse())
+                // Its own timeline, so the ticking clock redraws one label
+                // instead of publishing a value the whole window observes.
+                TimelineView(.periodic(from: model.session.created, by: 1)) { context in
+                    Text(SessionStore.timestamp(context.date, relativeTo: model.session.created))
+                        .monospacedDigit().foregroundStyle(Palette.ink)
+                }
+                Text(listening)
+            }
+        } else if model.pendingCount > 0 {
+            Text(model.usesCloud ? "正在等最后一句定稿" : "还有 \(model.pendingCount) 段音频在识别")
+        } else if !model.session.lines.isEmpty {
+            let last = model.session.lines.map(\.end).max() ?? model.session.created
+            Text("\(Format.day(model.session.created)) \(Format.time(model.session.created)) 开始，\(Format.length(last.timeIntervalSince(model.session.created)))")
+        } else {
+            Text(model.source.detail)
+        }
+    }
+
+    /// One menu instead of a picker plus a second list: the three kinds of
+    /// source, and under the last the apps that are running.
+    private var sourceMenu: some View {
+        Menu {
+            Toggle(isOn: Binding(get: { model.source == .all }, set: { _ in model.source = .all })) {
+                Text("全局声音：电脑上所有声音，加上麦克风")
+            }
+            Toggle(isOn: Binding(get: { model.source == .microphone }, set: { _ in model.source = .microphone })) {
+                Text("我的麦克风：线下课堂、线下会议")
+            }
+            Section("只录一个 App") {
+                if model.apps.isEmpty { Text("没有正在运行的 App") }
+                ForEach(model.apps) { app in
+                    Toggle(isOn: Binding(get: { model.source == .app && model.selectedPID == app.id },
+                                         set: { _ in model.source = .app; model.selectedPID = app.id })) { Text(app.name) }
+                }
+            }
+            Divider()
+            Button("刷新 App 列表") { model.refreshApps() }
+        } label: {
+            Label(sourceName, systemImage: model.source == .microphone ? "mic" : model.source == .app ? "macwindow" : "waveform")
+        }
+        .menuStyle(.button).buttonStyle(.bordered).controlSize(.large).fixedSize()
+        .disabled(model.isBusy)
+        .help(model.source.detail)
+    }
+
+    private var sourceName: String {
+        switch model.source {
+        case .all: "全局声音"
+        case .microphone: "我的麦克风"
+        case .app: model.selectedApp?.name ?? "选一个 App"
+        }
+    }
+
+    /// While recording: how loud each side is, and the microphone switch.
+    private var liveControls: some View {
+        HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 4) {
+                if model.activeSource != .microphone { LevelBar(levels: model.levels, microphone: false) }
+                if model.micEnabled { LevelBar(levels: model.levels, microphone: true) }
+            }.frame(width: 64)
+            if model.activeSource != .microphone {
+                // With speakers the microphone re-records the Mac's own sound; those
+                // repeated lines are dropped (EchoFilter), so the switch is safe to use.
+                Button { Task { await model.toggleMic(!model.micEnabled) } } label: {
+                    Image(systemName: model.micEnabled ? "mic.fill" : "mic.slash")
+                        .font(.system(size: 13)).frame(width: 30, height: 30)
+                        .foregroundStyle(model.micEnabled ? Palette.voice : Palette.muted)
+                        .background(Palette.ink.opacity(0.06), in: Circle())
+                }
+                .buttonStyle(.plain).disabled(model.isBusy || model.micBusy)
+                .help(model.micEnabled ? "麦克风在录。外放时录到的电脑声音会自动去掉，你自己的话照常保留。点一下关闭麦克风"
+                                       : "麦克风没有在录。点一下打开")
+            }
+        }
+    }
+
+    private var recordButton: some View {
+        let recording = model.isRecording
+        return Button { Task { await model.toggleRecording() } } label: {
+            HStack(spacing: 8) {
+                if model.isBusy { ProgressView().controlSize(.small) }
+                else if recording { Image(systemName: "pause.fill").font(.system(size: 11)) }
+                else { Circle().fill(Palette.live).frame(width: 9, height: 9) }
+                Text(model.isBusy ? "请稍候" : recording ? "暂停转写" : "开始转写").font(.system(size: 13, weight: .semibold))
+            }
+            .padding(.horizontal, 16).frame(height: 34)
+            .foregroundStyle(recording ? Palette.live : Palette.page)
+            .background(recording ? Palette.live.opacity(0.13) : Palette.ink, in: Capsule())
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .opacity(model.canToggleRecording ? 1 : 0.4)
+        .disabled(!model.canToggleRecording)
+        .help(recording ? "暂停转写（⌘R，在别的 App 里是 ⌥⌘R）" : "开始转写（⌘R，在别的 App 里是 ⌥⌘R）")
+    }
+}
+
+private struct LevelBar: View {
+    @ObservedObject var levels: AudioLevels
+    let microphone: Bool
+    var body: some View {
+        let level = microphone ? levels.mic : levels.app
+        let color = microphone ? Palette.voice : Palette.stream
+        GeometryReader { g in
+            ZStack(alignment: .leading) {
+                Capsule().fill(color.opacity(0.16))
+                Capsule().fill(color).frame(width: max(0, g.size.width * CGFloat(level)))
+            }
+        }
+        .frame(height: 4).animation(.linear(duration: 0.1), value: level)
+        .help(microphone ? "麦克风的音量" : "电脑声音的音量")
+    }
+}
+
+// MARK: - Transcript
+
+/// The session as a page: paragraphs of speech and the pictures taken along
+/// the way, with the time in the margin and a coloured bar saying whose side
+/// it was. New text is followed only while the reader is at the end; scroll
+/// up to re-read something and it stays put.
+private struct TranscriptPage: View {
+    @ObservedObject var model: AppModel
+    @State private var following = true
+    @State private var position = ScrollPosition(edge: .top)
+    @State private var preview: ImageAttachment?
+
+    /// Where the reader is: how far down, and how far from the end.
+    private struct Reach: Equatable {
+        var offset: CGFloat
+        var fromEnd: CGFloat
+    }
+
+    var body: some View {
+        if model.session.lines.isEmpty && model.session.imageLibrary.isEmpty && !model.hasLivePartial {
+            EmptyTranscript(model: model)
+        } else {
+            page
+        }
+    }
+
+    private var page: some View {
+        let tail = model.liveTailStart
+        let entries = TranscriptLayout.timeline(model.session, breakBefore: tail)
+        return ScrollView {
+            LazyVStack(alignment: .leading, spacing: 20) {
+                ForEach(entries) { entry in
+                    switch entry {
+                    case let .block(block):
+                        if block.id == tail { LiveTailDivider() }
+                        BlockRow(block: block, created: model.session.created).equatable()
+                    case let .image(image):
+                        ShotRow(image: image, sessionID: model.session.id, created: model.session.created) { preview = image }
+                    }
+                }
+                LivePreviewRows(preview: model.livePreview)
+                if model.pendingCount > 0 && !model.hasLivePartial {
+                    HStack(spacing: 8) {
+                        ProgressView().controlSize(.mini)
+                        Text(model.usesCloud ? "正在等最后一句定稿" : "正在识别 \(model.pendingCount) 段音频")
+                            .font(.system(size: 11)).foregroundStyle(Palette.muted)
+                    }.padding(.leading, RowMetrics.textInset)
+                }
+            }
+            .frame(maxWidth: RowMetrics.column, alignment: .leading)
+            .padding(.horizontal, 28).padding(.top, 22).padding(.bottom, 30)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .scrollPosition($position)
+        .onScrollGeometryChange(for: Reach.self) { geometry in
+            Reach(offset: geometry.contentOffset.y,
+                  fromEnd: geometry.contentSize.height - geometry.contentOffset.y - geometry.containerSize.height)
+        } action: { old, new in
+            if new.fromEnd < 40 {
+                if !following { following = true }
+            } else if new.offset < old.offset - 2 {
+                // The reader scrolled up: leave the page where they put it.
+                if following { following = false }
+            } else if following {
+                // The page grew under a reader who is at the end: stay there.
+                position.scrollTo(edge: .bottom)
+            }
+        }
+        // A session being recorded opens at its newest line, a finished one at its start.
+        .onChange(of: model.session.id, initial: true) { _, _ in
+            following = model.isRecording
+            position.scrollTo(edge: model.isRecording ? .bottom : .top)
+        }
+        .onChange(of: model.isRecording) { _, recording in
+            if recording { following = true; position.scrollTo(edge: .bottom) }
+        }
+        .overlay(alignment: .bottom) {
+            if !following {
+                Button { following = true; position.scrollTo(edge: .bottom) } label: {
+                    Label(model.isRecording ? "回到最新" : "到末尾", systemImage: "arrow.down")
+                        .font(.system(size: 12, weight: .medium))
+                        .padding(.horizontal, 13).frame(height: 30)
+                        .foregroundStyle(Palette.page)
+                        .background(Palette.ink.opacity(0.86), in: Capsule())
+                }
+                .buttonStyle(.plain).padding(.bottom, 14)
+            }
+        }
+        .sheet(item: $preview) { image in
+            AttachmentPreview(image: image, sessionID: model.session.id, created: model.session.created)
+        }
+    }
+}
+
+private enum RowMetrics {
+    static let time: CGFloat = 44
+    static let gutter: CGFloat = 14
+    static let bar: CGFloat = 2.5
+    /// Where text starts, measured from the row's leading edge.
+    static var textInset: CGFloat { time + gutter + bar + gutter }
+    /// About 42 Chinese characters a line at the body size.
+    static let column: CGFloat = 760
+}
+
+/// A row of the page: the time in the margin, then a bar in the source's
+/// colour that runs the height of whatever is beside it.
+private struct MarginRow<Content: View>: View {
+    let time: String
+    let color: Color
+    var dashed = false
+    @ViewBuilder var content: Content
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: RowMetrics.gutter) {
+            Text(time).font(.system(size: 11)).monospacedDigit().foregroundStyle(Palette.muted)
+                .frame(width: RowMetrics.time, alignment: .trailing)
+            content
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.leading, RowMetrics.bar + RowMetrics.gutter)
+                .overlay(alignment: .leading) {
+                    if dashed {
+                        VerticalLine().stroke(color.opacity(0.7), style: StrokeStyle(lineWidth: RowMetrics.bar, dash: [3, 4]))
+                            .frame(width: RowMetrics.bar)
+                    } else {
+                        RoundedRectangle(cornerRadius: RowMetrics.bar / 2).fill(color).frame(width: RowMetrics.bar)
+                    }
+                }
+        }
+    }
+}
+
+private struct VerticalLine: Shape {
+    func path(in rect: CGRect) -> Path {
+        Path { $0.move(to: CGPoint(x: rect.midX, y: 0)); $0.addLine(to: CGPoint(x: rect.midX, y: rect.maxY)) }
+    }
+}
+
+private struct BlockRow: View, Equatable {
+    let block: TranscriptBlock
+    let created: Date
+    var body: some View {
+        MarginRow(time: SessionStore.timestamp(block.start, relativeTo: created), color: Palette.source(block.source)) {
+            VStack(alignment: .leading, spacing: 5) {
+                if block.showsSource {
+                    Text(block.source).font(.system(size: 11, weight: .semibold)).foregroundStyle(Palette.source(block.source))
+                }
+                Text(block.text).font(.system(size: 15)).lineSpacing(7).textSelection(.enabled)
+            }
+        }
+    }
+}
+
+/// A picture kept during the session, at the point where it was taken.
+private struct ShotRow: View {
+    let image: ImageAttachment
+    let sessionID: UUID
+    let created: Date
+    var open: () -> Void
+    var body: some View {
+        MarginRow(time: SessionStore.timestamp(image.addedAt, relativeTo: created), color: Palette.faint) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(image.isShot ? "截屏" : image.name).font(.system(size: 11, weight: .semibold)).foregroundStyle(Palette.muted).lineLimit(1)
+                Button(action: open) {
+                    Group {
+                        if let thumbnail = AttachmentThumbnails.image(image, sessionID: sessionID, edge: 720) {
+                            Image(nsImage: thumbnail).resizable().scaledToFit()
+                        } else {
+                            Label("图片文件不在了", systemImage: "photo.badge.exclamationmark")
+                                .font(.system(size: 12)).foregroundStyle(Palette.muted).frame(width: 240, height: 80)
+                        }
+                    }
+                    .frame(maxWidth: 360, maxHeight: 230, alignment: .leading)
+                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous).strokeBorder(Palette.hairline))
+                }
+                .buttonStyle(.plain).help("点开看大图")
+            }
+        }
+    }
+}
+
+/// Sentences the cloud engine is still revising, dimmed under the settled
+/// text. Observes its own object, so the several updates a second redraw only
 /// these rows.
 private struct LivePreviewRows: View {
     @ObservedObject var preview: LivePreview
-    var onGrow: () -> Void
     var body: some View {
         ForEach(preview.items) { item in
-            VStack(alignment: .leading, spacing: 7) {
-                HStack(spacing: 7) {
-                    Text(item.source)
-                        .font(.system(size: 9.5, weight: .semibold))
-                        .foregroundStyle(item.source == "麦克风" ? Color.orange : teal)
-                        .padding(.horizontal, 6).padding(.vertical, 1.5)
-                        .background((item.source == "麦克风" ? Color.orange : teal).opacity(0.11), in: Capsule())
-                    Text("正在听…").font(.system(size: 9.5)).foregroundStyle(muted)
-                    Spacer()
-                }
-                Text(item.text).font(.system(size: 15)).lineSpacing(6).foregroundStyle(ink.opacity(0.5))
-            }
-        }
-        .onChange(of: preview.items.map(\.text.count).reduce(0, +)) { _, _ in onGrow() }
-    }
-}
-
-/// One exchange in the question panel. Kept as its own view so the list body stays
-/// cheap to type-check and so a streaming answer only redraws its own row.
-private struct ChatRow: View {
-    let message: ChatMessage
-    @ObservedObject var model: AppModel
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            header
-            body(for: message)
-            if message.role == "user", let ids = message.imageIDs, !ids.isEmpty {
-                ImageReferencesView(images: model.session.imageLibrary.filter { ids.contains($0.id) },
-                                    sessionID: model.session.id)
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
-
-    @ViewBuilder private var header: some View {
-        HStack {
-            Text(message.role == "user" ? "你" : "听流")
-                .font(.system(size: 11, weight: .semibold)).foregroundStyle(teal)
-            if let through = message.contextThrough, message.role == "assistant" {
-                Text("依据 \(SessionStore.timestamp(through, relativeTo: model.session.created)) 前的记录")
-                    .font(.system(size: 9)).foregroundStyle(muted)
-            }
-        }
-    }
-
-    @ViewBuilder private func body(for message: ChatMessage) -> some View {
-        if message.role == "assistant" {
-            // Subscribes to answerStream itself, so incoming deltas redraw this
-            // answer only — not the rest of the window.
-            AnswerBody(stream: model.answerStream, messageID: message.id, savedText: message.text)
-        } else {
-            QuestionBody(text: message.text)
-        }
-    }
-}
-
-/// The user's own question text. Split out so the surrounding list stays cheap to type-check.
-private struct QuestionBody: View {
-    let text: String
-    var body: some View {
-        Text(text)
-            .font(.system(size: 13))
-            .lineSpacing(5)
-            .textSelection(.enabled)
-    }
-}
-
-/// One assistant answer. Observing the stream here rather than in the parent keeps
-/// per-delta redraws scoped to this view while text arrives.
-private struct AnswerBody: View {
-    @ObservedObject var stream: AnswerStream
-    let messageID: UUID
-    let savedText: String
-    var body: some View {
-        // Live text only applies to the answer currently being generated.
-        let streaming = stream.state.messageID == messageID
-        let text = streaming ? stream.state.text : savedText
-        VStack(alignment: .leading, spacing: 8) {
-            if text.isEmpty {
-                ProgressView().controlSize(.small)
-            } else {
-                MarkdownAnswerView(text: text).equatable()
-                HStack(spacing: 12) {
-                    Button {
-                        NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(text, forType: .string)
-                    } label: { Label("复制回答", systemImage: "doc.on.doc").font(.system(size: 10)).foregroundStyle(muted) }
-                        .buttonStyle(.plain).help("复制原始 Markdown，保留格式")
-                    if streaming {
-                        Button { NSPasteboard.general.clearContents() } label: {
-                            Text("生成中…").font(.system(size: 10)).foregroundStyle(muted)
-                        }.buttonStyle(.plain).disabled(true)
-                    }
+            MarginRow(time: "", color: Palette.source(item.source), dashed: true) {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("\(item.source)，正在说").font(.system(size: 11, weight: .semibold)).foregroundStyle(Palette.source(item.source))
+                    Text(item.text).font(.system(size: 15)).lineSpacing(7).foregroundStyle(Palette.muted)
                 }
             }
-        }
-    }
-}
-
-private struct OrganizationDocument: View {
-    @ObservedObject var preview: OrganizationPreview
-    let savedText: String
-    let isGenerating: Bool
-    var body: some View {
-        let text = isGenerating && !preview.text.isEmpty ? preview.text : savedText
-        Group {
-            if text.isEmpty {
-                VStack(spacing: 15) {
-                    Image(systemName: "text.alignleft").font(.system(size: 37, weight: .ultraLight)).foregroundStyle(teal.opacity(0.7))
-                    Text(isGenerating ? "正在把碎片连成文章" : "把零碎的话，连起来读").font(.system(size: 17, weight: .medium))
-                    Text("合并断句、补全标点、整理段落。\n保留原意与时间戳，随时可以对照原始转写。")
-                        .font(.system(size: 12)).foregroundStyle(muted).multilineTextAlignment(.center).lineSpacing(5)
-                }.frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                VStack(alignment: .leading, spacing: 0) {
-                    DocumentTextView(text: text).frame(maxWidth: .infinity, maxHeight: .infinity)
-                    Text(isGenerating ? "生成中，完成后自动保存" : "AI 整理稿 · 不确定之处请对照原始转写")
-                        .font(.system(size: 10)).foregroundStyle(muted).padding(.horizontal, 26).padding(.vertical, 12)
-                }
-            }
-        }
-    }
-}
-
-/// Native text layout keeps long streamed documents inside the viewport without rebuilding the window.
-private struct DocumentTextView: NSViewRepresentable {
-    let text: String
-    func makeNSView(context: Context) -> NSScrollView {
-        let scroll = NSScrollView()
-        scroll.hasVerticalScroller = true
-        scroll.autohidesScrollers = true
-        scroll.drawsBackground = false
-        let view = NSTextView(frame: NSRect(x: 0, y: 0, width: 600, height: 400))
-        view.isEditable = false
-        view.isSelectable = true
-        view.isRichText = false
-        view.drawsBackground = false
-        view.isVerticallyResizable = true
-        view.isHorizontallyResizable = false
-        view.autoresizingMask = [.width]
-        view.textContainerInset = NSSize(width: 24, height: 22)
-        view.textContainer?.widthTracksTextView = true
-        view.textContainer?.containerSize = NSSize(width: 600, height: CGFloat.greatestFiniteMagnitude)
-        view.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
-        scroll.documentView = view
-        return scroll
-    }
-    func updateNSView(_ scroll: NSScrollView, context: Context) {
-        guard let view = scroll.documentView as? NSTextView, view.string != text else { return }
-        let origin = scroll.contentView.bounds.origin
-        let paragraph = NSMutableParagraphStyle()
-        paragraph.lineSpacing = 7
-        paragraph.paragraphSpacing = 10
-        view.textStorage?.setAttributedString(NSAttributedString(string: text, attributes: [
-            .font: NSFont.systemFont(ofSize: 15), .foregroundColor: NSColor(ink), .paragraphStyle: paragraph
-        ]))
-        scroll.contentView.scroll(to: origin)
-        scroll.reflectScrolledClipView(scroll.contentView)
-    }
-}
-
-private struct AudioLevelMeter: View {
-    @ObservedObject var levels: AudioLevels
-    let microphone: Bool
-    private var level: Float { microphone ? levels.mic : levels.app }
-    private var color: Color { microphone ? .orange : teal }
-    var body: some View {
-        GeometryReader { g in
-            ZStack(alignment: .leading) {
-                Capsule().fill(color.opacity(0.08))
-                Capsule().fill(color.opacity(0.8)).frame(width: max(0, g.size.width * CGFloat(level)))
-            }
-        }.frame(height: 4).animation(.linear(duration: 0.1), value: level)
-    }
-}
-
-struct SettingsView: View {
-    @ObservedObject var model: AppModel
-    @Environment(\.dismiss) private var dismiss
-    @State private var draft = Preferences()
-    @State private var key = ""
-    @State private var volcKey = ""
-    @State private var volcKeyLoaded = ""
-    @State private var error: String?
-    @State private var initialized = false
-    var body: some View {
-        VStack(alignment: .leading, spacing: 20) {
-            HStack { Text("模型与 API 设置").font(.system(size: 23, weight: .semibold)); Spacer(); Button("取消") { dismiss() } }
-            ScrollView {
-                VStack(alignment: .leading, spacing: 18) {
-                    GroupBox {
-                        VStack(alignment: .leading, spacing: 12) {
-                            Text("语音识别").font(.headline)
-                            Picker("识别引擎", selection: $draft.engine) {
-                                ForEach(RecognitionEngine.allCases) { Text($0.label).tag($0) }
-                            }.pickerStyle(.segmented)
-                                .disabled(model.isRecording || model.pendingCount > 0 || model.modelLoading)
-                            if draft.engine == .volc {
-                                Label("云端识别：转写时，音频会发送到火山引擎（豆包）。边说边出字，一句说完后由服务端再识别一遍定稿。",
-                                      systemImage: "cloud")
-                                    .font(.caption).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
-                                VStack(alignment: .leading, spacing: 5) {
-                                    Text("豆包语音 API Key").font(.system(size: 11)).foregroundStyle(.secondary)
-                                    SecureField("保存在 ~/.listenflow/keys.json，仅本人可读", text: $volcKey).textFieldStyle(.roundedBorder)
-                                }
-                                field("资源 ID", text: $draft.volcResourceID, prompt: "volc.seedasr.sauc.duration")
-                                Text("小时版填 volc.seedasr.sauc.duration，按送入的音频时长计费；并发版填 volc.seedasr.sauc.concurrent，需要单独开通。只在有人说话时连接和发送音频，静音不计费。")
-                                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                                field("人名、术语（逗号分隔，可选）", text: $draft.hotwords)
-                                Toggle("暂存录音，用于会后「精修全文」", isOn: $draft.keepAudioForRefine)
-                                Text("开启后，发给豆包的那部分音频（有人说话的片段）同时保存在这台 Mac 的 ~/.listenflow/audio。会后点「精修全文」，这些录音会上传到豆包录音文件识别，结合整段上下文重新识别，比实时结果更准；按音频时长另外计费。完成后删除，最长保留 7 天。")
-                                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                                if draft.keepAudioForRefine {
-                                    field("录音文件识别的资源 ID", text: $draft.volcFileResourceID, prompt: "volc.seedasr.auc")
-                                }
-                                Text("识别档位和合并重识别只用于本地模型；豆包自带二遍识别。没有网络时可以切换到本地模型。")
-                                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                            } else {
-                                Picker("模型", selection: $draft.asrModel) {
-                                    Text("Qwen3-ASR 1.7B · 默认").tag("mlx-community/Qwen3-ASR-1.7B-8bit")
-                                    Text("Qwen3-ASR 0.6B · 更轻量").tag("mlx-community/Qwen3-ASR-0.6B-8bit")
-                                }.disabled(model.isRecording || model.pendingCount > 0 || model.modelLoading)
-                                Picker("识别语言", selection: $draft.language) {
-                                    Text("自动识别").tag("")
-                                    Text("中文").tag("Chinese")
-                                    Text("English").tag("English")
-                                }
-                                field("Python 路径", text: $draft.python)
-                                    .disabled(model.isRecording || model.pendingCount > 0 || model.modelLoading)
-                                field("人名、术语（逗号分隔，可选）", text: $draft.hotwords)
-                                Picker("识别档位", selection: $draft.recognitionMode) {
-                                    ForEach(RecognitionMode.allCases) { Text($0.label).tag($0) }
-                                }.pickerStyle(.segmented)
-                                Text(draft.recognitionMode.detail + "。高精度约多用一半算力，错字约再少两到三成。")
-                                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                                Toggle("暂存录音，用于事后「精修全文」", isOn: $draft.keepAudioForRefine)
-                                Text("音频只保存在这台 Mac 的 ~/.listenflow/audio，精修完成后删除，最长保留 7 天。关闭后不保存任何原始音频。")
-                                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                                Text("复用本机模型缓存，模型加载和转写均为离线运行，音频不离开这台 Mac。").font(.caption).foregroundStyle(.secondary)
-                            }
-                        }.padding(12)
-                    }
-                    GroupBox {
-                        VStack(alignment: .leading, spacing: 12) {
-                            Text("刘海灵动岛").font(.headline)
-                            Toggle("在刘海显示实时转写", isOn: $draft.islandEnabled)
-                            Toggle("收起时常亮显示最新一句", isOn: $draft.islandShowLatest).disabled(!draft.islandEnabled)
-                            HStack(spacing: 10) {
-                                Text("宽度")
-                                Slider(value: $draft.islandWidth, in: 480...1100, step: 20)
-                                Text("\(Int(draft.islandWidth)) pt").font(.system(size: 11, design: .monospaced))
-                                    .foregroundStyle(.secondary).frame(width: 52, alignment: .trailing)
-                            }.disabled(!draft.islandEnabled)
-                            HStack {
-                                Button("恢复默认宽度") { draft.islandWidth = Preferences().islandWidth }
-                                    .disabled(!draft.islandEnabled || draft.islandWidth == Preferences().islandWidth)
-                                Button("恢复默认高度") { draft.islandHeight = Preferences().islandHeight }
-                                    .disabled(!draft.islandEnabled || draft.islandHeight == Preferences().islandHeight)
-                            }
-                            Text("鼠标移到刘海处展开，移开后收起；点图钉可固定展开。拖动灵动岛底部的横条可以调整高度，会记住；14 寸屏幕可以把宽度调窄一些。灵动岛不会出现在屏幕共享和截图里。")
-                                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                        }.padding(12)
-                    }
-                    GroupBox {
-                        VStack(alignment: .leading, spacing: 12) {
-                            Text("上下文问答").font(.headline)
-                            field("API Base URL", text: $draft.apiBase, prompt: "https://api.deepseek.com/v1")
-                                .onChange(of: draft.apiBase) { _, _ in if initialized { key = "" } }
-                            field("模型名称", text: $draft.llmModel, prompt: "deepseek-flash")
-                            VStack(alignment: .leading, spacing: 5) {
-                                Text("API Key").font(.system(size: 11)).foregroundStyle(.secondary)
-                                SecureField("保存在 ~/.listenflow/keys.json，仅本人可读", text: $key).textFieldStyle(.roundedBorder)
-                            }
-                            Button("读取此地址已保存的密钥") { key = SecretStore.read(account: draft.apiBase) }.font(.caption)
-                            Text("支持 chat/completions 兼容接口与流式回答。提问时发送当前会话的转写文字和最近问答，音频不会发送给问答服务。").font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                        }.padding(12)
-                    }
-                    HStack {
-                        Text("采集权限由 macOS 管理。麦克风仅在手动开启时请求权限。").font(.caption).foregroundStyle(.secondary)
-                        Spacer()
-                        Button("打开录制权限设置") {
-                            NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!)
-                        }.font(.caption)
-                    }
-                }
-            }
-            if let error { Text(error).font(.caption).foregroundStyle(.red) }
-            HStack {
-                Text("密钥不会出现在项目源码或导出记录里。").font(.caption).foregroundStyle(.secondary)
-                Spacer()
-                Button("保存设置") {
-                    do { try model.applyPreferences(draft, key: key, volcKey: volcKey == volcKeyLoaded ? nil : volcKey); dismiss() }
-                    catch { self.error = error.localizedDescription }
-                }.buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
-            }
-        }.padding(28).frame(width: 650, height: 690).tint(teal)
-            .onAppear { draft = model.preferences; key = SecretStore.read(account: draft.apiBase)
-                // Preview builds take the Doubao key from the environment only.
-                if Bundle.main.bundleIdentifier != "local.ListenFlow.preview" {
-                    volcKeyLoaded = SecretStore.read(account: SecretStore.volcAccount)
-                    volcKey = volcKeyLoaded
-                }
-                DispatchQueue.main.async { initialized = true }
-            }
-    }
-    private func field(_ title: String, text: Binding<String>, prompt: String = "") -> some View {
-        VStack(alignment: .leading, spacing: 5) {
-            Text(title).font(.system(size: 11)).foregroundStyle(.secondary)
-            TextField(prompt, text: text).textFieldStyle(.roundedBorder)
         }
     }
 }
@@ -858,16 +653,247 @@ private struct LiveTailDivider: View {
     var body: some View {
         HStack(spacing: 8) {
             dash
-            Text("以下为实时片段，稍后合并重识别").font(.system(size: 9.5)).foregroundStyle(muted.opacity(0.75)).fixedSize()
+            Text("以下为实时片段，稍后合并重识别").font(.system(size: 10)).foregroundStyle(Palette.muted).fixedSize()
             dash
-        }.padding(.vertical, -8)
+        }.padding(.leading, RowMetrics.textInset)
     }
     private var dash: some View {
-        Line().stroke(muted.opacity(0.35), style: StrokeStyle(lineWidth: 1, dash: [3, 4])).frame(height: 1)
+        Line().stroke(Palette.faint, style: StrokeStyle(lineWidth: 1, dash: [3, 4])).frame(height: 1)
     }
     private struct Line: Shape {
         func path(in rect: CGRect) -> Path {
             Path { $0.move(to: CGPoint(x: 0, y: rect.midY)); $0.addLine(to: CGPoint(x: rect.maxX, y: rect.midY)) }
         }
+    }
+}
+
+/// Nothing said yet: say what will happen and how to begin.
+private struct EmptyTranscript: View {
+    @ObservedObject var model: AppModel
+
+    private var headline: String {
+        if !model.engineReady { return model.usesCloud ? "先填写豆包的 API Key" : model.modelLoading ? "正在准备本地模型" : "本地模型还没有加载" }
+        guard model.isRecording else { return "从一段声音开始" }
+        switch model.activeSource {
+        case .microphone: return "正在听麦克风"
+        case .app: return "正在等 App 里的声音"
+        default: return "正在听电脑上的声音和麦克风"
+        }
+    }
+
+    private var detail: String {
+        let cloud = model.usesCloud
+        if !model.engineReady {
+            return cloud ? "豆包语音识别需要一个 API Key，保存在这台 Mac 的 ~/.listenflow/keys.json。\n没有网络时可以在设置里换成本地模型。"
+                         : "本地模型加载好之后就可以开始；也可以在设置里换成豆包云端识别。"
+        }
+        if model.isRecording {
+            let pace = cloud ? "边说边出字，一句说完后定稿。" : "停顿时更新，连续讲话约每 4 秒更新一次。"
+            switch model.activeSource {
+            case .microphone: return "说话即可，文字会出现在这里。\n" + pace
+            case .app: return "让所选 App 播放声音，文字会出现在这里。\n" + pace
+            default: return "电脑上播放的声音和你说的话都会写在这里。\n" + pace
+            }
+        }
+        let place = cloud ? "音频发送到火山引擎豆包识别；可以在设置里换成本地模型。" : "音频在这台 Mac 上识别。"
+        switch model.source {
+        case .all: return "点「开始转写」，电脑上所有 App 的声音和麦克风一起转成文字。\n" + place
+        case .microphone: return "点「开始转写」，只听这台 Mac 的麦克风，适合线下课堂和线下会议。\n" + place
+        case .app: return "在右上角选好一个 App，再点「开始转写」，只听它的声音。\n" + place
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Image(systemName: model.isRecording ? "waveform" : "waveform.path")
+                .font(.system(size: 30, weight: .light)).foregroundStyle(model.isRecording ? Palette.stream : Palette.faint)
+                .symbolEffect(.variableColor.iterative, isActive: model.isRecording)
+            Text(headline).font(.system(size: 22, weight: .semibold))
+            Text(detail).font(.system(size: 13)).foregroundStyle(Palette.muted).lineSpacing(6)
+                .fixedSize(horizontal: false, vertical: true)
+            if !model.engineReady && model.usesCloud {
+                Button("打开设置") { model.showSettings = true }.controlSize(.large)
+            } else if model.modelLoading {
+                ProgressView().controlSize(.small)
+            } else {
+                VStack(alignment: .leading, spacing: 7) {
+                    shortcut("⌥⌘R", "在任何 App 里开始或暂停转写")
+                    shortcut("⇧⌘J", "截下整个屏幕，按时间存进这场会话")
+                }.padding(.top, 8)
+            }
+        }
+        .frame(maxWidth: 470, alignment: .leading)
+        .padding(.leading, 28 + RowMetrics.textInset).padding(.trailing, 28).padding(.top, 64)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    private func shortcut(_ keys: String, _ meaning: String) -> some View {
+        HStack(spacing: 10) {
+            Text(keys).font(.system(size: 11, weight: .medium)).foregroundStyle(Palette.muted)
+                .padding(.horizontal, 6).frame(height: 20)
+                .background(Palette.ink.opacity(0.06), in: RoundedRectangle(cornerRadius: 5, style: .continuous))
+                .frame(width: 50, alignment: .leading)
+            Text(meaning).font(.system(size: 12)).foregroundStyle(Palette.muted)
+        }
+    }
+}
+
+// MARK: - Organized draft
+
+/// The transcript rewritten as an article by the configured model. Speech is
+/// set in the system sans; the written draft is set in Songti, so the two
+/// readings of a session never look alike.
+private struct DraftPage: View {
+    @ObservedObject var model: AppModel
+
+    private var status: String {
+        guard let organized = model.session.organized else { return "用设置里的大模型把零碎的话连成文章；自动更新约每 30 秒一次" }
+        var parts = [organized.sourceLineIDs.isEmpty ? "已整理图片资料"
+                     : "已整理到 \(SessionStore.timestamp(organized.through, relativeTo: model.session.created))"]
+        if model.session.unorganizedCount > 0 { parts.append("之后还有 \(model.session.unorganizedCount) 句") }
+        if let count = organized.imageIDs?.count, count > 0 { parts.append("参考了 \(count) 张图") }
+        if model.organizationImagesChanged { parts.append("图片选择变了") }
+        if model.organizationStale { parts.append("原文已精修，更新时整篇重写") }
+        return parts.joined(separator: "，")
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 12) {
+                    if model.isOrganizing {
+                        ProgressView().controlSize(.small)
+                        Text("正在整理").font(.system(size: 12)).foregroundStyle(Palette.stream)
+                        Button("停止") { model.cancelOrganization() }.controlSize(.small)
+                    } else {
+                        Button(model.session.organized == nil ? "整理这场会话" : "更新整理稿") { model.organize() }
+                            .buttonStyle(.borderedProminent).controlSize(.small)
+                            .disabled(!model.hasOrganizationContext || model.isImportingImages)
+                    }
+                    Text(status).font(.system(size: 11)).foregroundStyle(Palette.muted).lineLimit(1)
+                    Spacer(minLength: 4)
+                    Toggle("自动更新", isOn: Binding(get: { model.autoOrganize }, set: { model.setAutoOrganize($0) }))
+                        .font(.system(size: 11)).toggleStyle(.switch).controlSize(.mini)
+                        .help("开启后，有新的转写时约每 30 秒更新一次整理稿")
+                }
+                ImageAttachmentPicker(model: model)
+            }
+            .padding(.horizontal, 28).padding(.vertical, 12)
+            Rectangle().fill(Palette.hairline).frame(height: 1)
+            DraftDocument(preview: model.organizationPreview, savedText: model.session.organized?.text ?? "",
+                          isGenerating: model.isOrganizing)
+        }
+    }
+}
+
+private struct DraftDocument: View {
+    @ObservedObject var preview: OrganizationPreview
+    let savedText: String
+    let isGenerating: Bool
+    var body: some View {
+        let text = isGenerating && !preview.text.isEmpty ? preview.text : savedText
+        if text.isEmpty {
+            VStack(alignment: .leading, spacing: 12) {
+                Text(isGenerating ? "正在把碎片连成文章" : "把零碎的话，连起来读")
+                    .font(.custom("Songti SC", size: 24).weight(.semibold))
+                Text("合并断句、补全标点、分好段落，保留原意和时间。\n整理稿由 AI 生成，拿不准的地方请对照原始转写。")
+                    .font(.system(size: 13)).foregroundStyle(Palette.muted).lineSpacing(6)
+            }
+            .padding(.leading, 28 + RowMetrics.textInset).padding(.trailing, 28).padding(.top, 64)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        } else {
+            VStack(alignment: .leading, spacing: 0) {
+                DocumentTextView(text: text).frame(maxWidth: .infinity, maxHeight: .infinity)
+                Text(isGenerating ? "生成中，完成后自动保存" : "AI 整理稿，拿不准的地方请对照原始转写")
+                    .font(.system(size: 10)).foregroundStyle(Palette.muted)
+                    .padding(.leading, 28 + RowMetrics.textInset).padding(.vertical, 9)
+            }
+        }
+    }
+}
+
+/// Native text layout keeps a long streamed document inside the viewport
+/// without rebuilding the window.
+private struct DocumentTextView: NSViewRepresentable {
+    let text: String
+
+    /// The text column keeps a readable width however wide the window is.
+    final class Column: NSTextView {
+        static let inset = NSSize(width: 28 + 44 + 14, height: 22)
+        static let width: CGFloat = 700
+        override func setFrameSize(_ newSize: NSSize) {
+            super.setFrameSize(newSize)
+            textContainer?.containerSize = NSSize(width: max(200, min(newSize.width - Self.inset.width - 28, Self.width)),
+                                                  height: .greatestFiniteMagnitude)
+        }
+    }
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let scroll = NSScrollView()
+        scroll.hasVerticalScroller = true
+        scroll.autohidesScrollers = true
+        scroll.drawsBackground = false
+        let view = Column(frame: NSRect(x: 0, y: 0, width: 600, height: 400))
+        view.isEditable = false
+        view.isSelectable = true
+        view.isRichText = false
+        view.drawsBackground = false
+        view.isVerticallyResizable = true
+        view.isHorizontallyResizable = false
+        view.autoresizingMask = [.width]
+        view.textContainerInset = Column.inset
+        view.textContainer?.widthTracksTextView = false
+        view.textContainer?.lineFragmentPadding = 0
+        view.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        scroll.documentView = view
+        return scroll
+    }
+
+    func updateNSView(_ scroll: NSScrollView, context: Context) {
+        guard let view = scroll.documentView as? NSTextView, view.string != text else { return }
+        let origin = scroll.contentView.bounds.origin
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineSpacing = 9
+        paragraph.paragraphSpacing = 3
+        view.textStorage?.setAttributedString(NSAttributedString(string: text, attributes: [
+            .font: NSFont(name: "Songti SC", size: 16) ?? NSFont.systemFont(ofSize: 15),
+            .foregroundColor: NSColor.labelColor, .paragraphStyle: paragraph
+        ]))
+        scroll.contentView.scroll(to: origin)
+        scroll.reflectScrolledClipView(scroll.contentView)
+    }
+}
+
+// MARK: - Status line
+
+private struct StatusBar: View {
+    @ObservedObject var model: AppModel
+
+    private var saved: String {
+        if model.sessionIsEmpty { return "会话自动保存在这台 Mac" }
+        if model.keepsAudio { return "已自动保存；录音暂存在本机，精修后删除" }
+        return model.session.imageLibrary.isEmpty ? "已自动保存，不保留录音" : "文字和图片已自动保存，不保留录音"
+    }
+
+    var body: some View {
+        HStack(spacing: 16) {
+            Label(model.usesCloud ? "云端识别，音频发送到火山引擎" : "音频只在这台 Mac 上处理",
+                  systemImage: model.usesCloud ? "cloud" : "lock.shield")
+            if model.lastLatency > 0 {
+                Text(String(format: model.usesCloud ? "最近一句 %.1f 秒后定稿" : "最近一段延迟 %.1f 秒", model.lastLatency)).monospacedDigit()
+            }
+            if model.echoDropped > 0 {
+                Text("去掉了 \(model.echoDropped) 句外放回声").help("开着外放时，麦克风会把电脑的声音再录一遍；这些重复的句子不计入转写")
+            }
+            if model.oldestPending > 10 {
+                Label("识别跟不上，正在处理积压", systemImage: "exclamationmark.triangle").foregroundStyle(Palette.warning)
+            }
+            Spacer(minLength: 8)
+            Text(saved)
+        }
+        .font(.system(size: 11)).lineLimit(1)
+        .foregroundStyle(Palette.muted)
+        .padding(.horizontal, 28).frame(height: 30)
+        .overlay(alignment: .top) { Rectangle().fill(Palette.hairline).frame(height: 1) }
     }
 }

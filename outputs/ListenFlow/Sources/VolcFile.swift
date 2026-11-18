@@ -134,16 +134,13 @@ enum VolcRecording {
     /// short silences instead of by meaning: a microphone next to speakers hears
     /// the app and then the user's reply, and those must not become one sentence,
     /// or the echo filter can only keep or drop both.
-    static func submitBody(wav: Data, uid: String, hotwords: [String], splitOnPauses: Bool) -> Data {
+    static func submitBody(wav: Data, uid: String, hotwords: [String], tables: VolcTables = VolcTables(), splitOnPauses: Bool) -> Data {
         var request: [String: Any] = ["model_name": "bigmodel", "enable_itn": true, "enable_punc": true,
                                       "enable_ddc": true, "show_utterances": true]
         if splitOnPauses { request["vad_segment"] = true; request["end_window_size"] = 300 }
         // This interface takes up to 5,000 hot words, far more than anyone types.
-        let words = hotwords.map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }.prefix(1000)
-        if !words.isEmpty,
-           let context = try? JSONSerialization.data(withJSONObject: ["hotwords": words.map { ["word": $0] }]) {
-            request["corpus"] = ["context": String(decoding: context, as: UTF8.self)]
-        }
+        let words = hotwords.map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }.prefix(HotwordStore.limit)
+        if let corpus = tables.corpus(hotwords: Array(words)) { request["corpus"] = corpus }
         let object: [String: Any] = [
             "user": ["uid": uid],
             "audio": ["format": "wav", "codec": "raw", "rate": 16000, "bits": 16, "channel": 1,

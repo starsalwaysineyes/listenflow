@@ -6,7 +6,7 @@
 
 **把会议、网课和线下课堂的声音，在你自己的 Mac 上实时变成文字。**
 
-边听边问，会后一键整理成稿。默认用豆包云端流式识别，边说边出字；也可以切到本地模型，语音不出本机。
+截屏跟着时间存进记录，会后一键整理成稿，你的 agent 能直接读。默认用豆包云端流式识别，边说边出字；也可以切到本地模型，语音不出本机。
 
 [![macOS 15+](https://img.shields.io/badge/macOS-15%2B-000000?logo=apple&logoColor=white)](#安装)
 [![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-M1%20及以后-2f6f5e)](#安装)
@@ -21,7 +21,7 @@
 <br>
 
 <p align="center">
-  <img src="docs/images/main-window.png" alt="听流主窗口：左侧原始转写，按来源标出腾讯会议与麦克风；右侧对当前内容提问，回答整理出要点和待办表格" width="100%">
+  <img src="docs/images/main-window.png" alt="听流主窗口：左侧是历史会话，右侧是转写正文，同一个人连着说的话合成一段，按来源标出电脑声音与麦克风，截屏出现在它发生的时间位置" width="100%">
 </p>
 
 <p align="center"><sub>截图中的会议内容为演示用虚构数据。</sub></p>
@@ -60,8 +60,8 @@
 <tr>
 <td valign="top">
 
-### 💬 边听边问，会后成稿
-随时问「刚才说的截止时间是哪天」，回答带时间戳；可以截屏或粘贴图片一起问。整理稿把碎片化转写合成连贯段落，增量更新，已定稿的部分不会被改写。
+### 📸 截屏跟着时间走，会后成稿
+按 `⇧⌘J`（或点灵动岛上的按钮）截下整个屏幕，图片按时间插在转写中间：这页幻灯片是讲到哪一句时出现的，回看和让 agent 读的时候都一目了然。整理稿把碎片化转写合成连贯段落，增量更新，已定稿的部分不会被改写。
 
 </td>
 <td valign="top">
@@ -72,10 +72,16 @@
 </td>
 </tr>
 <tr>
-<td valign="top" colspan="2">
+<td valign="top">
 
 ### 🤖 让你的 agent 也听得到
-`lstf` 命令让 Claude Code、Codex 这类 agent 读到正在录的这场会和所有历史会话：像读文件一样按行号翻页，可以搜索，也可以对还没精修的会话启动精修。说一句「`lstf --help` 查一下刚才会上定的截止时间」，它读完帮助就知道怎么取。只读，不能替你开始或停止录制。
+`lstf` 命令让 Claude Code、Codex 这类 agent 读到正在录的这场会和所有历史会话：像读文件一样按行号翻页，截屏的图片路径按时间夹在句子中间，可以搜索，也可以对还没精修的会话启动精修。说一句「`lstf --help` 查一下刚才会上定的截止时间」，它读完帮助就知道怎么取。不能替你开始或停止录制。
+
+</td>
+<td valign="top">
+
+### 🔤 热词：人名和术语的正确写法
+把容易被认成同音字的人名、产品名、术语加进热词表，识别时优先往这些词上靠。在设置里增删，或者让 agent 用 `lstf hotword add` 当场加上；录制中改了，从下一段讲话起生效。也可以填火山引擎控制台里热词表、替换词表的 ID。
 
 </td>
 </tr>
@@ -89,6 +95,7 @@
 
 - 收起时什么都不显示，也不挡鼠标；可选「收起时常亮显示最新一句」。
 - 最新一句最亮，越早越淡；虚线以下是还没合并重识别的实时片段。
+- 展开后右上角有截屏按钮（下图是加这个按钮之前截的）。
 - 宽度可在设置里调（480–1100 pt），14 寸、16 寸屏都合适；没有刘海的屏幕显示在顶部正中。
 
 ## 它是怎么工作的
@@ -106,10 +113,10 @@ flowchart LR
     C -.->|"豆包：讲话片段暂存本机"| R[("豆包录音文件识别")]
     R -.->|"会后精修全文"| E
     E --> G["灵动岛"]
-    E --> H["上下文问答"]
+    S["截屏 ⇧⌘J"] -->|"按时间插入"| E
+    E --> H["lstf：agent 按行读取"]
     E --> I["整理稿 · Markdown 导出"]
-    H -.->|"仅文字"| J[("你配置的 LLM API")]
-    I -.->|"仅文字"| J
+    I -.->|"文字和选中的图片"| J[("你配置的 LLM API")]
 ```
 
 ### 实测
@@ -148,11 +155,11 @@ flowchart LR
    xattr -dr com.apple.quarantine /Applications/ListenFlow.app
    ```
 
-4. 打开听流 →「模型与 API 设置」，选识别引擎：
+4. 打开听流 →「设置」（`⌘,`），选识别引擎：
    - **豆包（云端，默认）**：填入火山引擎豆包语音的 API Key；资源 ID 默认是流式识别 2.0 小时版 `volc.seedasr.sauc.duration`，按送入的音频时长计费。会后「精修全文」用的是录音文件识别（`volc.seedasr.auc`，同一个 Key，另外计费），两项都要在控制台开通。
    - **本地模型**：把 Python 路径填成 `~/listenflow-venv/bin/python` 的完整路径，等左下角出现「本地模型已就绪」。
 5. 第一次转写时按提示允许「屏幕与系统音频录制」和「麦克风」。
-6. 想用问答和整理稿，再填一个兼容 `chat/completions` 的 API（默认 DeepSeek）。只做转写可以不填。
+6. 想用整理稿，再填一个兼容 `chat/completions` 的 API（默认 DeepSeek）。只做转写可以不填。
 7. （可选）想让 agent 读转写，把命令行工具链接到 PATH 里：`ln -s /Applications/ListenFlow.app/Contents/MacOS/lstf ~/.local/bin/lstf`，然后 `lstf --help`。
 
 ## 使用
@@ -161,16 +168,15 @@ flowchart LR
 | --- | --- |
 | 腾讯会议、网课 | 用默认的「全局」，直接开始转写；只想听一个 App 时选「指定 App」 |
 | 线下课堂、线下会议 | 来源选「我的麦克风」，`⌥⌘R` 开始 |
-| 想记下板书或 PPT | `⌥⌘S` 拉框截图，`⌘K` 带着截图直接提问 |
+| 想记下板书或 PPT | `⇧⌘J` 截下整个屏幕，图片按时间存进这场会话 |
+| 人名、术语总是识别错 | 设置最上面的热词表里加上正确的写法 |
 | 会后 | 「精修全文」重识别 →「整理稿」成稿 → 导出 Markdown |
 | 让 agent 用会议内容 | 对它说「`lstf --help`，然后……」；常用的是 `lstf read --minutes 5`、`lstf list`、`lstf search 关键词` |
 
 | 快捷键 | 作用 |
 | --- | --- |
 | `⌥⌘R` | 全局：开始 / 暂停转写 |
-| `⌥⌘S` | 全局：拉框截屏，加入当前提问 |
-| `⌘K` | 唤起窗口，光标进入提问框 |
-| `⌘Return` | 发送问题（`Shift-Return` 换行） |
+| `⇧⌘J` | 全局：截下鼠标所在的整个屏幕，存进当前会话 |
 | `⌘N` / `⌘,` | 新会话 / 设置 |
 
 关掉主窗口不会停止录音，菜单栏图标常驻，本身就是录制状态指示。
@@ -181,7 +187,9 @@ flowchart LR
   - 豆包（默认）：有人说话时，音频实时发送到火山引擎识别；静音不发送。「暂存录音」开启时（默认），发出去的这部分音频同时保存在本机，会后点「精修全文」会再上传一次；精修完成后删除，最长保留 7 天。关闭后不在本机保存音频。
   - 本地模型：只在本机识别，音频不离开这台 Mac。「暂存录音」开启时会在本机保存 16 kHz 音频用于精修，精修完成后删除，最长保留 7 天。
   - 暂存的录音都在 `~/.listenflow/audio/`，只有本人可读，可以随时手动删除。
-- **文字**：会话保存在 `~/Library/Application Support/ListenFlow/`；只有提问和整理时才发送给你配置的 API。
+- **文字**：会话保存在 `~/Library/Application Support/ListenFlow/`；只有整理时才发送给你配置的 API。
+- **截屏**：只保存在本机（同一目录下的 `Images/<会话 ID>/`，只有本人可读），截的是整个屏幕，听流自己的窗口不在其中。只有你把某张图选作整理稿的参考图片时，它才随整理发送给你配置的 API。
+- **热词**：保存在 `~/.listenflow/hotwords.txt`。豆包引擎下随识别请求发送到火山引擎。
 - **密钥**：保存在 `~/.listenflow/keys.json`，明文，只有本人可读（文件权限 0600）。不使用钥匙串；旧版存在钥匙串里的密钥会在第一次用到时移到这个文件。
 - **灵动岛**：不进入屏幕共享和截图。
 
@@ -209,14 +217,15 @@ outputs/ListenFlow/
 │   ├── VolcFile.swift          豆包录音文件识别：会后把暂存录音分段上传，替换实时结果
 │   ├── ASRBridge.swift         与本地 Python 识别进程的 JSON lines 管道
 │   ├── NotchIsland.swift       刘海灵动岛
-│   ├── LLMClient.swift         上下文快照、流式问答
-│   ├── MarkdownDocument.swift  回答的 Markdown 解析与渲染
-│   ├── Storage.swift           设置、密钥文件、会话与导出
+│   ├── ScreenshotCapture.swift 截下整个屏幕（不含听流自己的窗口）
+│   ├── ImageAttachments.swift  截屏和图片的存储
+│   ├── LLMClient.swift         整理稿的模型请求
+│   ├── Storage.swift           设置、密钥文件、热词表、会话、后台存盘、正文合段与导出
 │   ├── AgentBridge.swift       app 与 lstf 之间的状态文件和请求文件
-│   └── AppModel.swift / ContentView.swift
+│   └── AppModel.swift / ContentView.swift / SettingsView.swift
 ├── CLI/                        lstf 命令：给 agent 读转写用（随 app 一起构建，装在 app 包里）
 ├── Backend/asr_worker.py       常驻 MLX 模型
-├── Tests/                      核心逻辑、Markdown、剪贴板、整理与识别进程测试
+├── Tests/                      核心逻辑、整理与识别进程测试
 └── build.sh
 work/asr-lab/                   切分与精修方案的对比实验脚本
 ```
@@ -231,6 +240,7 @@ work/asr-lab/                   切分与精修方案的对比实验脚本
 - 远场收音时讲话只比底噪高约 10 dB，错字仍多于近距离收音；麦克风靠近说话人最有效。
 - 准确率数据来自合成语音加底噪；多人插话、背景音乐、口音等情况还需要更多实测。
 - 豆包引擎需要网络和可用的账户额度；连续几小时的真实课堂、两路同时长时间识别还没有实测。豆包的「精修全文」最长只用 4.5 分钟的录音测过。
+- 0.11.0 的新主窗口、截屏和热词刚做完：存储和 `lstf` 的部分有测试，真实截屏、多显示器、录制中途改热词的效果还没有实测，见[详细手册](outputs/ListenFlow/README.md#当前边界)。
 - 目前只在 16 寸 M1 Max MacBook Pro 上实测过。
 
 ## 致谢
@@ -238,4 +248,4 @@ work/asr-lab/                   切分与精修方案的对比实验脚本
 - [豆包流式语音识别](https://www.volcengine.com/docs/6561/1354869)与[录音文件识别](https://www.volcengine.com/docs/6561/1354868)（火山引擎）：默认的云端识别与会后精修
 - [Qwen3-ASR](https://huggingface.co/Qwen) 与 [mlx-audio](https://github.com/Blaizzy/mlx-audio)：本地语音识别
 - [Notchly](https://github.com/lglglglglg/Notchly)：刘海灵动岛的交互灵感
-- [DeepSeek](https://api-docs.deepseek.com/)：默认的问答与整理接口
+- [DeepSeek](https://api-docs.deepseek.com/)：默认的整理接口

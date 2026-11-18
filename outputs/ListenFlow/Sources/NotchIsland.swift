@@ -117,6 +117,8 @@ final class NotchIslandController {
             poll = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
                 MainActor.assumeIsolated { self?.trackMouse() }
             }
+            // Lets the system line this up with other wake-ups; hovering does not need exact timing.
+            poll?.tolerance = 0.03
         }
 
         let active = model.isRecording || model.pendingCount > 0
@@ -279,6 +281,7 @@ struct NotchIslandView: View {
             Spacer(minLength: state.notch.width + 20)
             HStack(spacing: 12) {
                 if model.isRecording { IslandLevel(levels: levels) }
+                IslandShotButton(model: model)
                 iconButton(model.islandPinned ? "pin.fill" : "pin", help: model.islandPinned ? "取消固定，移开鼠标后收起" : "固定展开") {
                     model.islandPinned.toggle()
                 }.foregroundStyle(model.islandPinned ? Color(red: 0.35, green: 0.85, blue: 0.75) : .white.opacity(0.8))
@@ -380,6 +383,26 @@ struct NotchIslandView: View {
         VStack(spacing: 0) {
             Color.clear.frame(height: state.notch.height)
             IslandCompactLine(preview: model.livePreview, last: model.session.lines.last, tags: showSources)
+        }
+    }
+}
+
+/// Keeps the whole screen with the session. The island itself never appears in
+/// the picture: it is excluded from every capture.
+private struct IslandShotButton: View {
+    @ObservedObject var model: AppModel
+    @State private var confirmed = false
+    var body: some View {
+        Button { model.captureScreenshot() } label: {
+            Image(systemName: confirmed ? "checkmark" : "camera.viewfinder")
+                .font(.system(size: 12, weight: .medium)).frame(width: 18, height: 18)
+                .foregroundStyle(confirmed ? Color(red: 0.35, green: 0.85, blue: 0.75) : .white.opacity(0.9))
+        }
+        .buttonStyle(.plain).disabled(model.isCapturingShot)
+        .help("截下整个屏幕，按时间存进这场会话（⇧⌘J）")
+        .onChange(of: model.shotsTaken) { _, _ in
+            confirmed = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) { confirmed = false }
         }
     }
 }

@@ -40,7 +40,7 @@ final class GlobalHotKey {
 
     /// ⌥⌘R — mirrors the in-window ⌘R.
     static let toggleRecordingID: UInt32 = 1
-    /// ⌥⌘S — grab a screen region into the pending question or organization.
+    /// ⇧⌘J — keep the whole screen with the session, as it is right now.
     static let screenshotID: UInt32 = 2
 
     @discardableResult
@@ -55,7 +55,7 @@ final class GlobalHotKey {
     }
 
     static func screenshot(action: @escaping () -> Void) -> GlobalHotKey? {
-        register(keyCode: UInt32(kVK_ANSI_S), modifiers: UInt32(optionKey | cmdKey),
+        register(keyCode: UInt32(kVK_ANSI_J), modifiers: UInt32(shiftKey | cmdKey),
                  identifier: screenshotID, action: action)
     }
 

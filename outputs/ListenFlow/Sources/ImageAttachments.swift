@@ -10,8 +10,16 @@ struct ImageAttachment: Identifiable, Codable, Sendable {
     let width: Int
     let height: Int
     let byteCount: Int
+    /// For a screenshot, the moment it was taken.
     let addedAt: Date
+    /// File name inside the session's image folder; nil for images stored
+    /// before 0.11.0, which are named after their id.
+    var file: String? = nil
+    /// A full-screen capture taken during the session, as opposed to a picture
+    /// the user added as reference material.
+    var shot: Bool? = nil
     var label: String { "图片\(number)" }
+    var isShot: Bool { shot == true }
 }
 
 enum ImageImportSource: Sendable {
@@ -23,13 +31,39 @@ enum ImageAttachmentStore {
     static let maxSelected = 6
     static let maxInputBytes = 32 * 1024 * 1024
     static let maxStoredBytes = 4 * 1024 * 1024
-    static var root: URL {
-        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("ListenFlow/Images", isDirectory: true)
-    }
+    /// Beside the sessions, so tests and `lstf` that point the sessions
+    /// somewhere else find the pictures there too.
+    static var root: URL { SessionStore.folder.deletingLastPathComponent().appendingPathComponent("Images", isDirectory: true) }
     static func folder(for sessionID: UUID) -> URL { root.appendingPathComponent(sessionID.uuidString, isDirectory: true) }
     static func url(for image: ImageAttachment, sessionID: UUID) -> URL {
-        folder(for: sessionID).appendingPathComponent(image.id.uuidString + ".jpg")
+        folder(for: sessionID).appendingPathComponent(image.file ?? image.id.uuidString + ".jpg")
+    }
+
+    /// Longest edge of a stored screenshot, in pixels: enough to read slide
+    /// text, a fraction of a Retina screen's full size.
+    static let shotEdge = 2560
+
+    /// `shot-20261118-212530.jpg`, local time: a plain listing of the folder is
+    /// already in the order things happened.
+    static func shotFileName(_ date: Date, zone: TimeZone = .current) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = zone
+        formatter.dateFormat = "yyyyMMdd-HHmmss"
+        return "shot-\(formatter.string(from: date)).jpg"
+    }
+
+    /// Keep a full-screen capture with the session, named after when it was taken.
+    static func storeShot(_ image: CGImage, at date: Date, sessionID: UUID, number: Int) throws -> ImageAttachment {
+        var name = shotFileName(date)
+        // Two captures within the same second must not overwrite each other.
+        var suffix = 2
+        while FileManager.default.fileExists(atPath: folder(for: sessionID).appendingPathComponent(name).path) {
+            name = shotFileName(date).replacingOccurrences(of: ".jpg", with: "-\(suffix).jpg")
+            suffix += 1
+        }
+        return try store(image, name: "截屏", sessionID: sessionID, number: number, qualities: [0.8, 0.65, 0.5],
+                         addedAt: date, file: name, shot: true)
     }
 
     /// Decode the real file format, apply orientation, bound dimensions, and omit source metadata.
@@ -81,8 +115,14 @@ enum ImageAttachmentStore {
         canvas.fill(CGRect(x: 0, y: 0, width: image.width, height: image.height))
         canvas.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
         guard let normalized = canvas.makeImage() else { throw CaptureFailure.message("图片处理失败。") }
+        return try store(normalized, name: name, sessionID: sessionID, number: number, qualities: [0.9, 0.75, 0.6],
+                         addedAt: Date(), file: nil, shot: nil)
+    }
+
+    private static func store(_ normalized: CGImage, name: String, sessionID: UUID, number: Int, qualities: [Double],
+                              addedAt: Date, file: String?, shot: Bool?) throws -> ImageAttachment {
         var jpeg: Data?
-        for quality in [0.9, 0.75, 0.6] {
+        for quality in qualities {
             let buffer = NSMutableData()
             guard let destination = CGImageDestinationCreateWithData(buffer, UTType.jpeg.identifier as CFString, 1, nil) else { continue }
             CGImageDestinationAddImage(destination, normalized, [kCGImageDestinationLossyCompressionQuality: quality] as CFDictionary)
@@ -90,7 +130,7 @@ enum ImageAttachmentStore {
         }
         guard let jpeg else { throw CaptureFailure.message("\(name)：压缩后仍过大，请先裁剪再添加。") }
         let attachment = ImageAttachment(id: UUID(), number: number, name: name,
-            width: image.width, height: image.height, byteCount: jpeg.count, addedAt: Date())
+            width: normalized.width, height: normalized.height, byteCount: jpeg.count, addedAt: addedAt, file: file, shot: shot)
         let directory = folder(for: sessionID)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         let output = url(for: attachment, sessionID: sessionID)

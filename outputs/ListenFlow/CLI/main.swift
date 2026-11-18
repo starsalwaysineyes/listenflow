@@ -106,6 +106,12 @@ enum Tool {
                 var object: [String: Any] = [
                     "session": Lstf.json(item), "offset": range.lowerBound + 1, "count": range.count, "total": session.lines.count,
                     "lines": range.map { Lstf.json(session.lines[$0], number: $0 + 1, created: session.created) }]
+                let pictures = Lstf.images(session, in: range)
+                if !pictures.isEmpty {
+                    object["images"] = pictures.keys.sorted().flatMap { slot in
+                        pictures[slot]!.map { Lstf.json($0, session: session, beforeLine: slot + 1) }
+                    }
+                }
                 if range.upperBound < session.lines.count || item.recording { object["nextOffset"] = range.upperBound + 1 }
                 if let note = picked.note { object["note"] = note }
                 emit(object)
@@ -142,6 +148,29 @@ enum Tool {
             }
             print("\n— \(found.hits.count) 处" + (found.more ? "，还有更多：加 --limit 或用 --session 缩小范围。" : "。")
                   + "看上下文：lstf read <会话ID> --offset <行号> --limit 20")
+
+        case let .hotwords(json):
+            let words = HotwordStore.load()
+            if json {
+                let live = HotwordStore.live(words).count
+                emit(["file": HotwordStore.file.path, "count": words.count, "usedLive": live,
+                      "hotwords": words.enumerated().map { ["word": $0.element, "live": $0.offset < live] as [String: Any] }])
+                return
+            }
+            print(Lstf.hotwordList(words), terminator: "")
+
+        case let .addHotwords(words):
+            let change: HotwordStore.Change
+            do { change = try HotwordStore.add(words) }
+            catch { throw LstfError(message: "热词没有保存下来：\(error.localizedDescription)") }
+            print(Lstf.hotwordResult(change, adding: true, recording: state?.recording == true))
+            if change.changed.isEmpty && !change.refused.isEmpty { exit(1) }
+
+        case let .deleteHotwords(words):
+            let change: HotwordStore.Change
+            do { change = try HotwordStore.remove(words) }
+            catch { throw LstfError(message: "热词没有保存下来：\(error.localizedDescription)") }
+            print(Lstf.hotwordResult(change, adding: false, recording: state?.recording == true))
 
         case let .refine(selector, wait):
             let picked = try Lstf.resolve(selector, sessions: SessionStore.all(), open: state?.sessionID, running: state != nil)
@@ -195,6 +224,7 @@ if let home = ProcessInfo.processInfo.environment["LSTF_HOME"], !home.isEmpty {
     let root = URL(fileURLWithPath: home, isDirectory: true)
     SessionStore.folderOverride = root.appendingPathComponent("Sessions", isDirectory: true)
     AudioStore.rootOverride = root.appendingPathComponent("audio", isDirectory: true)
+    HotwordStore.fileOverride = root.appendingPathComponent("hotwords.txt")
 }
 do { try Tool.run(try Lstf.parse(Array(CommandLine.arguments.dropFirst()))) }
 catch let error as LstfError { Tool.fail(error) }

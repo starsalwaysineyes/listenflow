@@ -129,20 +129,13 @@ enum VolcFrame {
     /// The first frame of a connection. `enable_nonstream` adds the service's own
     /// second, more accurate pass per sentence; only that pass marks a sentence
     /// `definite`. Hot words ride along as request context.
-    static func configuration(uid: String, hotwords: [String], endWindowMS: Int = 1000) -> Data {
+    static func configuration(uid: String, hotwords: [String], tables: VolcTables = VolcTables(), endWindowMS: Int = 1000) -> Data {
         var request: [String: Any] = [
             "model_name": "bigmodel", "enable_nonstream": true, "show_utterances": true, "enable_itn": true,
             "enable_punc": true, "enable_ddc": true, "end_window_size": endWindowMS, "result_type": "single"]
         // The streaming interface takes at most about 100 tokens of hot words.
-        var budget = 80
-        let words = hotwords.map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }.filter {
-            budget -= $0.count
-            return budget >= 0
-        }
-        if !words.isEmpty,
-           let context = try? JSONSerialization.data(withJSONObject: ["hotwords": words.map { ["word": $0] }]) {
-            request["corpus"] = ["context": String(decoding: context, as: UTF8.self)]
-        }
+        let words = HotwordStore.live(hotwords.map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty })
+        if let corpus = tables.corpus(hotwords: words) { request["corpus"] = corpus }
         let object: [String: Any] = [
             "user": ["uid": uid],
             "audio": ["format": "pcm", "codec": "raw", "rate": 16000, "bits": 16, "channel": 1],
@@ -315,5 +308,26 @@ struct SpeechGate {
         }
         carry.removeFirst(offset)
         return (any, recent.filter { $0 }.count >= 3)
+    }
+}
+
+/// Tables kept in the Volcengine console and named in a request by ID: hot
+/// words, and replacements applied to the finished text. Empty means unused.
+struct VolcTables: Equatable, Sendable {
+    var boosting = ""
+    var correct = ""
+
+    /// The request's `corpus`: hot words sent along (they take precedence over
+    /// a table's), and whichever tables are set. Nil when there is nothing.
+    func corpus(hotwords: [String]) -> [String: Any]? {
+        var corpus: [String: Any] = [:]
+        if !hotwords.isEmpty,
+           let context = try? JSONSerialization.data(withJSONObject: ["hotwords": hotwords.map { ["word": $0] }]) {
+            corpus["context"] = String(decoding: context, as: UTF8.self)
+        }
+        let boostingID = boosting.trimmingCharacters(in: .whitespaces), correctID = correct.trimmingCharacters(in: .whitespaces)
+        if !boostingID.isEmpty { corpus["boosting_table_id"] = boostingID }
+        if !correctID.isEmpty { corpus["correct_table_id"] = correctID }
+        return corpus.isEmpty ? nil : corpus
     }
 }

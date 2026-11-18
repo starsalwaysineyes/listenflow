@@ -11,7 +11,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     static let headless: Bool = {
         let env = ProcessInfo.processInfo.environment
         return Bundle.main.bundleIdentifier == "local.ListenFlow.preview"
-            && (env["LISTENFLOW_REPLAY"] != nil || env["LISTENFLOW_PREVIEW_SNAPSHOT"] != nil)
+            && (env["LISTENFLOW_REPLAY"] != nil || env["LISTENFLOW_PREVIEW_SNAPSHOT"] != nil
+                || env["LISTENFLOW_PREVIEW_SCROLLCHECK"] != nil)
     }()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -29,16 +30,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
         // Both shortcuts work from any app, so a class or meeting can be captured
-        // and queried without switching back to the ListenFlow window first.
+        // without switching back to the ListenFlow window first.
         var keys: [GlobalHotKey] = []
         if let key = GlobalHotKey.toggleRecording(action: { [weak self] in
             Task { @MainActor in await self?.model?.toggleRecording() }
         }) { keys.append(key) }
         if let key = GlobalHotKey.screenshot(action: { [weak self] in
-            Task { @MainActor in
-                guard let model = self?.model else { return }
-                model.captureScreenshot(forOrganization: model.showOrganized)
-            }
+            Task { @MainActor in self?.model?.captureScreenshot() }
         }) { keys.append(key) }
         hotKeys = keys
     }
@@ -80,7 +78,7 @@ struct ListenFlowApp: App {
         WindowGroup("听流 · ListenFlow") {
             ContentView(model: model).onAppear { delegate.model = model }
         }
-        .defaultSize(width: 1220, height: 800)
+        .defaultSize(width: 1080, height: 740)
         .defaultLaunchBehavior(AppDelegate.headless ? .suppressed : .automatic)
         .windowStyle(.hiddenTitleBar)
         .commands {
@@ -91,13 +89,9 @@ struct ListenFlowApp: App {
                 Button(model.isRecording ? "暂停转写" : "开始转写") {
                     Task { await model.toggleRecording() }
                 }.keyboardShortcut("r").disabled(!model.canToggleRecording)
-                Divider()
-                Button("随时提问…") { model.showMainWindow(focusQuestion: true) }
-                    .keyboardShortcut("k")
-                    .disabled(!model.hasAskContext)
             }
             CommandGroup(replacing: .appSettings) {
-                Button("模型与 API 设置…") { model.showSettings = true }.keyboardShortcut(",")
+                Button("设置…") { model.showSettings = true }.keyboardShortcut(",")
             }
         }
 
@@ -112,7 +106,7 @@ struct ListenFlowApp: App {
     @ViewBuilder
     private var menuContent: some View {
         if model.isRecording {
-            Text("正在转写 · \(model.session.lines.count) 段")
+            Text("正在转写，已有 \(model.session.lines.count) 句")
             if model.pendingCount > 0 && !model.usesCloud { Text("识别中 \(model.pendingCount) 段") }
         } else {
             Text(model.engineReady ? "已就绪，未在转写" : model.engineStatus)
@@ -121,16 +115,14 @@ struct ListenFlowApp: App {
         Button(model.isRecording ? "暂停转写（⌥⌘R）" : "开始转写（⌥⌘R）") {
             Task { await model.toggleRecording() }
         }.disabled(!model.canToggleRecording)
-        Button("随时提问…（⌘K）") { model.showMainWindow(focusQuestion: true) }
-            .disabled(!model.hasAskContext)
-        Button("截取屏幕加入提问（⌥⌘S）") { model.captureScreenshot() }
-            .disabled(model.isAsking || model.isImportingImages)
+        Button("截屏，存进这场会话（⇧⌘J）") { model.captureScreenshot() }
+            .disabled(model.isCapturingShot)
         Button("打开听流窗口") { model.showMainWindow() }
         if model.preferences.islandEnabled {
             Button(model.islandPinned ? "取消固定灵动岛" : "固定展开灵动岛") { model.islandPinned.toggle() }
         }
         Divider()
-        Button("模型与 API 设置…") { model.showSettings = true; model.showMainWindow() }
+        Button("设置…") { model.showSettings = true; model.showMainWindow() }
         Button("退出听流") {
             // Stop capture and persist before terminating, so no session is lost.
             Task { @MainActor in

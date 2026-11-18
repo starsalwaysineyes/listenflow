@@ -63,7 +63,13 @@ enum AudioStore {
         }
     }
 
-    private static func write(_ data: Data, to url: URL, at position: UInt64?) throws {
+    /// Files being appended to stay open. A recording hands over a piece of audio
+    /// about 70 times a second; opening and closing the file for each one cost
+    /// 112 µs a piece (measured), nearly all of it in the open and close.
+    nonisolated(unsafe) private static var handles: [String: FileHandle] = [:]   // guarded by queue
+
+    private static func handle(_ url: URL) throws -> FileHandle {
+        if let open = handles[url.path] { return open }
         let fm = FileManager.default
         try fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true,
                                attributes: [.posixPermissions: 0o700])
@@ -71,10 +77,35 @@ enum AudioStore {
             fm.createFile(atPath: url.path, contents: nil, attributes: [.posixPermissions: 0o600])
         }
         let handle = try FileHandle(forWritingTo: url)
-        defer { try? handle.close() }
-        if let position { try handle.seek(toOffset: position) } else { try handle.seekToEnd() }
-        try handle.write(contentsOf: data)
+        handles[url.path] = handle
+        return handle
     }
+
+    private static func write(_ data: Data, to url: URL, at position: UInt64?) throws {
+        let handle = try handle(url)
+        do {
+            if let position { try handle.seek(toOffset: position) } else { try handle.seekToEnd() }
+            try handle.write(contentsOf: data)
+        } catch {
+            // Not to be trusted again; the next write opens the file afresh.
+            try? handle.close()
+            handles[url.path] = nil
+            throw error
+        }
+    }
+
+    /// Call on `queue`. Closes what is open under `prefix` (everything when nil);
+    /// a file must be closed before it is deleted, or later writes would go to
+    /// a file that no longer has a name.
+    private static func closeHandles(under prefix: String? = nil) {
+        for (path, handle) in handles where prefix.map(path.hasPrefix) ?? true {
+            try? handle.close()
+            handles[path] = nil
+        }
+    }
+
+    /// Recording has stopped: nothing more is coming, so let the files go.
+    static func release() { queue.sync { closeHandles() } }
 
     // MARK: Cloud engine
     //
@@ -92,7 +123,12 @@ enum AudioStore {
     /// 16-bit PCM as it goes to the service; `spanStart` is set on the first
     /// piece of a new stretch of speech.
     static func appendStream(_ pcm: Data, session: UUID, source: String, spanStart: Date?) {
-        let url = streamFile(session: session, source: source)
+        appendStream(pcm, to: streamFile(session: session, source: source), spanStart: spanStart)
+    }
+
+    /// For a caller that appends many times: `url` is `streamFile(session:source:)`,
+    /// worked out once. Building that path was half the cost of an append.
+    static func appendStream(_ pcm: Data, to url: URL, spanStart: Date?) {
         queue.sync {
             let offset = lengths[url.path] ?? currentLength(url)
             lengths[url.path] = offset + pcm.count / 2
@@ -140,6 +176,7 @@ enum AudioStore {
         queue.sync {
             let fm = FileManager.default
             let dir = folder(session)
+            closeHandles(under: dir.path)
             // By prefix, not by listed URL: a listing may spell the path differently.
             lengths = lengths.filter { !($0.key.hasPrefix(dir.path) && $0.key.hasSuffix(".stream.pcm")) }
             for url in streamFiles(session) {
@@ -160,6 +197,7 @@ enum AudioStore {
         queue.sync {
             let fm = FileManager.default
             let dir = folder(session)
+            closeHandles(under: dir.path)
             lengths = lengths.filter { !($0.key.hasPrefix(dir.path) && !$0.key.hasSuffix(".stream.pcm")) }
             for url in (try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? []
             where url.pathExtension == "pcm" && !url.lastPathComponent.hasSuffix(".stream.pcm") {
@@ -191,6 +229,7 @@ enum AudioStore {
     static func delete(_ session: UUID) {
         queue.sync {
             let dir = folder(session)
+            closeHandles(under: dir.path)
             lengths = lengths.filter { !$0.key.hasPrefix(dir.path) }
             try? FileManager.default.removeItem(at: dir)
         }

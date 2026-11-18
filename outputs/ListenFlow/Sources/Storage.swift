@@ -40,9 +40,16 @@ struct Preferences: Codable {
     var volcResourceID = "volc.seedasr.sauc.duration"
     /// Doubao recording-file recognition, used to refine a finished session.
     var volcFileResourceID = "volc.seedasr.auc"
+    /// Tables made in the Volcengine console, by ID; empty when not used. The
+    /// replacement table rewrites one spelling as another after recognition,
+    /// which only a console table can do.
+    var volcBoostingTableID = ""
+    var volcCorrectTableID = ""
     var python = "/Users/aurora/Desktop/workspace/asr-realtime-lab/.venv/bin/python"
     var asrModel = "mlx-community/Qwen3-ASR-1.7B-8bit"
     var language = ""
+    /// Where hot words were kept up to 0.10.1; they now live in a file of their
+    /// own (`HotwordStore`), and this is only read once to move them there.
     var hotwords = ""
     var apiBase = "https://api.deepseek.com"
     var llmModel = "deepseek-flash"
@@ -71,6 +78,8 @@ struct Preferences: Codable {
         engine = (try? c.decodeIfPresent(RecognitionEngine.self, forKey: .engine)) ?? d.engine
         volcResourceID = try c.decodeIfPresent(String.self, forKey: .volcResourceID) ?? d.volcResourceID
         volcFileResourceID = try c.decodeIfPresent(String.self, forKey: .volcFileResourceID) ?? d.volcFileResourceID
+        volcBoostingTableID = try c.decodeIfPresent(String.self, forKey: .volcBoostingTableID) ?? d.volcBoostingTableID
+        volcCorrectTableID = try c.decodeIfPresent(String.self, forKey: .volcCorrectTableID) ?? d.volcCorrectTableID
         python = try c.decodeIfPresent(String.self, forKey: .python) ?? d.python
         asrModel = try c.decodeIfPresent(String.self, forKey: .asrModel) ?? d.asrModel
         language = try c.decodeIfPresent(String.self, forKey: .language) ?? d.language
@@ -118,7 +127,7 @@ enum ListenFlowHome {
 }
 
 /// API keys, in `~/.listenflow/keys.json` (mode 0600): one entry per account —
-/// the API address for question answering, `volcengine-asr` for Doubao speech.
+/// the API address of the model that writes the organized draft, `volcengine-asr` for Doubao speech.
 /// Up to 0.8.0 they were in the Keychain. Nothing is stored there any more: a
 /// key found there is moved to the file the first time it is asked for.
 enum SecretStore {
@@ -195,6 +204,104 @@ enum SecretStore {
         guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
               let data = result as? Data else { return "" }
         return String(data: data, encoding: .utf8) ?? ""
+    }
+}
+
+/// Names and terms the recognizer should expect — people, products, jargon —
+/// in `~/.listenflow/hotwords.txt`, one to a line. The app and the `lstf` tool
+/// both read and change this file, so an agent that notices a name coming out
+/// wrong can add it while the session is still running.
+///
+/// Order matters. Doubao's streaming interface takes about 100 tokens of hot
+/// words and drops the rest from the end, so live recognition only ever sees
+/// the top of the list; refining a session from its recording uses all of it.
+enum HotwordStore {
+    /// Tests, and `lstf` when pointed at a folder of its own.
+    nonisolated(unsafe) static var fileOverride: URL?
+    static var file: URL { fileOverride ?? ListenFlowHome.root.appendingPathComponent("hotwords.txt") }
+    /// The recording interface takes 5,000; nobody keeps that many by hand.
+    static let limit = 1000
+    static let maxLength = 40
+    private static let lock = NSLock()
+
+    /// One term per entry out of whatever was typed: split on line breaks and
+    /// commas, trimmed, with repeats dropped (ignoring case).
+    static func terms(_ text: String) -> [String] { unique(text.split(whereSeparator: { $0 == "," || $0 == "，" || $0.isNewline }).map(String.init)) }
+
+    private static func unique(_ words: [String]) -> [String] {
+        var seen = Set<String>(), out: [String] = []
+        for word in words {
+            let clean = word.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+            guard !clean.isEmpty, seen.insert(clean.lowercased()).inserted else { continue }
+            out.append(clean)
+        }
+        return out
+    }
+
+    static func load() -> [String] {
+        lock.withLock { ((try? String(contentsOf: file, encoding: .utf8)).map(terms) ?? []) }
+    }
+
+    /// When the file last changed; nil when there is none.
+    static func modified() -> Date? {
+        (try? FileManager.default.attributesOfItem(atPath: file.path))?[.modificationDate] as? Date
+    }
+
+    private static func write(_ words: [String]) throws {
+        try ListenFlowHome.ensure(file.deletingLastPathComponent())
+        try (words.joined(separator: "\n") + (words.isEmpty ? "" : "\n")).write(to: file, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+    }
+
+    static func save(_ words: [String]) throws { try lock.withLock { try write(unique(words)) } }
+
+    struct Change: Equatable {
+        /// Added, or removed.
+        var changed: [String] = []
+        /// Already there, or not there to remove.
+        var unchanged: [String] = []
+        /// Not usable as a hot word, with the reason.
+        var refused: [String] = []
+        var words: [String] = []
+    }
+
+    static func add(_ new: [String]) throws -> Change {
+        try lock.withLock {
+            var change = Change(words: (try? String(contentsOf: file, encoding: .utf8)).map(terms) ?? [])
+            for word in unique(new) {
+                if word.count > maxLength { change.refused.append("\(word)（超过 \(maxLength) 个字）") }
+                else if change.words.contains(where: { $0.lowercased() == word.lowercased() }) { change.unchanged.append(word) }
+                else if change.words.count >= limit { change.refused.append("\(word)（词表已满 \(limit) 个）") }
+                else { change.words.append(word); change.changed.append(word) }
+            }
+            if !change.changed.isEmpty { try write(change.words) }
+            return change
+        }
+    }
+
+    static func remove(_ gone: [String]) throws -> Change {
+        try lock.withLock {
+            var change = Change(words: (try? String(contentsOf: file, encoding: .utf8)).map(terms) ?? [])
+            for word in unique(gone) {
+                if let index = change.words.firstIndex(where: { $0.lowercased() == word.lowercased() }) {
+                    change.changed.append(change.words.remove(at: index))
+                } else { change.unchanged.append(word) }
+            }
+            if !change.changed.isEmpty { try write(change.words) }
+            return change
+        }
+    }
+
+    /// The top of the list that fits the streaming interface. The service
+    /// counts tokens, which cannot be counted here; 80 characters stays under
+    /// its 100 for Chinese and Latin text alike.
+    static let liveCharacters = 80
+    static func live(_ words: [String]) -> [String] {
+        var budget = liveCharacters
+        return Array(words.prefix { word in
+            budget -= word.count
+            return budget >= 0
+        })
     }
 }
 
@@ -308,6 +415,158 @@ struct MeetingSession: Codable, Identifiable {
         return lines.filter { !included.contains($0.id) }.count
     }
 }
+/// One row of the session list: enough to name a session and say how long it is.
+struct SessionSummary: Identifiable, Equatable, Decodable {
+    let id: UUID
+    var title: String
+    var created: Date
+    var lineCount: Int
+    /// From the session's start to the end of its last line; 0 without lines.
+    var seconds: TimeInterval
+    var hasDraft: Bool
+    var imageCount: Int
+
+    init(_ session: MeetingSession) {
+        id = session.id
+        title = session.title
+        created = session.created
+        lineCount = session.lines.count
+        seconds = max(0, (session.lines.map(\.end).max() ?? session.created).timeIntervalSince(session.created))
+        hasDraft = session.organized != nil
+        imageCount = session.imageLibrary.count
+    }
+
+    private enum CodingKeys: String, CodingKey { case id, title, created, lines, organized, images }
+    private struct LineEnd: Decodable { let end: Date }
+    private struct Present: Decodable { init(from decoder: Decoder) throws {} }
+
+    /// Decodes a stored session, keeping only the counts.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        title = try c.decode(String.self, forKey: .title)
+        created = try c.decode(Date.self, forKey: .created)
+        let ends = try c.decodeIfPresent([LineEnd].self, forKey: .lines) ?? []
+        lineCount = ends.count
+        seconds = max(0, (ends.map(\.end).max() ?? created).timeIntervalSince(created))
+        hasDraft = (try c.decodeIfPresent(Present.self, forKey: .organized)) != nil
+        imageCount = (try c.decodeIfPresent([Present].self, forKey: .images))?.count ?? 0
+    }
+}
+
+/// Saves sessions off the main thread. A session is saved after every settled
+/// sentence; encoding the whole of it there held up the interface for longer
+/// the longer the session ran (measured: 15 ms at 4,000 lines). Saves that
+/// pile up behind a slow disk collapse into the newest one.
+final class SessionWriter: @unchecked Sendable {
+    private let queue = DispatchQueue(label: "ListenFlow.sessions", qos: .utility)
+    private let lock = NSLock()
+    private var waiting: [UUID: MeetingSession] = [:]
+    /// Called on the main queue when a save fails.
+    var onError: ((String) -> Void)?
+
+    func save(_ session: MeetingSession) {
+        let schedule: Bool = lock.withLock {
+            let queued = waiting[session.id] != nil
+            waiting[session.id] = session
+            return !queued
+        }
+        guard schedule else { return }
+        let id = session.id
+        queue.async { [self] in
+            guard let latest = lock.withLock({ waiting.removeValue(forKey: id) }) else { return }
+            do { try SessionStore.save(latest) }
+            catch {
+                let message = error.localizedDescription
+                DispatchQueue.main.async { self.onError?(message) }
+            }
+        }
+    }
+
+    /// Returns once everything handed to `save` so far is on disk.
+    func flush() { queue.sync {} }
+}
+
+/// A stretch of the transcript shown as one paragraph. Live recognition settles
+/// a line per sentence, and a microphone running beside the Mac's sound is cut
+/// every 0.2 s; read as separate rows that is choppy. Only the display joins
+/// them: the stored lines, and what `lstf` reads, stay one per sentence.
+struct TranscriptBlock: Identifiable, Equatable {
+    /// The first line's id, so a block keeps its identity while it grows.
+    let id: UUID
+    let start: Date
+    var end: Date
+    let source: String
+    var text: String
+    let refined: Bool
+    /// False when the block before it is from the same source.
+    var showsSource: Bool
+}
+
+/// One thing on the transcript page: a paragraph of speech, or a picture kept
+/// at that moment.
+enum TranscriptEntry: Identifiable {
+    case block(TranscriptBlock)
+    case image(ImageAttachment)
+    var id: UUID {
+        switch self {
+        case let .block(block): block.id
+        case let .image(image): image.id
+        }
+    }
+    var time: Date {
+        switch self {
+        case let .block(block): block.start
+        case let .image(image): image.addedAt
+        }
+    }
+}
+
+enum TranscriptLayout {
+    /// A longer pause than this starts a new paragraph.
+    static let gap: TimeInterval = 2.5
+    static let seconds: TimeInterval = 45
+
+    /// Lines that were re-recognized are paragraphs already and are left as
+    /// they are. `breakBefore` forces a new block at that line, and so does
+    /// each of `cuts`: a paragraph does not run across a picture.
+    static func blocks(_ lines: [TranscriptLine], breakBefore: UUID? = nil, cuts: [Date] = []) -> [TranscriptBlock] {
+        var out: [TranscriptBlock] = []
+        for line in lines {
+            if var last = out.last, !last.refined, line.refined != true, line.id != breakBefore,
+               last.source == line.source, line.start.timeIntervalSince(last.end) <= gap,
+               line.end.timeIntervalSince(last.start) <= seconds,
+               !cuts.contains(where: { $0 > last.start && $0 <= line.start }) {
+                // Latin words need a space between them; Chinese does not.
+                let latin = last.text.last.map { $0.isASCII && ($0.isLetter || $0.isNumber) } == true
+                    && line.text.first.map { $0.isASCII && ($0.isLetter || $0.isNumber) } == true
+                last.text += (latin ? " " : "") + line.text
+                last.end = max(last.end, line.end)
+                out[out.count - 1] = last
+            } else {
+                out.append(TranscriptBlock(id: line.id, start: line.start, end: line.end, source: line.source, text: line.text,
+                                           refined: line.refined == true, showsSource: out.last?.source != line.source))
+            }
+        }
+        return out
+    }
+
+    /// Paragraphs and pictures in the order they happened. A paragraph names
+    /// its source again after a picture.
+    static func timeline(_ session: MeetingSession, breakBefore: UUID? = nil) -> [TranscriptEntry] {
+        let images = session.imageLibrary.sorted { $0.addedAt < $1.addedAt }
+        var blocks = blocks(session.lines, breakBefore: breakBefore, cuts: images.map(\.addedAt))[...]
+        var out: [TranscriptEntry] = []
+        for image in images {
+            while let block = blocks.first, block.start <= image.addedAt { out.append(.block(block)); blocks.removeFirst() }
+            out.append(.image(image))
+            if var next = blocks.first { next.showsSource = true; blocks[blocks.startIndex] = next }
+        }
+        out += blocks.map(TranscriptEntry.block)
+        return out
+    }
+}
+
 enum SessionStore {
     /// Tests, and preview builds that are told to, keep sessions somewhere else.
     nonisolated(unsafe) static var folderOverride: URL?
@@ -338,6 +597,15 @@ enum SessionStore {
             return try? JSONDecoder().decode(MeetingSession.self, from: data)
         }.sorted { $0.created > $1.created }
     }
+    /// What the session list shows, read without building every line of every
+    /// session: the app keeps these in memory instead of whole sessions.
+    static func summaries() -> [SessionSummary] {
+        let files = (try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? []
+        return files.filter { $0.pathExtension == "json" }.compactMap {
+            guard let data = try? Data(contentsOf: $0) else { return nil }
+            return try? JSONDecoder().decode(SessionSummary.self, from: data)
+        }.sorted { $0.created > $1.created }
+    }
     static func timestamp(_ date: Date, relativeTo start: Date) -> String {
         let seconds = max(0, Int(date.timeIntervalSince(start)))
         return String(format: "%02d:%02d", seconds / 60, seconds % 60)
@@ -355,7 +623,9 @@ enum SessionStore {
             result += "## 整理稿\n\n整理范围：\(scope)\(labels.isEmpty ? "" : "；参考图片：" + labels)；AI 整理，请对照原文核实。\n\n\(organized.text)\n\n"
             if session.unorganizedCount > 0 { result += "另有 \(session.unorganizedCount) 段原始转写尚未纳入整理稿。\n\n" }
         }
-        result += "## 原始转写\n\n\(transcript(session))\n\n## 问答\n\n"
+        result += "## 原始转写\n\n\(transcript(session))\n\n"
+        // Sessions from before 0.11.0 may hold questions asked in the app.
+        if !session.chat.isEmpty { result += "## 问答\n\n" }
         for message in session.chat {
             result += "### \(message.role == "user" ? "提问" : "回答")\n\n\(message.text)\n\n"
             let labels = session.imageLibrary.filter { message.imageIDs?.contains($0.id) == true }.map(\.label).joined(separator: "、")

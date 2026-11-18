@@ -13,6 +13,7 @@ final class VolcStream: @unchecked Sendable {
         var key: String
         var resourceID: String
         var hotwords: [String]
+        var tables = VolcTables()
         /// Quiet after which the service settles a sentence.
         var endWindowMS = 1000
     }
@@ -77,11 +78,15 @@ final class VolcStream: @unchecked Sendable {
     private var timer: DispatchSourceTimer?
     private let lock = NSLock()
     private var openSince: Date?
+    /// Sent with each new connection, so a word added mid-session is in use
+    /// from the next stretch of speech.
+    private var hotwords: [String]
 
     /// `emit` is called on the main queue.
     init(source: String, settings: Settings, keep: ((Data, Date?) -> Void)? = nil, emit: @escaping (Event) -> Void) {
         self.source = source
         self.settings = settings
+        self.hotwords = settings.hotwords
         self.keep = keep
         self.emit = emit
         let timer = DispatchSource.makeTimerSource(queue: queue)
@@ -102,6 +107,11 @@ final class VolcStream: @unchecked Sendable {
 
     func append(_ samples: [Float], end: Date) {
         queue.async { self.consume(samples, end: end) }
+    }
+
+    /// The list changed while recording; connections opened from now on use it.
+    func setHotwords(_ words: [String]) {
+        queue.async { self.hotwords = words }
     }
 
     /// Capture stopped: send what is left, wait for the last results, then `.drained`.
@@ -215,7 +225,7 @@ final class VolcStream: @unchecked Sendable {
         let task = urlSession.webSocketTask(with: request)
         segment.task = task
         task.resume()
-        if let frame = VolcFrame.fullRequest(VolcFrame.configuration(uid: connectID, hotwords: settings.hotwords, endWindowMS: settings.endWindowMS)) {
+        if let frame = VolcFrame.fullRequest(VolcFrame.configuration(uid: connectID, hotwords: hotwords, tables: settings.tables, endWindowMS: settings.endWindowMS)) {
             send(frame, on: segment, generation)
         }
         receive(segment, generation)

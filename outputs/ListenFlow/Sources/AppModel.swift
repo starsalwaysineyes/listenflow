@@ -83,29 +83,14 @@ final class OrganizationPreview: ObservableObject {
     @Published var text = ""
 }
 
-/// Streaming answer text lives outside `AppModel` on purpose. Publishing it on the
-/// session would invalidate every view that observes the model — the sidebar, the
-/// whole transcript list and the footer — several times per second. Only the small
-/// view that observes this object re-renders while an answer streams in.
-@MainActor
-final class AnswerStream: ObservableObject {
-    struct State: Equatable {
-        var messageID: UUID?
-        var text = ""
-    }
-    @Published private(set) var state = State()
-    func begin(_ id: UUID) { state = State(messageID: id, text: "") }
-    func update(_ value: String) { state.text = value }
-    func finish() { state = State() }
-}
-
 @MainActor
 final class AppModel: ObservableObject {
     @Published var preferences = Preferences.load()
     @Published var apps: [AudioApp] = []
     @Published var selectedPID: pid_t = 0
     @Published var session = MeetingSession()
-    @Published var history: [MeetingSession] = []
+    /// The session list. Summaries only: whole sessions stay on disk until opened.
+    @Published var history: [SessionSummary] = []
     @Published var isRecording = false
     @Published var isBusy = false
     @Published var micEnabled = false
@@ -120,22 +105,20 @@ final class AppModel: ObservableObject {
     let levels = AudioLevels()
     @Published var lastLatency: Double = 0
     @Published var oldestPending: Double = 0
-    @Published var question = ""
-    @Published var isAsking = false
     @Published var isOrganizing = false
     @Published var isImportingImages = false
-    @Published var askImageIDs: Set<UUID> = []
+    @Published var isCapturingShot = false
+    /// Names and terms the recognizer is told to expect; see `HotwordStore`.
+    @Published var hotwords: [String] = []
+    private var hotwordsStamp: Date?
+    /// Goes up with every screenshot kept, so views can confirm the click.
+    @Published var shotsTaken = 0
     @Published var organizationImageIDs: Set<UUID> = []
     let organizationPreview = OrganizationPreview()
-    let answerStream = AnswerStream()
     @Published var showOrganized = false
     @Published var autoOrganize = false
     @Published var showSettings = false
-    @Published var showHistory = false
     @Published var source: AudioSource = .all
-    /// Bumped to pull keyboard focus into the question field from the menu bar.
-    /// A counter rather than a flag, so repeated ⌘K always re-focuses.
-    @Published var questionFocusToken = 0
     /// What a running session is actually capturing, decided at start time so the
     /// user can change the picker freely while stopped.
     @Published var activeSource: AudioSource?
@@ -208,14 +191,16 @@ final class AppModel: ObservableObject {
     private var cloudRefineTask: Task<Void, Never>?
     /// Audio per upload; the replay harness shortens it to exercise the cutting.
     private var cloudChunkSeconds = VolcRecording.chunkSeconds
-    private var askTask: Task<Void, Never>?
+    private let writer = SessionWriter()
+    /// Kept-audio files may be open; closed again once recording has wound down.
+    private var audioOpen = false
     private var organizeTask: Task<Void, Never>?
     private var lastOrganizationAttempt = Date.distantPast
     private var timer: Timer?
     private var loadingSince: Date?
     private var lastAppSignal = Date.distantPast
     private var lastMicSignal = Date.distantPast
-    var canChangeSession: Bool { !isRecording && !isBusy && !isAsking && !isOrganizing && !isImportingImages && pendingCount == 0 && !isPostRefining }
+    var canChangeSession: Bool { !isRecording && !isBusy && !isOrganizing && !isImportingImages && !isCapturingShot && pendingCount == 0 && !isPostRefining }
     /// A microphone session can start with no app selected.
     var usesCloud: Bool { preferences.engine == .volc }
     /// The engine in use can take audio: a loaded local model, or a stored cloud key.
@@ -245,9 +230,7 @@ final class AppModel: ObservableObject {
         if isRecording { return true }
         return canStartRecording
     }
-    var askImages: [ImageAttachment] { session.imageLibrary.filter { askImageIDs.contains($0.id) } }
     var organizationImages: [ImageAttachment] { session.imageLibrary.filter { organizationImageIDs.contains($0.id) } }
-    var hasAskContext: Bool { !session.lines.isEmpty || !askImages.isEmpty || !session.chat.isEmpty }
     var hasOrganizationContext: Bool { !session.lines.isEmpty || !organizationImages.isEmpty }
     var organizationImagesChanged: Bool { Set(session.organized?.imageIDs ?? []) != organizationImageIDs }
     /// While live text is still arriving in quality mode, the first line after the
@@ -280,10 +263,8 @@ final class AppModel: ObservableObject {
             || (isRecording && usesCloud && preferences.keepAudioForRefine)
     }
     var selectedApp: AudioApp? { apps.first { $0.id == selectedPID } }
-    var connectionLabel: String {
-        guard !preferences.apiBase.isEmpty else { return "配置问答 API" }
-        return URL(string: preferences.apiBase)?.host ?? "问答 API"
-    }
+    /// Whether a session holds anything worth keeping or showing.
+    var sessionIsEmpty: Bool { session.lines.isEmpty && session.chat.isEmpty && session.imageLibrary.isEmpty }
 
     init() {
         // Tests of the command line tool: a preview build that keeps its sessions
@@ -292,6 +273,7 @@ final class AppModel: ObservableObject {
             let root = URL(fileURLWithPath: store, isDirectory: true)
             SessionStore.folderOverride = root.appendingPathComponent("Sessions", isDirectory: true)
             AudioStore.rootOverride = root.appendingPathComponent("audio", isDirectory: true)
+            HotwordStore.fileOverride = root.appendingPathComponent("hotwords.txt")
         }
         capture.onChunk = { [weak self] chunk in Task { @MainActor in self?.submit(chunk) } }
         capture.onLevel = { [weak self] source, level in
@@ -309,7 +291,11 @@ final class AppModel: ObservableObject {
         worker.onEvent = { [weak self] event in self?.receive(event) }
         refreshVolcKey()
         refreshApps()
-        history = SessionStore.all()
+        writer.onError = { [weak self] message in self?.error = "会话保存失败：\(message)" }
+        // Up to 0.10.1 hot words were a line of text in the settings.
+        if HotwordStore.modified() == nil, !preferences.hotwordList.isEmpty { try? HotwordStore.save(preferences.hotwordList) }
+        reloadHotwords()
+        loadHistory()
         DispatchQueue.global(qos: .utility).async {
             if !ListenFlowHome.isPreview { AudioStore.adoptLegacy() }
             AudioStore.purgeExpired()
@@ -341,8 +327,10 @@ final class AppModel: ObservableObject {
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.tick() }
         }
+        timer?.tolerance = 0.2
         runReplayIfRequested()
-        if ProcessInfo.processInfo.environment["LISTENFLOW_REPLAY"] == nil {
+        // Headless runs have no use for the island, and it would sit over the real one.
+        if !AppDelegate.headless {
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 if let h = ProcessInfo.processInfo.environment["LISTENFLOW_PREVIEW_ISLAND_HEIGHT"].flatMap(Double.init) {
@@ -357,6 +345,9 @@ final class AppModel: ObservableObject {
         if Bundle.main.bundleIdentifier == "local.ListenFlow.preview",
            let folder = ProcessInfo.processInfo.environment["LISTENFLOW_PREVIEW_SNAPSHOT"] {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.snapshotViews(to: folder) }
+        }
+        if ListenFlowHome.isPreview, let path = ProcessInfo.processInfo.environment["LISTENFLOW_PREVIEW_SCROLLCHECK"] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.scrollCheck(to: path) }
         }
         // Lets UI checks capture the settings sheet without synthesizing keystrokes.
         if Bundle.main.bundleIdentifier == "local.ListenFlow.preview",
@@ -409,15 +400,62 @@ final class AppModel: ObservableObject {
         if isRecording { await stop() } else if canStartRecording { await start() }
     }
 
-    /// Bring the main window forward, optionally focusing the question field, so a
-    /// mid-session question never requires hunting for the window.
-    func showMainWindow(focusQuestion: Bool = false) {
+    func showMainWindow() {
         NSApp.activate(ignoringOtherApps: true)
         for window in NSApp.windows where window.canBecomeMain {
             window.makeKeyAndOrderFront(nil)
             break
         }
-        if focusQuestion { questionFocusToken += 1 }
+    }
+
+    /// The list is a file that `lstf` may change at any time. Streams that are
+    /// running pick the new list up with their next connection.
+    private func reloadHotwords() {
+        hotwordsStamp = HotwordStore.modified()
+        let words = HotwordStore.load()
+        guard words != hotwords else { return }
+        hotwords = words
+        streamsByID.values.forEach { $0.setHotwords(words) }
+    }
+
+    /// From the settings sheet: one or several terms, separated by commas.
+    func addHotwords(_ text: String) {
+        do {
+            let change = try HotwordStore.add(HotwordStore.terms(text))
+            if !change.refused.isEmpty { error = "没有加进热词：" + change.refused.joined(separator: "、") }
+        } catch { self.error = "热词没有保存下来：\(error.localizedDescription)" }
+        reloadHotwords()
+    }
+
+    func removeHotword(_ word: String) {
+        do { _ = try HotwordStore.remove([word]) }
+        catch { self.error = "热词没有保存下来：\(error.localizedDescription)" }
+        reloadHotwords()
+    }
+
+    /// Read off the main thread: launch does not wait for it, however many
+    /// sessions there are. Sessions saved in the meantime keep their newer row.
+    private func loadHistory() {
+        // A preview build with no store of its own must not list real sessions.
+        guard SessionStore.writes else { return }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let stored = SessionStore.summaries()
+            DispatchQueue.main.async {
+                guard let self else { return }
+                let newer = self.history
+                self.history = stored
+                newer.forEach(self.remember)
+            }
+        }
+    }
+
+    /// Put a session's row in the list, or bring it up to date.
+    private func remember(_ summary: SessionSummary) {
+        if let index = history.firstIndex(where: { $0.id == summary.id }) {
+            if history[index] != summary { history[index] = summary }
+        } else {
+            history.insert(summary, at: history.firstIndex { $0.created < summary.created } ?? history.count)
+        }
     }
 
     func start() async {
@@ -435,6 +473,7 @@ final class AppModel: ObservableObject {
         let playback = source == .all ? AudioSource.systemName : app?.name
         isBusy = true
         error = nil
+        audioOpen = true
         let label = app?.name ?? source.label
         if session.lines.isEmpty && pending.isEmpty {
             session.created = Date()
@@ -445,7 +484,7 @@ final class AppModel: ObservableObject {
                 let key = await Task.detached { AppModel.volcKey() }.value
                 guard !key.isEmpty else {
                     volcKeyPresent = false
-                    throw CaptureFailure.message("还没有填写豆包语音识别的 API Key。请在「模型与 API 设置」里填写，或切换到本地模型。")
+                    throw CaptureFailure.message("还没有填写豆包语音识别的 API Key。请在「设置」里填写，或切换到本地模型。")
                 }
                 cloudKey = key
                 capture.onAudio = { [router] source, samples, end in router.append(source, samples, end) }
@@ -515,8 +554,8 @@ final class AppModel: ObservableObject {
     private func openStream(_ source: String) {
         guard activeStreams[source] == nil else { return }
         let id = UUID()
-        var settings = VolcStream.Settings(key: cloudKey, resourceID: preferences.volcResourceID,
-                                           hotwords: preferences.hotwordList)
+        var settings = VolcStream.Settings(key: cloudKey, resourceID: preferences.volcResourceID, hotwords: hotwords,
+                                           tables: VolcTables(boosting: preferences.volcBoostingTableID, correct: preferences.volcCorrectTableID))
         // A microphone running next to an app hears the app through the speakers.
         // Measured: with the usual 1 s window an echo ran straight into the user's
         // reply as one 20 s sentence, and the service's final text kept only the
@@ -527,9 +566,9 @@ final class AppModel: ObservableObject {
         }
         // Keep what is streamed, so the session can be refined from the recording.
         let keeping = preferences.keepAudioForRefine && (!ListenFlowHome.isPreview || AudioStore.rootOverride != nil)
-        let sessionID = session.id
+        let kept = AudioStore.streamFile(session: session.id, source: source)
         let stream = VolcStream(source: source, settings: settings, keep: keeping ? { pcm, start in
-            AudioStore.appendStream(pcm, session: sessionID, source: source, spanStart: start)
+            AudioStore.appendStream(pcm, to: kept, spanStart: start)
         } : nil) { [weak self] event in
             self?.receive(event, from: id, source: source)
         }
@@ -637,7 +676,7 @@ final class AppModel: ObservableObject {
         if preferences.keepAudioForRefine && (Bundle.main.bundleIdentifier != "local.ListenFlow.preview" || AudioStore.rootOverride != nil) {
             pendingAudio[chunk.id] = AudioStore.append(chunk.samples, session: session.id, source: chunk.source)
         }
-        worker.submit(chunk, language: preferences.language, hotwords: preferences.hotwords)
+        worker.submit(chunk, language: preferences.language, hotwords: hotwords.joined(separator: ","))
         if pending.count >= 12 && isRecording && !isBusy {
             error = "识别暂时跟不上音频，已暂停采集以避免继续累积延迟。已采集的片段会继续处理。"
             Task { await stop() }
@@ -742,8 +781,12 @@ final class AppModel: ObservableObject {
     // MARK: - Second-pass recognition
 
     private func updateRecognitionMode() {
-        let ac = PowerSource.onAC
-        if ac != onAC { onAC = ac }
+        // The power source only matters to the local engine; with the cloud
+        // engine it is not asked for at all, let alone once a second.
+        if !usesCloud {
+            let ac = PowerSource.onAC
+            if ac != onAC { onAC = ac }
+        }
         let quality = !usesCloud && PowerSource.wantsQuality(preferences.recognitionMode)
         if quality != qualityActive {
             qualityActive = quality
@@ -794,7 +837,7 @@ final class AppModel: ObservableObject {
         guard modelReady, refineInFlight == nil, pending.isEmpty, !refineQueue.isEmpty else { return }
         let job = refineQueue.removeFirst()
         refineInFlight = job
-        worker.submit(id: job.id, samples: job.samples, language: preferences.language, hotwords: preferences.hotwords)
+        worker.submit(id: job.id, samples: job.samples, language: preferences.language, hotwords: hotwords.joined(separator: ","))
     }
 
     private func finishRefine(_ job: RefineJob, text raw: String) {
@@ -906,7 +949,7 @@ final class AppModel: ObservableObject {
 
     /// Two uploads at a time; each result is handed over as soon as it is in.
     nonisolated private static func recognize(_ uploads: [CloudUpload], session: UUID, client: VolcFileClient,
-                                              hotwords: [String],
+                                              hotwords: [String], tables: VolcTables,
                                               apply: @MainActor @Sendable (Int, [VolcUtterance]) -> Void) async throws {
         try await withThrowingTaskGroup(of: (Int, [VolcUtterance]).self) { group in
             var next = 0, running = 0
@@ -923,7 +966,7 @@ final class AppModel: ObservableObject {
                             parts.append(pcm)
                         }
                         let body = VolcRecording.submitBody(wav: VolcRecording.wav(parts, spans: upload.spans),
-                                                            uid: UUID().uuidString, hotwords: hotwords, splitOnPauses: upload.split)
+                                                            uid: UUID().uuidString, hotwords: hotwords, tables: tables, splitOnPauses: upload.split)
                         return (index, try await client.recognize(body: body, seconds: upload.seconds))
                     }
                     next += 1; running += 1
@@ -941,6 +984,8 @@ final class AppModel: ObservableObject {
         let sessionID = session.id
         let settings = preferences
         let limit = cloudChunkSeconds
+        let words = hotwords
+        let tables = VolcTables(boosting: preferences.volcBoostingTableID, correct: preferences.volcCorrectTableID)
         error = nil
         notice = nil
         postRefineDone = 0
@@ -966,7 +1011,7 @@ final class AppModel: ObservableObject {
             do {
                 try await AppModel.recognize(uploads, session: sessionID,
                                              client: VolcFileClient(key: key, resourceID: settings.volcFileResourceID),
-                                             hotwords: settings.hotwordList) { [weak self] index, utterances in
+                                             hotwords: words, tables: tables) { [weak self] index, utterances in
                     self?.applyCloud(uploads[index], utterances, session: sessionID)
                 }
             } catch {
@@ -1059,6 +1104,7 @@ final class AppModel: ObservableObject {
             else { refuse(notice ?? "这场会话现在无法精修。") }
             return
         }
+        writer.flush()
         guard let stored = SessionStore.load(request.session) else { refuse("找不到这场会话。"); return }
         guard AudioStore.streamSeconds(stored.id) > 0 else {
             refuse(AudioStore.hasAudio(stored.id)
@@ -1075,6 +1121,8 @@ final class AppModel: ObservableObject {
         let id = stored.id
         let settings = preferences
         let limit = cloudChunkSeconds
+        let words = hotwords
+        let tables = VolcTables(boosting: preferences.volcBoostingTableID, correct: preferences.volcCorrectTableID)
         storedRefine = StoredRefine(session: stored)
         Task { [weak self] in
             let key = await Task.detached { AppModel.volcKey() }.value
@@ -1087,7 +1135,7 @@ final class AppModel: ObservableObject {
                 do {
                     try await AppModel.recognize(uploads, session: id,
                                                  client: VolcFileClient(key: key, resourceID: settings.volcFileResourceID),
-                                                 hotwords: settings.hotwordList) { [weak self] index, utterances in
+                                                 hotwords: words, tables: tables) { [weak self] index, utterances in
                         guard let self, var run = self.storedRefine else { return }
                         let upload = uploads[index]
                         if VolcRecording.apply(utterances, spans: upload.spans, source: upload.source,
@@ -1115,7 +1163,7 @@ final class AppModel: ObservableObject {
                 self.lastRefine = .init(sessionID: id, ok: true, message: uploads.isEmpty ? "这场会话已经精修过，暂存音频已删除。"
                     : "全文精修完成：\(uploads.count) 段、约 \(Self.minutes(seconds))的音频由豆包录音文件识别重新识别，其中 \(run.changed) 段文字有改动。暂存音频已删除。", finished: Date())
             }
-            self.history = SessionStore.all()
+            self.remember(SessionSummary(run.session))
         }
     }
 
@@ -1144,6 +1192,7 @@ final class AppModel: ObservableObject {
         // The elapsed-time readout is driven by a TimelineView, so this timer never
         // publishes a clock value — only real state changes reach the views.
         updateRecognitionMode()
+        if HotwordStore.modified() != hotwordsStamp { reloadHotwords() }
         settleHeldMic()
         // A speaker who paused for a while has finished a thought: refine it now
         // rather than waiting for the next chunk to close the window.
@@ -1153,6 +1202,7 @@ final class AppModel: ObservableObject {
         if age != oldestPending { oldestPending = age }
         if current.timeIntervalSince(lastAppSignal) > 1 && levels.app != 0 { levels.app = 0 }
         if current.timeIntervalSince(lastMicSignal) > 1 && levels.mic != 0 { levels.mic = 0 }
+        if audioOpen && !isRecording && !isBusy && pendingCount == 0 { audioOpen = false; AudioStore.release() }
         if oldestPending > 40 { failWorker("识别等待超时，已停止采集。") }
         if modelLoading, let since = loadingSince, current.timeIntervalSince(since) > 120 { failWorker("本地模型加载超时，请检查 Python 环境与模型路径。") }
         if autoOrganize && !isOrganizing && !isImportingImages && hasOrganizationContext && (session.unorganizedCount > 0 || organizationImagesChanged || organizationStale) &&
@@ -1180,6 +1230,8 @@ final class AppModel: ObservableObject {
         }
         preferences = value
         preferences.volcResourceID = value.volcResourceID.trimmingCharacters(in: .whitespaces)
+        preferences.volcBoostingTableID = value.volcBoostingTableID.trimmingCharacters(in: .whitespaces)
+        preferences.volcCorrectTableID = value.volcCorrectTableID.trimmingCharacters(in: .whitespaces)
         let fileResource = value.volcFileResourceID.trimmingCharacters(in: .whitespaces)
         preferences.volcFileResourceID = fileResource.isEmpty ? Preferences().volcFileResourceID : fileResource
         preferences.save()
@@ -1196,56 +1248,6 @@ final class AppModel: ObservableObject {
             resetRefinement()
         }
     }
-
-    func ask(_ prompt: String? = nil) {
-        var text = (prompt ?? question).trimmingCharacters(in: .whitespacesAndNewlines)
-        let selectedImages = askImages
-        guard !isAsking, !isImportingImages, hasAskContext, !text.isEmpty || !selectedImages.isEmpty else { return }
-        if text.isEmpty { text = "请解释这些图片，结合已有转写（如有），区分图片和发言中的信息。" }
-        guard !preferences.apiBase.isEmpty, !preferences.llmModel.isEmpty else { showSettings = true; return }
-        error = nil
-        question = ""
-        let snapshot = session
-        let settings = preferences
-        let key = SecretStore.read(account: settings.apiBase)
-        let contextEnd = snapshot.lines.last?.end
-        session.chat.append(ChatMessage(role: "user", text: text, contextThrough: contextEnd, imageIDs: selectedImages.map(\.id)))
-        let reply = ChatMessage(role: "assistant", text: "", contextThrough: contextEnd)
-        session.chat.append(reply)
-        isAsking = true
-        // Stream into AnswerStream, not into `session`: publishing every delta on the
-        // model would rebuild the sidebar, transcript and footer ~4x per second.
-        answerStream.begin(reply.id)
-        askTask = Task { [weak self] in
-            guard let self else { return }
-            do {
-                let answer = try await LLMClient.ask(preferences: settings, key: key, session: snapshot, question: text, images: selectedImages) { [weak self] partial in
-                    // Writes to the dedicated stream object, so only the answer view redraws.
-                    self?.answerStream.update(partial)
-                }
-                if let index = self.session.chat.firstIndex(where: { $0.id == reply.id }) {
-                    self.session.chat[index].text = answer
-                }
-            } catch {
-                let cancelled = Task.isCancelled || error is CancellationError || (error as? URLError)?.code == .cancelled
-                // Keep whatever streamed in before the failure instead of dropping it.
-                let partial = self.answerStream.state.text
-                if let index = self.session.chat.firstIndex(where: { $0.id == reply.id }) {
-                    if partial.isEmpty { self.session.chat.remove(at: index) }
-                    else { self.session.chat[index].text = partial + "\n\n（\(cancelled ? "回答已停止" : "连接中断，回答未完成")）" }
-                }
-                if !cancelled {
-                    self.error = error.localizedDescription
-                    if self.question.isEmpty { self.question = text }
-                }
-            }
-            self.answerStream.finish()
-            self.isAsking = false
-            self.persist()
-        }
-    }
-
-    func cancelAsk() { askTask?.cancel() }
 
     func setAutoOrganize(_ enabled: Bool) {
         autoOrganize = enabled
@@ -1315,63 +1317,59 @@ final class AppModel: ObservableObject {
 
     func cancelOrganization() { autoOrganize = false; organizeTask?.cancel() }
 
-    func selectImage(_ image: ImageAttachment, forOrganization: Bool, selected: Bool) {
-        if forOrganization {
-            guard !isOrganizing, !isImportingImages else { return }
-            if selected && organizationImageIDs.count >= ImageAttachmentStore.maxSelected { error = "每次最多选择 6 张图片。"; return }
-            if selected { organizationImageIDs.insert(image.id) } else { organizationImageIDs.remove(image.id) }
-        } else {
-            guard !isAsking, !isImportingImages else { return }
-            if selected && askImageIDs.count >= ImageAttachmentStore.maxSelected { error = "每次最多选择 6 张图片。"; return }
-            if selected { askImageIDs.insert(image.id) } else { askImageIDs.remove(image.id) }
+    func selectImage(_ image: ImageAttachment, selected: Bool) {
+        guard !isOrganizing, !isImportingImages else { return }
+        if selected && organizationImageIDs.count >= ImageAttachmentStore.maxSelected { error = "每次最多选择 6 张图片。"; return }
+        if selected { organizationImageIDs.insert(image.id) } else { organizationImageIDs.remove(image.id) }
+    }
+
+    /// One click keeps the whole screen with the session, at this moment: no
+    /// region to drag, no window hidden. The transcript shows it where it
+    /// happened, and `lstf` hands its path to an agent at the same place.
+    func captureScreenshot() {
+        guard SessionStore.writes, !isCapturingShot else { return }
+        isCapturingShot = true
+        let sessionID = session.id
+        let number = (session.imageLibrary.map(\.number).max() ?? 0) + 1
+        let display = ScreenshotCapture.displayUnderPointer()
+        let taken = Date()
+        Task {
+            do {
+                let image = try await ScreenshotCapture.capture(display: display)
+                let shot = try await Task.detached(priority: .userInitiated) {
+                    try ImageAttachmentStore.storeShot(image, at: taken, sessionID: sessionID, number: number)
+                }.value
+                if self.session.id == sessionID {
+                    self.session.images = self.session.imageLibrary + [shot]
+                    if self.session.title == "新的会话" { self.session.title = "截屏 · \(taken.formatted(date: .abbreviated, time: .shortened))" }
+                    self.persist()
+                    self.shotsTaken += 1
+                } else {
+                    // The session was switched in the meantime; the picture has no home.
+                    try? FileManager.default.removeItem(at: ImageAttachmentStore.url(for: shot, sessionID: sessionID))
+                }
+            } catch {
+                self.error = error.localizedDescription
+            }
+            self.isCapturingShot = false
         }
     }
 
-    /// Mid-meeting grab of whatever is on screen: pick a region, and it lands in
-    /// the session already selected for the pending question.
-    func captureScreenshot(forOrganization: Bool = false) {
-        guard !isImportingImages, !(forOrganization ? isOrganizing : isAsking) else { return }
-        // Bring the window back afterwards, but get out of the way for the crosshair.
-        NSApp.hide(nil)
-        Task { @MainActor in
-            let source = await ScreenshotCapture.captureInteractive()
-            NSApp.unhide(nil)
-            NSApp.activate(ignoringOtherApps: true)
-            guard let source else { return }
-            importImages([source], forOrganization: forOrganization)
-        }
-    }
-
-    func importImages(forOrganization: Bool) {
-        guard !isImportingImages, !(forOrganization ? isOrganizing : isAsking) else { return }
+    func importImages() {
+        guard !isImportingImages, !isOrganizing else { return }
         let panel = NSOpenPanel()
-        panel.title = forOrganization ? "添加整理参考图片" : "添加提问图片"
+        panel.title = "添加整理参考图片"
         panel.prompt = "添加图片"
         panel.allowedContentTypes = [.image]
         panel.allowsMultipleSelection = true
         panel.canChooseDirectories = false
         guard panel.runModal() == .OK else { return }
-        importImages(panel.urls.map(ImageImportSource.file), forOrganization: forOrganization)
+        importImages(panel.urls.map(ImageImportSource.file))
     }
 
-    /// Return false for ordinary text so the native editor can paste it at the cursor.
-    func pasteAskImages(from pasteboard: NSPasteboard) -> Bool {
-        do {
-            let sources = try ClipboardImages.sources(from: pasteboard)
-            guard !sources.isEmpty else { return false }
-            guard !isAsking, !isImportingImages else { error = "请等待当前回答或图片添加完成，再粘贴图片。"; return true }
-            importImages(sources, forOrganization: false)
-            return true
-        } catch {
-            self.error = error.localizedDescription
-            return true
-        }
-    }
-
-    private func importImages(_ sources: [ImageImportSource], forOrganization: Bool) {
-        guard !sources.isEmpty, !isImportingImages, !(forOrganization ? isOrganizing : isAsking) else { return }
-        let selected = forOrganization ? organizationImageIDs : askImageIDs
-        guard selected.count + sources.count <= ImageAttachmentStore.maxSelected else { error = "每次最多选择 6 张图片，请减少选择。"; return }
+    private func importImages(_ sources: [ImageImportSource]) {
+        guard !sources.isEmpty, !isImportingImages, !isOrganizing else { return }
+        guard organizationImageIDs.count + sources.count <= ImageAttachmentStore.maxSelected else { error = "每次最多选择 6 张图片，请减少选择。"; return }
         let sessionID = session.id
         let firstNumber = (session.imageLibrary.map(\.number).max() ?? 0) + 1
         isImportingImages = true
@@ -1387,8 +1385,7 @@ final class AppModel: ObservableObject {
             }.value
             guard self.session.id == sessionID else { self.isImportingImages = false; return }
             self.session.images = self.session.imageLibrary + result.0
-            if forOrganization { self.organizationImageIDs.formUnion(result.0.map(\.id)) }
-            else { self.askImageIDs.formUnion(result.0.map(\.id)) }
+            self.organizationImageIDs.formUnion(result.0.map(\.id))
             if self.session.title == "新的会话", !result.0.isEmpty { self.session.title = "图片资料 · \(Date().formatted(date: .abbreviated, time: .shortened))" }
             self.isImportingImages = false
             if !result.1.isEmpty { self.error = result.1.joined(separator: "\n") }
@@ -1403,32 +1400,40 @@ final class AppModel: ObservableObject {
         keptStreamSeconds = 0
         echoDropped = 0
         resetRefinement()
-        askImageIDs = []; organizationImageIDs = []
+        organizationImageIDs = []
         showOrganized = false
         autoOrganize = false
         lastLatency = 0
     }
-    func openSession(_ value: MeetingSession) {
-        guard canChangeSession else { return }
+    func openSession(_ id: UUID) {
+        guard canChangeSession, id != session.id else { return }
         // Its file is being rewritten; a copy opened now would overwrite that.
-        if value.id == storedRefine?.session.id { showHistory = false; notice = "这场会话正在后台精修，完成后再打开。"; return }
+        if id == storedRefine?.session.id { notice = "这场会话正在后台精修，完成后再打开。"; return }
         persist()
+        writer.flush()
+        guard let value = SessionStore.load(id) else {
+            error = "这场会话的文件读不出来了。"
+            history.removeAll { $0.id == id }
+            return
+        }
         session = value
         keptStreamSeconds = 0
         refreshKeptAudio()
         echoDropped = 0
         resetRefinement()
-        askImageIDs = Set((value.chat.last(where: { $0.role == "user" })?.imageIDs ?? []).prefix(ImageAttachmentStore.maxSelected))
         organizationImageIDs = Set((value.organized?.imageIDs ?? []).prefix(ImageAttachmentStore.maxSelected))
-        showOrganized = value.organized != nil
+        showOrganized = false
         autoOrganize = false
-        showHistory = false
+        lastLatency = 0
+        error = nil
+        notice = nil
     }
+    /// Saved after every settled sentence, so `lstf` and a crash both find the
+    /// text. The write itself happens off the main thread.
     func persist() {
-        guard SessionStore.writes else { return }
-        guard !session.lines.isEmpty || !session.chat.isEmpty || !session.imageLibrary.isEmpty else { return }
-        do { try SessionStore.save(session); history = SessionStore.all() }
-        catch { self.error = "会话保存失败：\(error.localizedDescription)" }
+        guard SessionStore.writes, !sessionIsEmpty else { return }
+        writer.save(session)
+        remember(SessionSummary(session))
     }
     func export() {
         let panel = NSSavePanel()
@@ -1439,10 +1444,10 @@ final class AppModel: ObservableObject {
         catch { self.error = error.localizedDescription }
     }
     func shutdown() {
-        askTask?.cancel()
         organizeTask?.cancel()
         cloudRefineTask?.cancel()
         persist()
+        writer.flush()
         cancelStreams()
         worker.shutdown()
         if SessionStore.writes { AgentBridge.withdraw() }
@@ -1601,36 +1606,153 @@ extension AppModel {
         AudioStore.delete(session.id)
     }
 
-    /// Renders the main window and the settings sheet for both engines to PNG files
-    /// without putting a window on screen, so layout can be checked on a locked
-    /// or headless Mac. Preview builds only.
+    /// Renders the main window in its main states, light and dark, and the
+    /// settings sheet for both engines, to PNG files without putting a window on
+    /// screen — so layout can be checked on a locked or headless Mac. Preview
+    /// builds only.
     func snapshotViews(to folder: String) {
-        func shot<V: View>(_ view: V, _ size: NSSize, _ name: String) {
+        func shot<V: View>(_ view: V, _ size: NSSize, _ name: String, dark: Bool = false) {
             let host = NSHostingView(rootView: view.frame(width: size.width, height: size.height))
             host.frame = NSRect(origin: .zero, size: size)
             let window = NSWindow(contentRect: host.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+            window.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
             window.contentView = host
             host.layoutSubtreeIfNeeded()
             RunLoop.main.run(until: Date().addingTimeInterval(0.8))
             guard let rep = host.bitmapImageRepForCachingDisplay(in: host.bounds) else { return }
             host.cacheDisplay(in: host.bounds, to: rep)
-            try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: folder + "/" + name + ".png"))
+            try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: folder + "/" + name + (dark ? "-dark" : "") + ".png"))
         }
+        func main(_ name: String, both: Bool = true) {
+            let size = NSSize(width: 1080, height: 740)
+            shot(ContentView(model: self), size, name)
+            if both { shot(ContentView(model: self), size, name, dark: true) }
+        }
+        let fixture = session
         showSettings = false
+        volcKeyPresent = true
+        preferences.engine = .volc
+        // A made-up list: a preview build never reads the real sessions.
+        let now = Date()
+        history = [SessionSummary(fixture)] + [(0.9, 52.0, 410, "腾讯会议"), (1.2, 95.0, 902, "全局声音"), (2.4, 7.0, 61, "我的麦克风"), (6.1, 48.0, 377, "Safari")]
+            .map { days, minutes, lines, name in
+                var past = MeetingSession(title: "\(name) · 合成", created: now.addingTimeInterval(-days * 86400))
+                past.lines = (0..<lines).map { index in
+                    TranscriptLine(start: past.created, end: past.created.addingTimeInterval(minutes * 60 * Double(index + 1) / Double(lines)),
+                                   source: name, text: "", latency: 0)
+                }
+                return SessionSummary(past)
+            }
+        main("main-volc")
+
+        // In the middle of a session: both sources live, a sentence still being heard.
+        isRecording = true
+        activeSource = .all
+        micEnabled = true
+        levels.app = 0.55
+        levels.mic = 0.22
+        cloudActivity = .live
+        livePreview.set(AudioSource.systemName, "接下来说一下用户访谈的情况，这周一共约到了")
+        hasLivePartial = true
+        main("main-recording")
+        isRecording = false
+        activeSource = nil
+        micEnabled = false
+        levels.app = 0
+        levels.mic = 0
+        cloudActivity = .waiting
+        livePreview.clear()
+        hasLivePartial = false
+
+        showOrganized = true
+        main("main-draft")
+        showOrganized = false
+
+        session = MeetingSession()
+        main("main-empty")
+        session = fixture
+
         for engine in RecognitionEngine.allCases {
             preferences.engine = engine
-            volcKeyPresent = true
-            if engine == .volc {
-                livePreview.set(apps.first?.name ?? "App", "接下来说一下用户访谈的情况，这周一共约到了")
-                hasLivePartial = true
-                cloudActivity = .live
-            } else {
-                livePreview.clear()
-                hasLivePartial = false
-            }
-            shot(ContentView(model: self), NSSize(width: 1220, height: 800), "main-\(engine.rawValue)")
+            if engine == .local { main("main-local", both: false) }
             shot(SettingsView(model: self), NSSize(width: 650, height: 690), "settings-\(engine.rawValue)")
         }
+        NSApp.terminate(nil)
+    }
+
+    /// Whether the transcript follows new text only while the reader is at the
+    /// end. Driven in a window that is never shown: lines are added, the page
+    /// is scrolled away and back, and where it ends up each time is written
+    /// out. Preview builds only.
+    func scrollCheck(to path: String) {
+        let created = Date().addingTimeInterval(-3600)
+        func line(_ index: Int) -> TranscriptLine {
+            // Ten seconds apart, so every line is a paragraph of its own.
+            let start = created.addingTimeInterval(Double(index) * 10)
+            return TranscriptLine(start: start, end: start.addingTimeInterval(4), source: index % 3 == 0 ? EchoFilter.micSource : AudioSource.systemName,
+                                  text: "合成的第 \(index + 1) 句，用来把页面撑到比窗口高。", latency: 0.8)
+        }
+        session = MeetingSession(title: "滚动检查", created: created)
+        session.lines = (0..<60).map(line)
+        volcKeyPresent = true
+        isRecording = true
+        activeSource = .all
+        let size = NSSize(width: 1080, height: 740)
+        let host = NSHostingView(rootView: ContentView(model: self).frame(width: size.width, height: size.height))
+        host.frame = NSRect(origin: .zero, size: size)
+        let window = NSWindow(contentRect: host.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+        window.contentView = host
+        func settle(_ seconds: TimeInterval) {
+            host.layoutSubtreeIfNeeded()
+            RunLoop.main.run(until: Date().addingTimeInterval(seconds))
+            host.layoutSubtreeIfNeeded()
+        }
+        func page() -> NSScrollView? {
+            var found: [NSScrollView] = []
+            func walk(_ view: NSView) {
+                if let scroll = view as? NSScrollView { found.append(scroll) }
+                view.subviews.forEach(walk)
+            }
+            walk(host)
+            return found.filter { $0.frame.width > 500 }.max { ($0.documentView?.frame.height ?? 0) < ($1.documentView?.frame.height ?? 0) }
+        }
+        var result: [String: Any] = [:]
+        func record(_ name: String) {
+            guard let scroll = page(), let document = scroll.documentView else { result[name] = "no scroll view"; return }
+            let bounds = scroll.contentView.bounds
+            result[name] = ["offset": Double(bounds.origin.y), "fromEnd": Double(document.frame.height - bounds.maxY),
+                            "documentHeight": Double(document.frame.height), "lines": session.lines.count]
+        }
+        func scroll(toY y: CGFloat) {
+            guard let scroll = page() else { return }
+            scroll.contentView.scroll(to: NSPoint(x: 0, y: y))
+            scroll.reflectScrolledClipView(scroll.contentView)
+        }
+        settle(1.2)
+        record("1 opened while recording")
+        session.lines.append(line(session.lines.count))
+        settle(1.0)
+        record("2 a line arrived while at the end")
+        scroll(toY: 0)
+        settle(0.6)
+        record("3 scrolled to the top")
+        for _ in 0..<3 { session.lines.append(line(session.lines.count)); settle(0.5) }
+        livePreview.set(AudioSource.systemName, "正在说的半句")
+        hasLivePartial = true
+        settle(0.5)
+        record("4 three lines and a preview arrived while at the top")
+        if let scrollView = page(), let document = scrollView.documentView {
+            scroll(toY: max(0, document.frame.height - scrollView.contentView.bounds.height))
+        }
+        settle(0.6)
+        record("5 scrolled back to the end")
+        session.lines.append(line(session.lines.count))
+        settle(1.0)
+        record("6 a line arrived while at the end again")
+        if let data = try? JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys]) {
+            try? data.write(to: URL(fileURLWithPath: path))
+        }
+        isRecording = false
         NSApp.terminate(nil)
     }
 

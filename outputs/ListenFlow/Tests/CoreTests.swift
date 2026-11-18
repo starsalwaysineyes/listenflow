@@ -1,4 +1,5 @@
 import Foundation
+import CoreGraphics
 
 enum CaptureFailure: LocalizedError {
     case message(String)
@@ -123,10 +124,7 @@ enum CaptureFailure: LocalizedError {
         var session = MeetingSession(title: "Test", created: start)
         session.lines = [TranscriptLine(start: start.addingTimeInterval(3), end: start.addingTimeInterval(7), source: "Browser", text: "Friday release", latency: 4.5)]
         session.chat = [ChatMessage(role: "user", text: "When?"), ChatMessage(role: "assistant", text: "Friday")]
-        let messages = LLMClient.messages(session: session, question: "Owner?")
-        precondition(messages[1]["content"]!.contains("[00:03] [Browser] Friday release"))
-        precondition(messages.last?["content"] == "Owner?")
-        precondition(messages.filter { $0["content"] == "Owner?" }.count == 1)
+        precondition(SessionStore.transcript(session).contains("[00:03] [Browser] Friday release"))
         let encoded = try JSONEncoder().encode(session)
         let decoded = try JSONDecoder().decode(MeetingSession.self, from: encoded)
         precondition(decoded.lines[0].text == "Friday release")
@@ -676,11 +674,201 @@ enum CaptureFailure: LocalizedError {
         try? FileManager.default.removeItem(at: bridgeRoot)
         SessionStore.folderOverride = nil
 
+
+        // --- 0.11.0: the session list, saving off the main thread, the page layout, screenshots ---
+        do {
+            let listRoot = FileManager.default.temporaryDirectory.appendingPathComponent("lf-list-\(UUID().uuidString)")
+            defer { try? FileManager.default.removeItem(at: listRoot) }
+            SessionStore.folderOverride = listRoot.appendingPathComponent("Sessions")
+            AudioStore.rootOverride = listRoot.appendingPathComponent("audio")
+            let listStart = Date(timeIntervalSince1970: 1_790_000_000)
+            func said(_ at: Double, _ length: Double, _ source: String, _ text: String, refined: Bool? = nil) -> TranscriptLine {
+                TranscriptLine(start: listStart.addingTimeInterval(at), end: listStart.addingTimeInterval(at + length), source: source,
+                               text: text, latency: 0.5, refined: refined)
+            }
+            var listedSession = MeetingSession(title: "全局声音 · 测试", created: listStart)
+            listedSession.lines = [said(2, 3, "电脑声音", "第一句。"), said(5.5, 2, "电脑声音", "第二句。"), said(600, 4, "麦克风", "十分钟后的一句。")]
+            listedSession.organized = OrganizedTranscript(text: "整理稿", generatedAt: listStart, sourceLineIDs: [listedSession.lines[0].id], through: listStart)
+            try SessionStore.save(listedSession)
+            var bare = MeetingSession(title: "空的", created: listStart.addingTimeInterval(3600))
+            bare.chat = [ChatMessage(role: "user", text: "只有旧问答")]
+            try SessionStore.save(bare)
+            let summaries = SessionStore.summaries()
+            precondition(summaries.map(\.id) == [bare.id, listedSession.id], "Newest first")
+            precondition(summaries[1] == SessionSummary(listedSession) && summaries[1].lineCount == 3 && summaries[1].seconds == 604 && summaries[1].hasDraft
+                         && summaries[1].imageCount == 0, "Read from disk, a summary says what one made from the session says")
+            precondition(summaries[0].lineCount == 0 && summaries[0].seconds == 0 && !summaries[0].hasDraft)
+            precondition(SessionStore.markdown(bare).contains("## 问答") && !SessionStore.markdown(listedSession).contains("## 问答"),
+                         "Questions asked before 0.11.0 still export; a session without any has no empty section")
+
+            // Saves pile up while the disk is busy; only the newest of each session is written.
+            let writer = SessionWriter()
+            var growing = MeetingSession(title: "写入", created: listStart)
+            for index in 0..<200 {
+                growing.lines.append(said(Double(index), 0.5, "电脑声音", "第 \(index) 句"))
+                writer.save(growing)
+            }
+            writer.flush()
+            precondition(SessionStore.load(growing.id)?.lines.count == 200, "After flush the newest state is on disk")
+            writer.flush()
+
+            // The page: sentences that follow one another read as one paragraph.
+            let choppy = [said(0, 2, "电脑声音", "先说结论，"), said(2.3, 2, "电脑声音", "这个方案可行。"), said(4.6, 1, "麦克风", "OK"),
+                          said(5.8, 1, "麦克风", "fine,"), said(7, 1, "麦克风", "那就这么定。"), said(20, 2, "麦克风", "另外一件事。"),
+                          said(22.2, 3, "麦克风", "精修过的一段。", refined: true), said(25.4, 2, "麦克风", "精修过的另一段。", refined: true)]
+            let blocks = TranscriptLayout.blocks(choppy)
+            precondition(blocks.map(\.text) == ["先说结论，这个方案可行。", "OK fine,那就这么定。", "另外一件事。", "精修过的一段。", "精修过的另一段。"],
+                         "Joined within a source across short pauses; a space only between Latin words; refined lines left alone")
+            precondition(blocks.map(\.showsSource) == [true, true, false, false, false] && blocks.map(\.id) == [choppy[0].id, choppy[2].id, choppy[5].id, choppy[6].id, choppy[7].id])
+            precondition(blocks[1].start == choppy[2].start && blocks[1].end == choppy[4].end)
+            precondition(TranscriptLayout.blocks(choppy, breakBefore: choppy[1].id).count == 6, "A forced break starts a new paragraph")
+            let longTalk = (0..<40).map { said(Double($0) * 2, 1.9, "电脑声音", "句\($0)。") }
+            precondition(TranscriptLayout.blocks(longTalk).allSatisfy { $0.end.timeIntervalSince($0.start) <= TranscriptLayout.seconds }
+                         && TranscriptLayout.blocks(longTalk).count == 2, "Unbroken talk still gets paragraphs")
+            precondition(TranscriptLayout.blocks([]).isEmpty)
+
+            // A screenshot is kept under the session, named after when it was taken.
+            let shotZone = TimeZone(secondsFromGMT: 8 * 3600)!
+            precondition(ImageAttachmentStore.shotFileName(Date(timeIntervalSince1970: 1_800_000_000), zone: shotZone) == "shot-20270115-160000.jpg")
+            precondition(ImageAttachmentStore.root.path == listRoot.appendingPathComponent("Images").path, "Pictures live beside the sessions, wherever those are")
+            let canvas = CGContext(data: nil, width: 640, height: 400, bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
+                                   bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)!
+            canvas.setFillColor(CGColor(red: 0.1, green: 0.5, blue: 0.4, alpha: 1))
+            canvas.fill(CGRect(x: 0, y: 0, width: 640, height: 400))
+            let screen = canvas.makeImage()!
+            var pictured = MeetingSession(title: "带截屏", created: listStart)
+            pictured.lines = [said(10, 3, "电脑声音", "看这一页。"), said(13.2, 2, "电脑声音", "左边是问题。"), said(40, 3, "电脑声音", "下一页。"), said(60, 2, "麦克风", "好的。")]
+            let early = try ImageAttachmentStore.storeShot(screen, at: listStart.addingTimeInterval(4), sessionID: pictured.id, number: 1)
+            let middle = try ImageAttachmentStore.storeShot(screen, at: listStart.addingTimeInterval(12), sessionID: pictured.id, number: 2)
+            let twin = try ImageAttachmentStore.storeShot(screen, at: listStart.addingTimeInterval(12), sessionID: pictured.id, number: 3)
+            let late = try ImageAttachmentStore.storeShot(screen, at: listStart.addingTimeInterval(90), sessionID: pictured.id, number: 4)
+            pictured.images = [late, middle, early, twin]
+            let middleURL = ImageAttachmentStore.url(for: middle, sessionID: pictured.id)
+            precondition(middle.isShot && middle.width == 640 && middle.file == ImageAttachmentStore.shotFileName(listStart.addingTimeInterval(12))
+                         && middleURL.lastPathComponent == middle.file && FileManager.default.fileExists(atPath: middleURL.path))
+            precondition(twin.file != middle.file && twin.file?.hasSuffix("-2.jpg") == true, "Two in the same second are both kept")
+            let shotMode = try FileManager.default.attributesOfItem(atPath: middleURL.path)[.posixPermissions] as? Int
+            precondition(shotMode == 0o600)
+            let reread = try JSONDecoder().decode(MeetingSession.self, from: JSONEncoder().encode(pictured))
+            precondition(reread.imageLibrary.first { $0.id == middle.id }?.file == middle.file && reread.imageLibrary.allSatisfy(\.isShot))
+            let legacyImage = try JSONDecoder().decode(ImageAttachment.self, from: Data("""
+            {"id":"3F2A91BC-0000-4000-8000-000000000009","number":1,"name":"a.png","width":10,"height":10,"byteCount":5,"addedAt":0}
+            """.utf8))
+            precondition(!legacyImage.isShot && ImageAttachmentStore.url(for: legacyImage, sessionID: pictured.id).lastPathComponent == "3F2A91BC-0000-4000-8000-000000000009.jpg",
+                         "Pictures stored before 0.11.0 keep their file names")
+
+            // On the page: pictures in time order, and no paragraph runs across one.
+            let timeline = TranscriptLayout.timeline(pictured)
+            let shape: [String] = timeline.map { entry in
+                switch entry {
+                case let .block(block): return "说:" + block.text
+                case let .image(image): return "图:\(image.number)"
+                }
+            }
+            precondition(shape == ["图:1", "说:看这一页。", "图:2", "图:3", "说:左边是问题。", "说:下一页。", "说:好的。", "图:4"], "\(shape)")
+            if case let .block(afterPicture) = timeline[4] { precondition(afterPicture.showsSource, "The source is named again after a picture") }
+            precondition(SessionSummary(pictured).imageCount == 4)
+
+            // For an agent: each picture's path, where it happened, without taking a line number.
+            let picturedInfo = Lstf.Info(session: pictured)
+            let whole = Lstf.page(picturedInfo, range: 0..<4, note: nil).split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+            let bodyRows = Array(whole.drop { !$0.contains("[截屏]") && !$0.contains("[电脑声音]") }.prefix(8))
+            precondition(bodyRows.map { $0.contains("[截屏]") } == [true, false, true, true, false, false, false, true], "\(bodyRows)")
+            precondition(bodyRows[0].hasSuffix(ImageAttachmentStore.url(for: early, sessionID: pictured.id).path) && bodyRows[0].contains("[00:04] [截屏] /")
+                         && bodyRows[1].hasPrefix("1  [00:10]") && bodyRows[4].hasPrefix("2  [00:13]"), "Line numbers are the transcript's own")
+            precondition(whole[1].contains("截屏 4 张") && Lstf.json(picturedInfo)["images"] as? Int == 4)
+            // Paged: each picture turns up once, on the page of the line it comes before.
+            let firstPage = Lstf.images(pictured, in: 0..<2), secondPage = Lstf.images(pictured, in: 2..<4)
+            precondition(firstPage[0]?.map(\.number) == [1] && firstPage[1]?.map(\.number) == [2, 3] && firstPage[2] == nil)
+            precondition(secondPage.keys.sorted() == [4] && secondPage[4]?.map(\.number) == [4])
+            precondition(Lstf.images(pictured, in: 4..<4)[4]?.map(\.number) == [4], "Reading on from the end still shows a picture taken since")
+            let pictureJSON = Lstf.json(middle, session: pictured, beforeLine: 2)
+            precondition(pictureJSON["kind"] as? String == "screenshot" && pictureJSON["at"] as? String == "00:12" && pictureJSON["path"] as? String == middleURL.path
+                         && pictureJSON["beforeLine"] as? Int == 2)
+            var onlyPictures = MeetingSession(title: "只有图", created: listStart)
+            onlyPictures.images = [early]
+            precondition(Lstf.page(Lstf.Info(session: onlyPictures), range: 0..<0, note: nil).contains("只有上面的图片"))
+            precondition(Lstf.help.contains("[截屏]"))
+
+            // Hot words: one file, shared by the app and the tool; order is priority.
+            HotwordStore.fileOverride = listRoot.appendingPathComponent("home/hotwords.txt")
+            precondition(HotwordStore.load().isEmpty && HotwordStore.modified() == nil, "No file yet is an empty list")
+            precondition(HotwordStore.terms("小林，梯度下降,损失函数\n听流\n\n  梯度下降  ,Adam   优化器") == ["小林", "梯度下降", "损失函数", "听流", "Adam 优化器"])
+            let firstAdd = try HotwordStore.add(["梯度下降", "Transformer", "梯度下降"])
+            precondition(firstAdd.changed == ["梯度下降", "Transformer"] && firstAdd.unchanged.isEmpty && firstAdd.words == ["梯度下降", "Transformer"])
+            let secondAdd = try HotwordStore.add(["transformer", "注意力机制", String(repeating: "长", count: 41)])
+            precondition(secondAdd.changed == ["注意力机制"] && secondAdd.unchanged == ["transformer"] && secondAdd.refused.count == 1
+                         && secondAdd.words == ["梯度下降", "Transformer", "注意力机制"], "Same word in another case is the same word; over-long is refused")
+            precondition(HotwordStore.load() == secondAdd.words && HotwordStore.modified() != nil)
+            let hotMode = try FileManager.default.attributesOfItem(atPath: HotwordStore.file.path)[.posixPermissions] as? Int
+            let hotText = try String(contentsOf: HotwordStore.file, encoding: .utf8)
+            precondition(hotMode == 0o600 && hotText == "梯度下降\nTransformer\n注意力机制\n",
+                         "Plain text, a word a line: readable and editable by hand")
+            let removal = try HotwordStore.remove(["TRANSFORMER", "没有这个词"])
+            precondition(removal.changed == ["Transformer"] && removal.unchanged == ["没有这个词"] && removal.words == ["梯度下降", "注意力机制"])
+            try HotwordStore.save([])
+            precondition(HotwordStore.load().isEmpty && HotwordStore.modified() != nil, "An emptied list is still a file, so old settings are not moved in again")
+            let manyWords = (0..<30).map { "术语\($0)号词条" }
+            let liveWords = HotwordStore.live(manyWords)
+            precondition(liveWords == Array(manyWords.prefix(liveWords.count)) && liveWords.joined().count <= HotwordStore.liveCharacters
+                         && (liveWords + [manyWords[liveWords.count]]).joined().count > HotwordStore.liveCharacters, "The top of the list, as much as fits")
+            let liveConfig = try JSONSerialization.jsonObject(with: VolcFrame.configuration(uid: "u", hotwords: manyWords,
+                                tables: VolcTables(boosting: " tb-1 ", correct: "ct-9"))) as! [String: Any]
+            let liveCorpus = (liveConfig["request"] as! [String: Any])["corpus"] as! [String: Any]
+            let liveContext = try JSONSerialization.jsonObject(with: Data((liveCorpus["context"] as! String).utf8)) as! [String: [[String: String]]]
+            precondition(liveContext["hotwords"]?.compactMap { $0["word"] } == liveWords && liveCorpus["boosting_table_id"] as? String == "tb-1"
+                         && liveCorpus["correct_table_id"] as? String == "ct-9", "Streaming sends what fits, and names the console tables")
+            let fileBody = try JSONSerialization.jsonObject(with: VolcRecording.submitBody(wav: Data(), uid: "u", hotwords: manyWords,
+                                tables: VolcTables(correct: "ct-9"), splitOnPauses: false)) as! [String: Any]
+            let fileCorpus = (fileBody["request"] as! [String: Any])["corpus"] as! [String: Any]
+            let fileContext = try JSONSerialization.jsonObject(with: Data((fileCorpus["context"] as! String).utf8)) as! [String: [[String: String]]]
+            precondition(fileContext["hotwords"]?.count == 30 && fileCorpus["correct_table_id"] as? String == "ct-9" && fileCorpus["boosting_table_id"] == nil,
+                         "Refining from the recording uses the whole list")
+            precondition(VolcTables().corpus(hotwords: []) == nil && VolcTables(boosting: "tb").corpus(hotwords: [])?.count == 1)
+            let hotCommands = try [["hotword"], ["hotwords", "list", "--json"], ["hotword", "add", "小林", "梯度下降，损失函数"], ["hotword", "rm", "小林"],
+                                   ["hotword", "delete", "a b"]].map { try Lstf.parse($0) }
+            precondition(hotCommands == [.hotwords(json: false), .hotwords(json: true), .addHotwords(["小林", "梯度下降", "损失函数"]),
+                                         .deleteHotwords(["小林"]), .deleteHotwords(["a b"])])
+            for wrong in [["hotword", "add"], ["hotword", "frob"], ["hotword", "list", "extra"], ["hotword", "add", "x", "--json"]] {
+                do { _ = try Lstf.parse(wrong); fatalError("\(wrong) accepted") } catch let error as LstfError { precondition(error.usage) }
+            }
+            let listing = Lstf.hotwordList(manyWords).split(separator: "\n").map(String.init)
+            precondition(listing[0].contains("热词 30 个") && listing[0].contains("前 \(liveWords.count) 个") && listing[1] == " 1  术语0号词条"
+                         && listing[liveWords.count] == String(format: "%2d", liveWords.count) + "  " + liveWords.last!
+                         && listing[liveWords.count + 1].hasSuffix("（只在精修时用）") && Lstf.hotwordList([]).contains("lstf hotword add"))
+            let said1 = Lstf.hotwordResult(.init(changed: ["小林"], unchanged: ["听流"], refused: [], words: ["听流", "小林"]), adding: true, recording: true)
+            precondition(said1.contains("已添加：小林。") && said1.contains("已经有了：听流。") && said1.contains("共 2 个") && said1.contains("下一段讲话起生效"))
+            let said2 = Lstf.hotwordResult(.init(changed: [manyWords[29]], words: manyWords), adding: true, recording: false)
+            precondition(said2.contains("只在精修时用") && !said2.contains("正在录制"))
+            let said3 = Lstf.hotwordResult(.init(changed: [], unchanged: ["没有"], words: []), adding: false, recording: true)
+            precondition(said3.contains("热词表里没有：没有。") && !said3.contains("生效"))
+            precondition(Lstf.help.contains("lstf hotword add") && Lstf.help.contains("不是错的写法"))
+            HotwordStore.fileOverride = nil
+
+            // Kept audio: the file stays open between pieces, and a deleted session's file is not written to again.
+            let heldSession = UUID()
+            for index in 0..<50 { AudioStore.appendStream(Data(repeating: 1, count: 640), session: heldSession, source: "电脑声音", spanStart: index == 0 ? listStart : nil) }
+            precondition(AudioStore.streamSeconds(heldSession) == 1, "50 pieces of 20 ms")
+            precondition(AudioStore.readStream(session: heldSession, source: "电脑声音", offset: 0, count: 16000)?.count == 32000)
+            AudioStore.deleteStream(heldSession)
+            precondition(AudioStore.streamSeconds(heldSession) == 0 && !AudioStore.hasAudio(heldSession))
+            AudioStore.appendStream(Data(repeating: 2, count: 640), session: heldSession, source: "电脑声音", spanStart: listStart)
+            precondition(AudioStore.streamSeconds(heldSession) == 0.02 && AudioStore.streamSpans(heldSession)["电脑声音"]?.count == 1,
+                         "A new recording after deletion starts a new file")
+            AudioStore.release()
+            AudioStore.appendStream(Data(repeating: 3, count: 640), session: heldSession, source: "电脑声音", spanStart: nil)
+            precondition(AudioStore.streamSeconds(heldSession) == 0.04, "Released files open again when more arrives")
+            AudioStore.delete(heldSession)
+            SessionStore.folderOverride = nil
+            AudioStore.rootOverride = nil
+        }
+
         print("PASS: silence, bounded chunks, lossless boundaries, endpointing, independent sources, discard, API URLs, context snapshots, session round-trip")
         print("PASS: old-session compatibility, organized draft persistence/export, late-arrival coverage, lossless cleanup batching, raw-only cleanup context")
         print("PASS: Doubao frames (gzip, headers, errors, malformed input), sentence de-duplication, resend backlog, speech gate, engine settings")
         print("PASS: recording refinement (span index, upload planning and cutting, clock mapping, WAV, request, replacement guards, paragraphs, when to cut on pauses), kept speech store, key file")
         print("PASS: lstf (arguments, choosing a session, paging, output, search), app/tool request files, refinement applied to a stored session")
+        print("PASS: session list summaries, saving off the main thread, paragraphs on the page, screenshots kept by time and shown to lstf, hot word file and lstf hotword, console tables, kept-audio files held open")
         print("PASS: pause-aware chunking under noise, forced-cut flags, settings migration, refinement windows/guards/merge, echo filter, private audio store round trip")
         if CommandLine.arguments.contains("--organize-live") {
             let key = String(data: FileHandle.standardInput.readDataToEndOfFile(), encoding: .utf8)!.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -699,14 +887,6 @@ enum CaptureFailure: LocalizedError {
             try JSONEncoder().encode(fixture).write(to: URL(fileURLWithPath: "work/organization-fixture.json"))
             try text.write(toFile: "work/organization-result.txt", atomically: true, encoding: .utf8)
             print("PASS: native live DeepSeek organization request; synthetic fixture saved for UI validation")
-        }
-        if let endpoint = ProcessInfo.processInfo.environment["TEST_LLM_BASE"] {
-            var preferences = Preferences()
-            preferences.apiBase = endpoint
-            preferences.llmModel = "test"
-            let answer = try await LLMClient.ask(preferences: preferences, key: "synthetic-test-token", session: session, question: "When?") { _ in }
-            precondition(answer == "周五发布。[00:03]", "SSE parsing failed: \(answer)")
-            print("PASS: native URLSession streaming API integration")
         }
     }
 }
