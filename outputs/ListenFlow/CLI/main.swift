@@ -7,8 +7,22 @@ enum CaptureFailure: LocalizedError {
 }
 
 /// Everything that touches files: where the sessions are, what the app says it
-/// is doing, and the one request the tool can make of it.
+/// is doing, and the requests the tool can make of it.
 enum Tool {
+    /// Leaves a request for the running app and waits for its answer; the app
+    /// looks once a second.
+    static func ask(_ request: AgentBridge.Request) throws -> AgentBridge.Response {
+        do { try AgentBridge.submit(request) }
+        catch { throw LstfError(message: "无法向听流发出请求：\(error.localizedDescription)") }
+        let asked = Date()
+        while Date().timeIntervalSince(asked) < 8 {
+            Thread.sleep(forTimeInterval: 0.2)
+            if let answer = AgentBridge.response(to: request) { return answer }
+        }
+        AgentBridge.cancel(request)
+        throw LstfError(message: "听流没有应答。它可能正忙，或者版本太旧不支持这个命令。")
+    }
+
     static func fail(_ error: LstfError) -> Never {
         FileHandle.standardError.write(Data(("lstf: " + error.message + (error.usage ? "\n用法见 lstf --help\n" : "\n")).utf8))
         exit(error.usage ? 2 : 1)
@@ -172,6 +186,21 @@ enum Tool {
             catch { throw LstfError(message: "热词没有保存下来：\(error.localizedDescription)") }
             print(Lstf.hotwordResult(change, adding: false, recording: state?.recording == true))
 
+        case let .rename(name, selector):
+            let picked = try Lstf.resolve(selector, sessions: SessionStore.all(), open: state?.sessionID, running: state != nil)
+            let session = picked.session, short = Lstf.shortID(picked.session.id)
+            if session.title != name || session.renamed != true {
+                if state != nil {
+                    // The app may have this session open; a file changed under it would be overwritten.
+                    let answer = try ask(AgentBridge.Request(action: AgentBridge.rename, session: session.id, name: name))
+                    guard answer.ok else { throw LstfError(message: "会话 \(short) 没有改名：\(answer.message)") }
+                } else {
+                    do { try SessionStore.rename(session.id, to: name) }
+                    catch { throw LstfError(message: "会话 \(short) 没有改名：\(error.localizedDescription)") }
+                }
+            }
+            print(Lstf.renamed(session.id, from: session.title, to: name, note: picked.note), terminator: "")
+
         case let .refine(selector, wait):
             let picked = try Lstf.resolve(selector, sessions: SessionStore.all(), open: state?.sessionID, running: state != nil)
             let id = picked.session.id, short = Lstf.shortID(picked.session.id)
@@ -179,18 +208,7 @@ enum Tool {
                 throw LstfError(message: "听流没有在运行。精修由听流 app 执行，需要用户先打开听流。")
             }
             let request = AgentBridge.Request(action: AgentBridge.refine, session: id)
-            do { try AgentBridge.submit(request) }
-            catch { throw LstfError(message: "无法向听流发出请求：\(error.localizedDescription)") }
-            var answer: AgentBridge.Response?
-            let asked = Date()
-            while answer == nil && Date().timeIntervalSince(asked) < 8 {
-                Thread.sleep(forTimeInterval: 0.2)
-                answer = AgentBridge.response(to: request)
-            }
-            guard let answer else {
-                AgentBridge.cancel(request)
-                throw LstfError(message: "听流没有应答。它可能正忙，或者版本太旧不支持这个命令。")
-            }
+            let answer = try ask(request)
             guard answer.ok else { throw LstfError(message: "会话 \(short) 没有开始精修：\(answer.message)") }
             guard wait else {
                 print("会话 \(short) 已开始精修。进度用 lstf status 查看；完成后重新读：lstf read \(short)（行号会变）。")

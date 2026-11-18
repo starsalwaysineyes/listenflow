@@ -51,8 +51,40 @@ private enum Format {
         if minutes < 60 { return "\(max(minutes, 1)) 分钟" }
         return minutes % 60 == 0 ? "\(minutes / 60) 小时" : "\(minutes / 60) 小时 \(minutes % 60) 分钟"
     }
-    /// Titles are "<what was recorded> · <date>"; the list already shows the date.
-    static func name(_ title: String) -> String { title.components(separatedBy: " · ").first ?? title }
+}
+
+/// A session's name being typed over where it is shown, the way a file is
+/// renamed in Finder: Return or clicking elsewhere keeps what was typed,
+/// Escape leaves the old name. `done` gets nil when nothing should change.
+private struct NameField: View {
+    let initial: String
+    let size: CGFloat
+    let weight: Font.Weight
+    let done: (String?) -> Void
+    @State private var text = ""
+    @State private var finished = false
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        TextField("给这场会话起个名字", text: $text)
+            .textFieldStyle(.plain).font(.system(size: size, weight: weight))
+            .focused($focused)
+            .onSubmit { finish(text) }
+            .onExitCommand { finish(nil) }
+            .onChange(of: focused) { _, now in if !now { finish(text) } }
+            .onAppear {
+                text = initial
+                DispatchQueue.main.async { focused = true }
+            }
+    }
+
+    private func finish(_ value: String?) {
+        guard !finished else { return }
+        finished = true
+        // Unchanged is not a rename: the session keeps the name the app gave it.
+        let name = value.flatMap(SessionStore.cleanName)
+        done(name == initial ? nil : name)
+    }
 }
 
 /// A slow breathing pulse on the recording dot. Its own modifier, so it
@@ -233,28 +265,47 @@ private struct SessionRow: View {
         return Format.length(row.seconds) + "，\(row.lineCount) 句" + (row.hasDraft ? "，有整理稿" : "")
     }
 
-    var body: some View {
-        let current = row.id == model.session.id
-        Button { model.openSession(row.id) } label: {
-            VStack(alignment: .leading, spacing: 3) {
-                HStack(spacing: 6) {
-                    if current && model.isRecording {
-                        Circle().fill(Palette.live).frame(width: 6, height: 6).modifier(Pulse())
+    @State private var renaming = false
+
+    private func content(current: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 6) {
+                if current && model.isRecording {
+                    Circle().fill(Palette.live).frame(width: 6, height: 6).modifier(Pulse())
+                }
+                if renaming {
+                    NameField(initial: row.name, size: 13, weight: current ? .semibold : .regular) { name in
+                        renaming = false
+                        if let name, let problem = model.renameSession(row.id, to: name) { model.error = problem }
                     }
-                    Text(Format.name(row.title)).font(.system(size: 13, weight: current ? .semibold : .regular)).lineLimit(1)
+                } else {
+                    Text(row.name).font(.system(size: 13, weight: current ? .semibold : .regular)).lineLimit(1)
                     Spacer(minLength: 4)
                     Text(Format.time(row.created)).font(.system(size: 11)).monospacedDigit().foregroundStyle(Palette.muted)
                 }
-                Text(detail).font(.system(size: 11)).foregroundStyle(Palette.muted).lineLimit(1)
             }
-            .padding(.horizontal, 10).padding(.vertical, 7)
-            .background(current ? Palette.ink.opacity(0.08) : .clear, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
-            .contentShape(Rectangle())
+            .frame(height: 16)
+            Text(detail).font(.system(size: 11)).foregroundStyle(Palette.muted).lineLimit(1)
         }
-        .buttonStyle(.plain)
-        .disabled(!current && !model.canChangeSession)
-        .opacity(current || model.canChangeSession ? 1 : 0.5)
-        .help(current || model.canChangeSession ? row.title : "暂停转写并等识别完成后，才能换到别的会话")
+        .padding(.horizontal, 10).padding(.vertical, 7)
+        .background(current || renaming ? Palette.ink.opacity(0.08) : .clear, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+        .contentShape(Rectangle())
+    }
+
+    var body: some View {
+        let current = row.id == model.session.id
+        if renaming {
+            // Not inside the button: a button would take the field's clicks and its space bar.
+            content(current: current)
+        } else {
+            Button { model.openSession(row.id) } label: { content(current: current) }
+                .buttonStyle(.plain)
+                .disabled(!current && !model.canChangeSession)
+                .opacity(current || model.canChangeSession ? 1 : 0.5)
+                .help(current || model.canChangeSession ? row.title : "暂停转写并等识别完成后，才能换到别的会话")
+                // Outside `disabled`: a session can be renamed while another one is recording.
+                .contextMenu { Button("改名…") { renaming = true } }
+        }
     }
 }
 
@@ -305,10 +356,14 @@ private struct EngineFooter: View {
 private struct Transport: View {
     @ObservedObject var model: AppModel
 
-    private var title: String {
-        if !model.sessionIsEmpty { return Format.name(model.session.title) }
-        return model.isRecording ? "正在听" : "新的会话"
+    @State private var renaming = false
+    @State private var overTitle = false
+
+    /// Nil while the session has neither content nor a name of its own.
+    private var name: String? {
+        model.sessionIsEmpty && model.session.renamed != true ? nil : model.session.name
     }
+    private var title: String { name ?? (model.isRecording ? "正在听" : "新的会话") }
 
     private var listening: String {
         let mic = model.micEnabled
@@ -322,9 +377,31 @@ private struct Transport: View {
     var body: some View {
         HStack(alignment: .center, spacing: 14) {
             VStack(alignment: .leading, spacing: 5) {
-                Text(title).font(.system(size: 19, weight: .semibold)).lineLimit(1)
+                if renaming {
+                    NameField(initial: name ?? "", size: 19, weight: .semibold) { name in
+                        renaming = false
+                        if let name, let problem = model.renameSession(model.session.id, to: name) { model.error = problem }
+                    }
+                    .frame(maxWidth: 460, alignment: .leading).frame(height: 24)
+                } else {
+                    HStack(spacing: 7) {
+                        Text(title).font(.system(size: 19, weight: .semibold)).lineLimit(1)
+                        Image(systemName: "pencil").font(.system(size: 12, weight: .medium)).foregroundStyle(Palette.muted)
+                            .opacity(overTitle ? 1 : 0)
+                    }
+                    .contentShape(Rectangle())
+                    .onHover { overTitle = $0 }
+                    .onTapGesture { renaming = true }
+                    .help("点一下改名")
+                    .accessibilityAddTraits(.isButton)
+                    .accessibilityLabel("会话名：\(title)，点一下改名")
+                    .frame(height: 24)      // the same as the field, so nothing below moves
+                }
                 subtitle.font(.system(size: 12)).foregroundStyle(Palette.muted).lineLimit(1)
             }
+            // A new session, or one opened from the list, is not the one being renamed.
+            .onChange(of: model.session.id) { renaming = false }
+            .onChange(of: model.renameToken) { renaming = true }
             Spacer(minLength: 10)
             if model.isRecording { liveControls } else { sourceMenu }
             recordButton
@@ -459,6 +536,8 @@ private struct LevelBar: View {
 private struct TranscriptPage: View {
     @ObservedObject var model: AppModel
     @State private var following = true
+    /// There is more below the bottom edge. A session that fits on the page has no end to go to.
+    @State private var below = false
     @State private var position = ScrollPosition(edge: .top)
     @State private var preview: ImageAttachment?
 
@@ -508,6 +587,7 @@ private struct TranscriptPage: View {
             Reach(offset: geometry.contentOffset.y,
                   fromEnd: geometry.contentSize.height - geometry.contentOffset.y - geometry.containerSize.height)
         } action: { old, new in
+            if below != (new.fromEnd >= 40) { below = new.fromEnd >= 40 }
             if new.fromEnd < 40 {
                 if !following { following = true }
             } else if new.offset < old.offset - 2 {
@@ -527,7 +607,7 @@ private struct TranscriptPage: View {
             if recording { following = true; position.scrollTo(edge: .bottom) }
         }
         .overlay(alignment: .bottom) {
-            if !following {
+            if !following && below {
                 Button { following = true; position.scrollTo(edge: .bottom) } label: {
                     Label(model.isRecording ? "回到最新" : "到末尾", systemImage: "arrow.down")
                         .font(.system(size: 12, weight: .medium))

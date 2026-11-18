@@ -408,7 +408,12 @@ struct MeetingSession: Codable, Identifiable {
     /// Set when the whole transcript was re-recognized after the fact. An organized
     /// draft older than this was written from the earlier wording and is redone in full.
     var refinedAt: Date?
+    /// The title was given by a person or an agent, not made up from what was
+    /// recorded and when. Such a title is shown whole and never replaced.
+    var renamed: Bool?
     var imageLibrary: [ImageAttachment] { images ?? [] }
+    /// What the session is called where its date is shown beside it anyway.
+    var name: String { SessionStore.name(title: title, renamed: renamed == true) }
     var unorganizedCount: Int {
         let included = Set(organized?.sourceLineIDs ?? [])
         return lines.filter { !included.contains($0.id) }.count
@@ -424,10 +429,13 @@ struct SessionSummary: Identifiable, Equatable, Decodable {
     var seconds: TimeInterval
     var hasDraft: Bool
     var imageCount: Int
+    var renamed = false
+    var name: String { SessionStore.name(title: title, renamed: renamed) }
 
     init(_ session: MeetingSession) {
         id = session.id
         title = session.title
+        renamed = session.renamed == true
         created = session.created
         lineCount = session.lines.count
         seconds = max(0, (session.lines.map(\.end).max() ?? session.created).timeIntervalSince(session.created))
@@ -435,7 +443,7 @@ struct SessionSummary: Identifiable, Equatable, Decodable {
         imageCount = session.imageLibrary.count
     }
 
-    private enum CodingKeys: String, CodingKey { case id, title, created, lines, organized, images }
+    private enum CodingKeys: String, CodingKey { case id, title, created, lines, organized, images, renamed }
     private struct LineEnd: Decodable { let end: Date }
     private struct Present: Decodable { init(from decoder: Decoder) throws {} }
 
@@ -444,6 +452,7 @@ struct SessionSummary: Identifiable, Equatable, Decodable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         id = try c.decode(UUID.self, forKey: .id)
         title = try c.decode(String.self, forKey: .title)
+        renamed = try c.decodeIfPresent(Bool.self, forKey: .renamed) ?? false
         created = try c.decode(Date.self, forKey: .created)
         let ends = try c.decodeIfPresent([LineEnd].self, forKey: .lines) ?? []
         lineCount = ends.count
@@ -588,6 +597,30 @@ enum SessionStore {
         let url = folder.appendingPathComponent(session.id.uuidString + ".json")
         try encoder.encode(session).write(to: url, options: .atomic)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+    }
+    static let nameLimit = 60
+    /// A name as it will be stored: one line, no stray space, not endless.
+    /// Nil when nothing is left of it.
+    static func cleanName(_ raw: String) -> String? {
+        let words = raw.components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }
+        let name = String(words.joined(separator: " ").prefix(nameLimit)).trimmingCharacters(in: .whitespaces)
+        return name.isEmpty ? nil : name
+    }
+    /// A title the app made up is "<what was recorded> · <date>", and the date
+    /// is dropped wherever it is shown beside the name; a given name is kept whole.
+    static func name(title: String, renamed: Bool) -> String {
+        renamed ? title : title.components(separatedBy: " · ").first ?? title
+    }
+    /// Renames a session that is on disk and that nothing has open. The app
+    /// renames the one it has open itself, or its next save would undo this.
+    @discardableResult
+    static func rename(_ id: UUID, to name: String) throws -> MeetingSession {
+        guard let name = cleanName(name) else { throw CaptureFailure.message("名字不能是空的。") }
+        guard var session = load(id) else { throw CaptureFailure.message("找不到这场会话，或它的文件读不出来。") }
+        session.title = name
+        session.renamed = true
+        try save(session)
+        return session
     }
     static func all() -> [MeetingSession] {
         let files = (try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? []

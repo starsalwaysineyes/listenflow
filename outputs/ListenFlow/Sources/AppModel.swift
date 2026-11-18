@@ -118,6 +118,8 @@ final class AppModel: ObservableObject {
     @Published var showOrganized = false
     @Published var autoOrganize = false
     @Published var showSettings = false
+    /// Bumped by the menu command; the title in the main window turns into a field.
+    @Published var renameToken = 0
     @Published var source: AudioSource = .all
     /// What a running session is actually capturing, decided at start time so the
     /// user can change the picker freely while stopped.
@@ -346,6 +348,11 @@ final class AppModel: ObservableObject {
            let folder = ProcessInfo.processInfo.environment["LISTENFLOW_PREVIEW_SNAPSHOT"] {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.snapshotViews(to: folder) }
         }
+        // Checks of `lstf` against a running app: sit there without a window,
+        // answer requests for this many seconds, then quit as a user would.
+        if ListenFlowHome.isPreview, let seconds = ProcessInfo.processInfo.environment["LISTENFLOW_PREVIEW_SERVE"].flatMap(Double.init) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { NSApp.terminate(nil) }
+        }
         if ListenFlowHome.isPreview, let path = ProcessInfo.processInfo.environment["LISTENFLOW_PREVIEW_SCROLLCHECK"] {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.scrollCheck(to: path) }
         }
@@ -477,7 +484,7 @@ final class AppModel: ObservableObject {
         let label = app?.name ?? source.label
         if session.lines.isEmpty && pending.isEmpty {
             session.created = Date()
-            session.title = "\(label) · \(Date().formatted(date: .abbreviated, time: .shortened))"
+            if session.renamed != true { session.title = "\(label) · \(Date().formatted(date: .abbreviated, time: .shortened))" }
         }
         do {
             if usesCloud {
@@ -1083,10 +1090,16 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// The one thing an agent may change: start refining a session that has
-    /// kept audio. Recording is never started or stopped from outside.
+    /// What an agent may ask of the app: start refining a session that has
+    /// kept audio, and rename a session. Recording is never started or stopped
+    /// from outside.
     private func handle(_ request: AgentBridge.Request) {
         func refuse(_ reason: String) { AgentBridge.respond(to: request, ok: false, reason) }
+        if request.action == AgentBridge.rename {
+            if let problem = renameSession(request.session, to: request.name ?? "") { refuse(problem) }
+            else { AgentBridge.respond(to: request, ok: true, "已改名。") }
+            return
+        }
         guard request.action == AgentBridge.refine else { refuse("这个版本的听流不认识这个请求。"); return }
         if isPostRefining || storedRefine != nil { refuse("已有一场会话在精修，等它完成后再试。"); return }
         if request.session == session.id {
@@ -1340,7 +1353,7 @@ final class AppModel: ObservableObject {
                 }.value
                 if self.session.id == sessionID {
                     self.session.images = self.session.imageLibrary + [shot]
-                    if self.session.title == "新的会话" { self.session.title = "截屏 · \(taken.formatted(date: .abbreviated, time: .shortened))" }
+                    if self.session.title == "新的会话", self.session.renamed != true { self.session.title = "截屏 · \(taken.formatted(date: .abbreviated, time: .shortened))" }
                     self.persist()
                     self.shotsTaken += 1
                 } else {
@@ -1385,7 +1398,7 @@ final class AppModel: ObservableObject {
             guard self.session.id == sessionID else { self.isImportingImages = false; return }
             self.session.images = self.session.imageLibrary + result.0
             self.organizationImageIDs.formUnion(result.0.map(\.id))
-            if self.session.title == "新的会话", !result.0.isEmpty { self.session.title = "图片资料 · \(Date().formatted(date: .abbreviated, time: .shortened))" }
+            if self.session.title == "新的会话", self.session.renamed != true, !result.0.isEmpty { self.session.title = "图片资料 · \(Date().formatted(date: .abbreviated, time: .shortened))" }
             self.isImportingImages = false
             if !result.1.isEmpty { self.error = result.1.joined(separator: "\n") }
             self.persist()
@@ -1426,6 +1439,40 @@ final class AppModel: ObservableObject {
         lastLatency = 0
         error = nil
         notice = nil
+    }
+    /// Gives a session a name of the user's (or their agent's) choosing: the
+    /// one that is open, recording or not, or any other in the list. Returns
+    /// why it could not, or nil when it is done.
+    @discardableResult
+    func renameSession(_ id: UUID, to raw: String) -> String? {
+        guard let name = SessionStore.cleanName(raw) else { return "名字不能是空的。" }
+        if id == session.id {
+            guard session.title != name || session.renamed != true else { return nil }
+            session.title = name
+            session.renamed = true
+            persist()       // an empty session has no file yet; it keeps the name until it has
+            return nil
+        }
+        // Being refined in the background: that run owns the file until it ends.
+        if var run = storedRefine, run.session.id == id {
+            run.session.title = name
+            run.session.renamed = true
+            storedRefine = run
+            do { try SessionStore.save(run.session) } catch { return "改名没有保存下来：\(error.localizedDescription)" }
+            remember(SessionSummary(run.session))
+            return nil
+        }
+        guard SessionStore.writes else {
+            // A preview build showing made-up history: nothing on disk to change.
+            guard let index = history.firstIndex(where: { $0.id == id }) else { return "找不到这场会话。" }
+            history[index].title = name
+            history[index].renamed = true
+            return nil
+        }
+        writer.flush()      // a session left a moment ago may still be on its way to disk
+        do { remember(SessionSummary(try SessionStore.rename(id, to: name))) }
+        catch { return "改名没有保存下来：\(error.localizedDescription)" }
+        return nil
     }
     /// Saved after every settled sentence, so `lstf` and a crash both find the
     /// text. The write itself happens off the main thread.

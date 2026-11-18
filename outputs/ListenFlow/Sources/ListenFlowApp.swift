@@ -12,7 +12,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let env = ProcessInfo.processInfo.environment
         return Bundle.main.bundleIdentifier == "local.ListenFlow.preview"
             && (env["LISTENFLOW_REPLAY"] != nil || env["LISTENFLOW_PREVIEW_SNAPSHOT"] != nil
-                || env["LISTENFLOW_PREVIEW_SCROLLCHECK"] != nil)
+                || env["LISTENFLOW_PREVIEW_SCROLLCHECK"] != nil || env["LISTENFLOW_PREVIEW_SERVE"] != nil)
     }()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -89,6 +89,10 @@ struct ListenFlowApp: App {
                 Button(model.isRecording ? "暂停转写" : "开始转写") {
                     Task { await model.toggleRecording() }
                 }.keyboardShortcut("r").disabled(!model.canToggleRecording)
+                Button("给这场会话改名…") {
+                    model.showMainWindow()
+                    model.renameToken += 1
+                }
             }
             CommandGroup(replacing: .appSettings) {
                 Button("设置…") { model.showSettings = true }.keyboardShortcut(",")

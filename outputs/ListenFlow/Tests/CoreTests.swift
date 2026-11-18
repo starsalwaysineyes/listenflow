@@ -863,12 +863,82 @@ enum CaptureFailure: LocalizedError {
             AudioStore.rootOverride = nil
         }
 
+        // --- 0.11.1: a session can be given a name ---
+        do {
+            let nameRoot = FileManager.default.temporaryDirectory.appendingPathComponent("lf-name-\(UUID().uuidString)")
+            defer { try? FileManager.default.removeItem(at: nameRoot) }
+            SessionStore.folderOverride = nameRoot.appendingPathComponent("Sessions")
+            defer { SessionStore.folderOverride = nil }
+
+            precondition(SessionStore.cleanName("  产品周会\n导出排期  ") == "产品周会 导出排期" && SessionStore.cleanName(" \n\t ") == nil
+                         && SessionStore.cleanName(String(repeating: "长", count: 200))?.count == SessionStore.nameLimit,
+                         "One line, trimmed, not endless; nothing left is no name")
+            precondition(SessionStore.name(title: "全局声音 · Nov 18, 2026 at 22:52", renamed: false) == "全局声音"
+                         && SessionStore.name(title: "需求评审 · 第二场", renamed: true) == "需求评审 · 第二场",
+                         "The app's own titles lose their date where one is shown anyway; a given name is kept whole")
+
+            let began = Date(timeIntervalSince1970: 1_800_000_000)
+            var named = MeetingSession(title: "全局声音 · Nov 18, 2026 at 22:52", created: began)
+            named.lines = [TranscriptLine(start: began.addingTimeInterval(2), end: began.addingTimeInterval(6), source: "电脑声音", text: "第一句", latency: 1),
+                           TranscriptLine(start: began.addingTimeInterval(8), end: began.addingTimeInterval(12), source: "麦克风", text: "第二句", latency: 1)]
+            named.organized = OrganizedTranscript(text: "稿", generatedAt: began, sourceLineIDs: [named.lines[0].id], through: began.addingTimeInterval(6))
+            named.refinedAt = began.addingTimeInterval(60)
+            precondition(named.name == "全局声音" && SessionSummary(named).renamed == false && SessionSummary(named).name == "全局声音")
+            try SessionStore.save(named)
+            let before = try Data(contentsOf: SessionStore.folder.appendingPathComponent(named.id.uuidString + ".json"))
+            precondition(!String(decoding: before, as: UTF8.self).contains("renamed"), "Sessions nobody renamed are stored as before")
+
+            let after = try SessionStore.rename(named.id, to: "  需求评审 · 第二场\n")
+            let stored = SessionStore.load(named.id)
+            precondition(after.title == "需求评审 · 第二场" && stored?.title == "需求评审 · 第二场" && stored?.renamed == true && stored?.name == "需求评审 · 第二场")
+            precondition(stored?.lines.map(\.id) == named.lines.map(\.id) && stored?.lines.map(\.text) == ["第一句", "第二句"]
+                         && stored?.organized?.text == "稿" && stored?.refinedAt == named.refinedAt && stored?.created == named.created,
+                         "Only the name changes")
+            let namedFile = SessionStore.folder.appendingPathComponent(named.id.uuidString + ".json")
+            let namedMode = try FileManager.default.attributesOfItem(atPath: namedFile.path)[.posixPermissions] as? Int
+            precondition(namedMode == 0o600)
+            let namedRows = SessionStore.summaries()
+            precondition(namedRows.count == 1 && namedRows[0].renamed && namedRows[0].name == "需求评审 · 第二场" && namedRows[0] == SessionSummary(stored!),
+                         "The list reads the name without reading the lines")
+            var refusedEmpty = false, refusedMissing = false
+            do { try SessionStore.rename(named.id, to: "  ") } catch { refusedEmpty = true }
+            do { try SessionStore.rename(UUID(), to: "别的") } catch { refusedMissing = true }
+            precondition(refusedEmpty && refusedMissing && SessionStore.load(named.id)?.title == "需求评审 · 第二场")
+            precondition(SessionStore.markdown(stored!).hasPrefix("# 需求评审 · 第二场\n"), "The export carries the name")
+
+            // What the tool asks of the app.
+            let ask = AgentBridge.Request(action: AgentBridge.rename, session: named.id, name: "周会")
+            try AgentBridge.submit(ask)
+            let waiting = AgentBridge.pending()
+            precondition(waiting.count == 1 && waiting[0].action == "rename" && waiting[0].name == "周会" && waiting[0].session == named.id)
+            AgentBridge.cancel(ask)
+            let older = try JSONDecoder().decode(AgentBridge.Request.self, from: Data(#"{"id":"\#(UUID().uuidString)","action":"refine","session":"\#(named.id.uuidString)","created":0}"#.utf8))
+            precondition(older.name == nil && older.action == AgentBridge.refine, "A request written by 0.11.0 still reads")
+
+            // The command.
+            let parsedNames = try [["rename", "产品周会", "导出排期"], ["rename", "--session", "3F2A91BC", "  周会 "], ["rename", "周会", "--session", "latest"]].map(Lstf.parse)
+            precondition(parsedNames == [.rename(name: "产品周会 导出排期", session: nil), .rename(name: "周会", session: "3F2A91BC"),
+                                         .rename(name: "周会", session: "latest")], "Words after rename are the name, joined by spaces")
+            for wrong in [["rename"], ["rename", "  "], ["rename", "周会", "--json"], ["rename", "周会", "--session"]] {
+                var usage = false
+                do { _ = try Lstf.parse(wrong) } catch let error as LstfError { usage = error.usage }
+                precondition(usage, "\(wrong) is a mistake in the command")
+            }
+            let short = Lstf.shortID(named.id)
+            precondition(Lstf.renamed(named.id, from: "全局声音 · Nov 18", to: "周会", note: nil) == "会话 \(short) 已改名：「全局声音 · Nov 18」→「周会」\n"
+                         && Lstf.renamed(named.id, from: "周会", to: "周会", note: "听流没有在运行，这里是最近的一场。")
+                            == "听流没有在运行，这里是最近的一场。\n会话 \(short) 本来就叫「周会」。\n")
+            precondition(Lstf.help.contains("lstf rename 新名字 [--session 会话]") && Lstf.help.contains("能改动的只有三件事"))
+            precondition(Lstf.listRow(Lstf.Info(session: stored!, keptSeconds: 0, localAudio: false, open: false, recording: false, refining: nil)).contains("「需求评审 · 第二场」"))
+        }
+
         print("PASS: silence, bounded chunks, lossless boundaries, endpointing, independent sources, discard, API URLs, context snapshots, session round-trip")
         print("PASS: old-session compatibility, organized draft persistence/export, late-arrival coverage, lossless cleanup batching, raw-only cleanup context")
         print("PASS: Doubao frames (gzip, headers, errors, malformed input), sentence de-duplication, resend backlog, speech gate, engine settings")
         print("PASS: recording refinement (span index, upload planning and cutting, clock mapping, WAV, request, replacement guards, paragraphs, when to cut on pauses), kept speech store, key file")
         print("PASS: lstf (arguments, choosing a session, paging, output, search), app/tool request files, refinement applied to a stored session")
         print("PASS: session list summaries, saving off the main thread, paragraphs on the page, screenshots kept by time and shown to lstf, hot word file and lstf hotword, console tables, kept-audio files held open")
+        print("PASS: naming a session (clean names, the stored file, the list, the export), lstf rename (arguments, the request, output)")
         print("PASS: pause-aware chunking under noise, forced-cut flags, settings migration, refinement windows/guards/merge, echo filter, private audio store round trip")
         if CommandLine.arguments.contains("--organize-live") {
             let key = String(data: FileHandle.standardInput.readDataToEndOfFile(), encoding: .utf8)!.trimmingCharacters(in: .whitespacesAndNewlines)
