@@ -301,7 +301,7 @@ struct NotchIslandView: View {
     /// Label sources once more than one is in play, so a meeting's other side and
     /// the room microphone can be told apart.
     private var showSources: Bool {
-        Set(shownLines.map(\.source)).count > 1 || (model.micEnabled && model.activeSource == .app)
+        Set(shownLines.map(\.source)).count > 1 || (model.micEnabled && model.activeSource != .microphone)
     }
 
     private var transcript: some View {

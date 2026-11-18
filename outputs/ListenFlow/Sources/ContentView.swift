@@ -111,7 +111,7 @@ struct ContentView: View {
                 sectionLabel("音频来源")
                 Picker("音频来源", selection: $model.source) {
                     ForEach(AudioSource.allCases) { source in
-                        Text(source.label).tag(source)
+                        Text(source.shortLabel).tag(source)
                     }
                 }.labelsHidden().pickerStyle(.segmented).frame(maxWidth: .infinity)
                     .disabled(model.isRecording || model.isBusy)
@@ -139,7 +139,7 @@ struct ContentView: View {
             .padding(14)
             .surfaceCard()
 
-            if model.source == .app, model.isRecording {
+            if model.source != .microphone, model.isRecording {
                 // With speakers, the microphone re-records the app's own sound; those
                 // repeated lines are dropped (EchoFilter), so the switch is safe to use.
                 VStack(alignment: .leading, spacing: 10) {
@@ -216,12 +216,19 @@ struct ContentView: View {
         let cloud = model.usesCloud
         if model.isRecording {
             let pace = cloud ? "边说边出字，一句说完后定稿。" : "停顿时更新，连续讲话约每 4 秒更新一次。"
-            return (model.activeSource == .microphone ? "说话即可，转写会自动出现在这里。\n" : "让所选 App 播放音频，转写会自动出现在这里。\n") + pace
+            let hint = switch model.activeSource {
+            case .microphone: "说话即可，转写会自动出现在这里。\n"
+            case .app: "让所选 App 播放音频，转写会自动出现在这里。\n"
+            default: "电脑上播放的声音和你说的话都会转写，自动出现在这里。\n"
+            }
+            return hint + pace
         }
         let place = cloud ? "音频发送到火山引擎豆包识别；可在设置里换成本地模型。" : "音频在这台 Mac 上识别。"
-        return model.source == .microphone
-            ? "选择左侧「我的麦克风」后点击「开始转写」。\n适合线下课堂与线下会议，" + place
-            : "在左侧选择一个正在播放声音的 App，再点击「开始转写」。\n" + place
+        switch model.source {
+        case .all: return "点击「开始转写」，电脑上所有 App 的声音和麦克风一起转写。\n" + place
+        case .microphone: return "选择左侧「我的麦克风」后点击「开始转写」。\n适合线下课堂与线下会议，" + place
+        case .app: return "在左侧选择一个正在播放声音的 App，再点击「开始转写」。\n" + place
+        }
     }
 
     private var header: some View {
@@ -290,7 +297,8 @@ struct ContentView: View {
                     Image(systemName: model.isRecording ? (model.activeSource == .microphone ? "mic.fill" : "waveform") : "waveform.path")
                         .font(.system(size: 42, weight: .ultraLight)).foregroundStyle(teal.opacity(0.7))
                     Text(model.isRecording
-                         ? (model.activeSource == .microphone ? "正在聆听麦克风" : "正在等待 App 中的声音")
+                         ? (model.activeSource == .microphone ? "正在聆听麦克风"
+                            : model.activeSource == .all ? "正在聆听电脑声音和麦克风" : "正在等待 App 中的声音")
                          : "从一段声音开始").font(.system(size: 18, weight: .medium))
                     Text(emptyStateDetail)
                         .font(.system(size: 12)).foregroundStyle(muted).multilineTextAlignment(.center).lineSpacing(5)

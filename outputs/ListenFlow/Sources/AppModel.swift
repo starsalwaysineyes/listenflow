@@ -8,18 +8,39 @@ struct AudioApp: Identifiable, Hashable {
     let bundleID: String
 }
 
-/// Where a session's audio comes from. In-person classes and meetings need the
-/// microphone alone, with no app playing anything, so the two are exclusive
-/// choices rather than a picker plus a bolted-on toggle.
+/// Where a session's audio comes from. `all` is everything at once — whatever the
+/// Mac is playing plus the microphone — and needs no choosing, so it is the
+/// default. In-person classes need the microphone alone; picking one app keeps
+/// notification sounds and other windows out.
 enum AudioSource: String, Codable, CaseIterable, Identifiable {
+    case all
     case microphone
     case app
     var id: String { rawValue }
-    var label: String { self == .microphone ? "我的麦克风" : "指定 App" }
-    var detail: String {
-        self == .microphone ? "线下课堂、线下会议；只用本机麦克风" : "腾讯会议、网课、播放器；只接收所选 App 的声音"
+    var label: String {
+        switch self {
+        case .all: "全局声音"
+        case .microphone: "我的麦克风"
+        case .app: "指定 App"
+        }
     }
-    var icon: String { self == .microphone ? "mic.fill" : "waveform.badge.macwindow" }
+    /// For the three-way picker in the narrow sidebar.
+    var shortLabel: String {
+        switch self {
+        case .all: "全局"
+        case .microphone: "麦克风"
+        case .app: "指定 App"
+        }
+    }
+    var detail: String {
+        switch self {
+        case .all: "电脑上所有 App 的声音和麦克风一起录，不用选 App"
+        case .microphone: "线下课堂、线下会议；只用本机麦克风"
+        case .app: "腾讯会议、网课、播放器；只接收所选 App 的声音"
+        }
+    }
+    /// Name on transcript lines that came from the Mac's own sound.
+    static let systemName = "电脑声音"
 }
 
 @MainActor
@@ -111,7 +132,7 @@ final class AppModel: ObservableObject {
     @Published var autoOrganize = false
     @Published var showSettings = false
     @Published var showHistory = false
-    @Published var source: AudioSource = .app
+    @Published var source: AudioSource = .all
     /// Bumped to pull keyboard focus into the question field from the menu bar.
     /// A counter rather than a flag, so repeated ⌘K always re-focuses.
     @Published var questionFocusToken = 0
@@ -212,7 +233,7 @@ final class AppModel: ObservableObject {
     }
     var canStartRecording: Bool {
         guard engineReady, !isBusy, !isRecording, !isPostRefining else { return false }
-        return source == .microphone || selectedPID != 0
+        return source != .app || selectedPID != 0
     }
     /// Whether the start/pause control is actionable right now. Stopping must stay
     /// available while recording — `canStartRecording` is false then by definition,
@@ -394,17 +415,20 @@ final class AppModel: ObservableObject {
 
     func start() async {
         guard engineReady, !isBusy, !isRecording else { return }
-        // A microphone-only session never needs a target app; an app session does.
+        // Only an app session needs a target app.
         let app: AudioApp?
         switch source {
-        case .microphone: app = nil
+        case .all, .microphone: app = nil
         case .app:
             guard let selected = selectedApp else { return }
             app = selected
         }
+        let source = source
+        // What the non-microphone lines are called; nil when only the microphone runs.
+        let playback = source == .all ? AudioSource.systemName : app?.name
         isBusy = true
         error = nil
-        let label = app?.name ?? AudioSource.microphone.label
+        let label = app?.name ?? source.label
         if session.lines.isEmpty && pending.isEmpty {
             session.created = Date()
             session.title = "\(label) · \(Date().formatted(date: .abbreviated, time: .shortened))"
@@ -418,12 +442,12 @@ final class AppModel: ObservableObject {
                 }
                 cloudKey = key
                 capture.onAudio = { [router] source, samples, end in router.append(source, samples, end) }
-                openStream(app?.name ?? EchoFilter.micSource)
+                openStream(playback ?? EchoFilter.micSource)
             } else {
                 capture.onAudio = nil
             }
-            if let app {
-                try await capture.start(pid: app.id, name: app.name)
+            if let playback {
+                try await capture.start(pid: app?.id, name: playback)
             } else {
                 try await capture.startMicrophoneOnly()
             }
@@ -433,6 +457,14 @@ final class AppModel: ObservableObject {
         } catch {
             self.error = error.localizedDescription
             cancelStreams()
+        }
+        // Everything at once: the microphone joins as soon as the Mac's sound is
+        // running. Without it (no permission, no input device) the session
+        // carries on with what the Mac plays, and says why. Still busy, so a
+        // stop cannot slip in while the permission prompt is up.
+        if isRecording && source == .all {
+            await setMic(true)
+            if !micEnabled, let reason = error { error = "麦克风没有打开，目前只在转写电脑上的声音。\(reason)" }
         }
         isBusy = false
     }
@@ -455,6 +487,10 @@ final class AppModel: ObservableObject {
 
     func toggleMic(_ value: Bool) async {
         guard isRecording, !isBusy, !micBusy else { return }
+        await setMic(value)
+    }
+
+    private func setMic(_ value: Bool) async {
         micBusy = true
         do {
             if usesCloud && value { openStream(EchoFilter.micSource) }

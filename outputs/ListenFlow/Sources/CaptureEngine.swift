@@ -34,16 +34,27 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
     private let outputFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32,
                                              sampleRate: 16000, channels: 1, interleaved: false)!
 
+    /// `pid` nil captures every app's sound at once — whatever the Mac is playing —
+    /// except this app's own.
     @MainActor
-    func start(pid: pid_t, name: String) async throws {
+    func start(pid: pid_t?, name: String) async throws {
         let content: SCShareableContent
         do { content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false) }
         catch { throw CaptureFailure.message("需要允许「屏幕与系统音频录制」。请在系统设置中授权听流，然后重新打开应用。\n\(error.localizedDescription)") }
-        guard let display = content.displays.first,
-              let app = content.applications.first(where: { $0.processID == pid }) else {
-            throw CaptureFailure.message("所选 App 已退出或暂时不可采集。请刷新列表并重新选择。")
+        guard let display = content.displays.first else {
+            throw CaptureFailure.message("没有可用的显示器，暂时无法采集系统声音。")
         }
-        let filter = SCContentFilter(display: display, including: [app], exceptingWindows: [])
+        let filter: SCContentFilter
+        if let pid {
+            guard let app = content.applications.first(where: { $0.processID == pid }) else {
+                throw CaptureFailure.message("所选 App 已退出或暂时不可采集。请刷新列表并重新选择。")
+            }
+            filter = SCContentFilter(display: display, including: [app], exceptingWindows: [])
+        } else {
+            // Audio is not tied to a display: with no app excluded this is the
+            // sound of all of them, on whichever screen their windows are.
+            filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
+        }
         let config = SCStreamConfiguration()
         config.capturesAudio = true
         config.captureMicrophone = false  // Microphone is NEVER included in this stream.
