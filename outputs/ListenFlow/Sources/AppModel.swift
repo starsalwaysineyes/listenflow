@@ -1938,6 +1938,9 @@ extension AppModel {
             let host = NSHostingView(rootView: view.frame(width: size.width, height: size.height))
             host.frame = NSRect(origin: .zero, size: size)
             let window = NSWindow(contentRect: host.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+            // What a view leaves undrawn stays transparent in the picture.
+            window.isOpaque = false
+            window.backgroundColor = .clear
             window.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
             window.contentView = host
             host.layoutSubtreeIfNeeded()
@@ -1977,6 +1980,29 @@ extension AppModel {
         }
         groupNames = ["读书会"]         // made, with nothing in it yet
         main("main-volc")
+        // The same, as macOS photographs a window: its corners, the three buttons, the shadow, on nothing.
+        // For the README. The title bar is hidden in the app, so the content is given the room one takes.
+        let pane = NSSize(width: 1080, height: 780), bar: CGFloat = 32
+        let edge = RoundedRectangle(cornerRadius: 16, style: .continuous)
+        shot(ContentView(model: self)
+            .safeAreaPadding(.top, bar)
+            .frame(width: pane.width, height: pane.height)
+            .background(Palette.page)
+            .overlay(alignment: .topLeading) {
+                HStack(spacing: 9) {
+                    ForEach([0xFF5F57, 0xFEBC2E, 0x28C840], id: \.self) { hex in
+                        Circle().fill(Color(red: Double(hex >> 16 & 0xFF) / 255, green: Double(hex >> 8 & 0xFF) / 255, blue: Double(hex & 0xFF) / 255))
+                            .overlay(Circle().strokeBorder(.black.opacity(0.12), lineWidth: 0.5)).frame(width: 13, height: 13)
+                    }
+                }.padding(.leading, 9).padding(.top, 9.5)
+            }
+            .clipShape(edge)
+            .overlay(edge.strokeBorder(.black.opacity(0.16), lineWidth: 0.5))
+            .shadow(color: .black.opacity(0.10), radius: 2, y: 1)
+            .shadow(color: .black.opacity(0.28), radius: 26, y: 18)
+            // Room for the shadow to fade out before the edge of the picture.
+            .padding(EdgeInsets(top: 52, leading: 72, bottom: 92, trailing: 72)),
+             NSSize(width: pane.width + 144, height: pane.height + 144), "main-window-framed")
 
         // In the middle of a session: both sources live, a sentence still being heard.
         isRecording = true
