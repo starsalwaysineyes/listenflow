@@ -613,6 +613,8 @@ struct TranscriptBlock: Identifiable, Equatable {
     let refined: Bool
     /// False when the block before it is from the same source.
     var showsSource: Bool
+    /// When its last sentence began.
+    var tail: Date
 }
 
 /// One thing on the transcript page: a paragraph of speech, or a picture kept
@@ -629,7 +631,14 @@ enum TranscriptEntry: Identifiable {
     var time: Date {
         switch self {
         case let .block(block): block.start
-        case let .image(image): image.addedAt
+        case let .image(image): image.position
+        }
+    }
+    /// The latest moment in it that a picture put after it has to come after.
+    var lower: Date {
+        switch self {
+        case let .block(block): block.tail
+        case let .image(image): image.position
         }
     }
 }
@@ -654,28 +663,66 @@ enum TranscriptLayout {
                     && line.text.first.map { $0.isASCII && ($0.isLetter || $0.isNumber) } == true
                 last.text += (latin ? " " : "") + line.text
                 last.end = max(last.end, line.end)
+                last.tail = max(last.tail, line.start)
                 out[out.count - 1] = last
             } else {
                 out.append(TranscriptBlock(id: line.id, start: line.start, end: line.end, source: line.source, text: line.text,
-                                           refined: line.refined == true, showsSource: out.last?.source != line.source))
+                                           refined: line.refined == true, showsSource: out.last?.source != line.source, tail: line.start))
             }
         }
         return out
     }
 
-    /// Paragraphs and pictures in the order they happened. A paragraph names
-    /// its source again after a picture.
+    /// Pictures in the order they are shown: by where they were put, and those
+    /// at one moment by when they were taken.
+    static func ordered(_ images: [ImageAttachment]) -> [ImageAttachment] {
+        images.sorted { ($0.position, $0.addedAt, $0.number) < ($1.position, $1.addedAt, $1.number) }
+    }
+
+    /// Paragraphs and pictures in the order they happened, a moved picture
+    /// where it was put. A paragraph names its source again after a picture.
     static func timeline(_ session: MeetingSession, breakBefore: UUID? = nil) -> [TranscriptEntry] {
-        let images = session.imageLibrary.sorted { $0.addedAt < $1.addedAt }
-        var blocks = blocks(session.lines, breakBefore: breakBefore, cuts: images.map(\.addedAt))[...]
+        let images = ordered(session.imageLibrary)
+        var blocks = blocks(session.lines, breakBefore: breakBefore, cuts: images.map(\.position))[...]
         var out: [TranscriptEntry] = []
         for image in images {
-            while let block = blocks.first, block.start <= image.addedAt { out.append(.block(block)); blocks.removeFirst() }
+            while let block = blocks.first, block.start <= image.position { out.append(.block(block)); blocks.removeFirst() }
             out.append(.image(image))
             if var next = blocks.first { next.showsSource = true; blocks[blocks.startIndex] = next }
         }
         out += blocks.map(TranscriptEntry.block)
         return out
+    }
+
+    /// The moment a picture has to be put at to sit just before or just after
+    /// `entry` — a paragraph or another picture — on the page. A picture is
+    /// shown after every paragraph that began by its moment, and a paragraph is
+    /// cut where one falls inside it; so the moment is taken from between the
+    /// last sentence of what comes before and the start of what comes after,
+    /// and the picture lands between those two sentences however the
+    /// paragraphs around them are made up afterwards. Nil when there is no
+    /// such picture or entry.
+    static func placement(of image: UUID, beside entry: UUID, after: Bool, in session: MeetingSession, breakBefore: UUID? = nil) -> Date? {
+        guard image != entry, session.imageLibrary.contains(where: { $0.id == image }) else { return nil }
+        let entries = timeline(session, breakBefore: breakBefore).filter { $0.id != image }
+        guard let at = entries.firstIndex(where: { $0.id == entry }) else { return nil }
+        let slot = after ? at + 1 : at
+        let lower = slot > 0 ? entries[slot - 1].lower : nil
+        let upper = slot < entries.count ? entries[slot].time : nil
+        switch (lower, upper) {
+        case let (lower?, upper?):
+            return lower < upper ? lower.addingTimeInterval(upper.timeIntervalSince(lower) / 2) : upper.addingTimeInterval(-0.001)
+        case let (lower?, nil): return lower.addingTimeInterval(1)
+        case let (nil, upper?): return upper.addingTimeInterval(-1)
+        default: return nil
+        }
+    }
+
+    /// One place up or down the page; nil at either end.
+    static func step(_ image: UUID, down: Bool, in session: MeetingSession, breakBefore: UUID? = nil) -> Date? {
+        let entries = timeline(session, breakBefore: breakBefore)
+        guard let at = entries.firstIndex(where: { $0.id == image }), entries.indices.contains(down ? at + 1 : at - 1) else { return nil }
+        return placement(of: image, beside: entries[down ? at + 1 : at - 1].id, after: down, in: session, breakBefore: breakBefore)
     }
 }
 

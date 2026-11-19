@@ -466,8 +466,9 @@ enum Lstf {
     static func images(_ session: MeetingSession, in range: Range<Int>) -> [Int: [ImageAttachment]] {
         let lines = session.lines
         var placed: [Int: [ImageAttachment]] = [:]
-        for image in session.imageLibrary.sorted(by: { $0.addedAt < $1.addedAt }) {
-            let index = lines.firstIndex { $0.start > image.addedAt } ?? lines.count
+        // Where the user put it, when it was moved; `at` in the output stays the moment it was taken.
+        for image in TranscriptLayout.ordered(session.imageLibrary) {
+            let index = lines.firstIndex { $0.start > image.position } ?? lines.count
             // The first page takes what came before the first line, the last
             // page what came after the last one.
             let slot = min(max(index, range.lowerBound), range.upperBound)

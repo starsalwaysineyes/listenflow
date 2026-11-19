@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import UniformTypeIdentifiers
 
 /// Colours that follow the system appearance. The surfaces are the Codex
 /// desktop app's: white all over, neutral ink, filled buttons in ink. Two
@@ -803,6 +804,9 @@ private struct TranscriptPage: View {
     @State private var below = false
     @State private var position = ScrollPosition(edge: .top)
     @State private var preview: ImageAttachment?
+    /// The picture being dragged, and the row edge it would land at.
+    @State private var dragging: UUID?
+    @State private var landing: Landing?
 
     /// Where the reader is: how far down, and how far from the end.
     private struct Reach: Equatable {
@@ -827,9 +831,25 @@ private struct TranscriptPage: View {
                     switch entry {
                     case let .block(block):
                         if block.id == tail { LiveTailDivider() }
-                        BlockRow(block: block, created: model.session.created).equatable()
+                        LandingRow(entry: block.id, dragging: $dragging, landing: $landing, move: model.moveImage) {
+                            BlockRow(block: block, created: model.session.created).equatable()
+                        }
                     case let .image(image):
-                        ShotRow(image: image, sessionID: model.session.id, created: model.session.created) { preview = image }
+                        LandingRow(entry: image.id, dragging: $dragging, landing: $landing, move: model.moveImage) {
+                            ShotRow(image: image, sessionID: model.session.id, created: model.session.created,
+                                    first: entries.first?.id == image.id, last: entries.last?.id == image.id) { action in
+                                switch action {
+                                case .open: preview = image
+                                case .lifted: dragging = image.id
+                                case .up: model.stepImage(image.id, down: false)
+                                case .down: model.stepImage(image.id, down: true)
+                                case .reset: model.resetImagePlace(image.id)
+                                case .reveal:
+                                    NSWorkspace.shared.activateFileViewerSelecting([ImageAttachmentStore.url(for: image, sessionID: model.session.id)])
+                                case .delete: model.deleteImage(image.id)
+                                }
+                            }
+                        }
                     }
                 }
                 LivePreviewRows(preview: model.livePreview)
@@ -944,30 +964,130 @@ private struct BlockRow: View, Equatable {
     }
 }
 
-/// A picture kept during the session, at the point where it was taken.
+/// The edge of a row a dragged picture would land at.
+private struct Landing: Equatable {
+    var entry: UUID
+    var after: Bool
+}
+
+/// A row a picture can be dropped on: on its upper half the picture goes
+/// before it, on its lower half after. A line shows where.
+private struct LandingRow<Content: View>: View {
+    let entry: UUID
+    @Binding var dragging: UUID?
+    @Binding var landing: Landing?
+    var move: (UUID, UUID, Bool) -> Void
+    @ViewBuilder var content: Content
+    @State private var height: CGFloat = 0
+
+    var body: some View {
+        content
+            .overlay(alignment: landing?.after == true ? .bottom : .top) {
+                if let landing, landing.entry == entry, dragging != nil, dragging != entry {
+                    // Halfway into the gap between two rows.
+                    Capsule().fill(Palette.accent).frame(height: 2.5)
+                        .padding(.leading, RowMetrics.time + RowMetrics.gutter)
+                        .offset(y: landing.after ? 11 : -11)
+                        .allowsHitTesting(false)
+                }
+            }
+            .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height = $0 }
+            .onDrop(of: [.utf8PlainText], delegate: PictureDrop(entry: entry, height: height, dragging: $dragging, landing: $landing, move: move))
+    }
+}
+
+/// Takes a picture dragged from this page. What is dragged is the picture's id
+/// as text; anything else that is dropped here — a selection of the transcript,
+/// text from another app — is not a picture of this session and does nothing.
+private struct PictureDrop: DropDelegate {
+    let entry: UUID
+    let height: CGFloat
+    @Binding var dragging: UUID?
+    @Binding var landing: Landing?
+    var move: (UUID, UUID, Bool) -> Void
+
+    private func after(_ info: DropInfo) -> Bool { info.location.y > height / 2 }
+    func validateDrop(info: DropInfo) -> Bool { dragging != nil && info.hasItemsConforming(to: [.utf8PlainText]) }
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        let next = Landing(entry: entry, after: after(info))
+        if landing != next { landing = next }
+        return DropProposal(operation: .move)
+    }
+    func dropExited(info: DropInfo) { if landing?.entry == entry { landing = nil } }
+    func performDrop(info: DropInfo) -> Bool {
+        let after = after(info), entry = entry, move = move
+        landing = nil
+        dragging = nil
+        guard let provider = info.itemProviders(for: [.utf8PlainText]).first else { return false }
+        _ = provider.loadObject(ofClass: NSString.self) { text, _ in
+            guard let text = text as? String, let image = UUID(uuidString: text) else { return }
+            DispatchQueue.main.async { move(image, entry, after) }
+        }
+        return true
+    }
+}
+
+/// A picture kept during the session, where it was taken or where it was put
+/// since. It can be dragged to another place on the page, and taken out.
 private struct ShotRow: View {
+    enum Action { case open, lifted, up, down, reset, reveal, delete }
     let image: ImageAttachment
     let sessionID: UUID
     let created: Date
-    var open: () -> Void
+    /// Nothing above it, or nothing below it, to move past.
+    let first: Bool
+    let last: Bool
+    var act: (Action) -> Void
+    @State private var hovering = false
+
     var body: some View {
         MarginRow(time: SessionStore.timestamp(image.addedAt, relativeTo: created), color: Palette.faint) {
             VStack(alignment: .leading, spacing: 6) {
-                Text(image.isShot ? "截屏" : image.name).font(.system(size: 11, weight: .semibold)).foregroundStyle(Palette.muted).lineLimit(1)
-                Button(action: open) {
-                    Group {
-                        if let thumbnail = AttachmentThumbnails.image(image, sessionID: sessionID, edge: 720) {
-                            Image(nsImage: thumbnail).resizable().scaledToFit()
-                        } else {
-                            Label("图片文件不在了", systemImage: "photo.badge.exclamationmark")
-                                .font(.system(size: 12)).foregroundStyle(Palette.muted).frame(width: 240, height: 80)
-                        }
-                    }
-                    .frame(maxWidth: 360, maxHeight: 230, alignment: .leading)
-                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
-                    .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous).strokeBorder(Palette.hairline))
+                HStack(spacing: 6) {
+                    Text(image.isShot ? "截屏" : image.name).font(.system(size: 11, weight: .semibold)).foregroundStyle(Palette.muted).lineLimit(1)
+                    // The time in the margin is when it was taken, which no longer matches its place.
+                    if image.placed != nil { Text("挪过位置").font(.system(size: 11)).foregroundStyle(Palette.faint) }
                 }
-                .buttonStyle(.plain).help("点开看大图")
+                Group {
+                    if let thumbnail = AttachmentThumbnails.image(image, sessionID: sessionID, edge: 720) {
+                        Image(nsImage: thumbnail).resizable().scaledToFit()
+                    } else {
+                        Label("图片文件不在了", systemImage: "photo.badge.exclamationmark")
+                            .font(.system(size: 12)).foregroundStyle(Palette.muted).frame(width: 240, height: 80)
+                    }
+                }
+                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous).strokeBorder(Palette.hairline))
+                .overlay(alignment: .topTrailing) {
+                    if hovering {
+                        Button { act(.delete) } label: {
+                            Image(systemName: "xmark.circle.fill").symbolRenderingMode(.palette)
+                                .foregroundStyle(.white, .black.opacity(0.55)).font(.system(size: 18))
+                        }
+                        .buttonStyle(.plain).padding(6).help("删除这张图（文件移到废纸篓）")
+                    }
+                }
+                .contentShape(Rectangle())
+                .onTapGesture { act(.open) }
+                .onHover { hovering = $0 }
+                .onDrag {
+                    act(.lifted)
+                    return NSItemProvider(object: image.id.uuidString as NSString)
+                }
+                .contextMenu {
+                    Button("看大图") { act(.open) }
+                    Button("在访达中显示") { act(.reveal) }
+                    Divider()
+                    Button("上移一段") { act(.up) }.disabled(first)
+                    Button("下移一段") { act(.down) }.disabled(last)
+                    if image.placed != nil { Button("放回截下时的位置") { act(.reset) } }
+                    Divider()
+                    Button("删除这张图", role: .destructive) { act(.delete) }
+                }
+                .frame(maxWidth: 360, maxHeight: 230, alignment: .leading)
+                .help("点开看大图；拖到别的段落前后可以换位置，右键可以删除")
+                .accessibilityLabel(image.isShot ? "截屏" : image.name)
+                .accessibilityAddTraits(.isButton)
             }
         }
     }

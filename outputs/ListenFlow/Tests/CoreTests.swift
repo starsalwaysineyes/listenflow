@@ -788,6 +788,63 @@ enum CaptureFailure: LocalizedError {
             var onlyPictures = MeetingSession(title: "只有图", created: listStart)
             onlyPictures.images = [early]
             precondition(Lstf.page(Lstf.Info(session: onlyPictures), range: 0..<0, note: nil).contains("只有上面的图片"))
+
+            // Moving a picture: only the moment it is shown at changes, and it lands between the two sentences it was put between.
+            func pageShape(_ session: MeetingSession) -> [String] {
+                TranscriptLayout.timeline(session).map { entry in
+                    switch entry {
+                    case let .block(block): return "说:" + block.text
+                    case let .image(image): return "图:\(image.number)"
+                    }
+                }
+            }
+            func put(_ session: inout MeetingSession, _ image: ImageAttachment, _ moment: Date?) {
+                let index = session.images!.firstIndex { $0.id == image.id }!
+                session.images![index].placed = moment
+            }
+            var moved = pictured
+            let row3ID = moved.lines[2].id, row4ID = moved.lines[3].id, row1ID = moved.lines[0].id
+            let beforeNext = TranscriptLayout.placement(of: late.id, beside: row3ID, after: false, in: moved)!
+            precondition(abs(beforeNext.timeIntervalSince(listStart) - 26.6) < 0.001, "Halfway between the last sentence before and the paragraph after")
+            put(&moved, late, beforeNext)
+            precondition(pageShape(moved) == ["图:1", "说:看这一页。", "图:2", "图:3", "说:左边是问题。", "图:4", "说:下一页。", "说:好的。"], "\(pageShape(moved))")
+            put(&moved, early, TranscriptLayout.placement(of: early.id, beside: row4ID, after: true, in: moved)!)
+            precondition(pageShape(moved) == ["说:看这一页。", "图:2", "图:3", "说:左边是问题。", "图:4", "说:下一页。", "说:好的。", "图:1"], "To the very end: \(pageShape(moved))")
+            put(&moved, middle, TranscriptLayout.placement(of: middle.id, beside: late.id, after: true, in: moved)!)
+            precondition(pageShape(moved) == ["说:看这一页。", "图:3", "说:左边是问题。", "图:4", "图:2", "说:下一页。", "说:好的。", "图:1"], "Beside another picture: \(pageShape(moved))")
+            put(&moved, twin, TranscriptLayout.placement(of: twin.id, beside: row1ID, after: false, in: moved)!)
+            precondition(pageShape(moved) == ["图:3", "说:看这一页。左边是问题。", "图:4", "图:2", "说:下一页。", "说:好的。", "图:1"],
+                         "To the very start; the paragraph it had cut in two is whole again: \(pageShape(moved))")
+            // One place at a time, from the menu.
+            precondition(TranscriptLayout.step(twin.id, down: false, in: moved) == nil && TranscriptLayout.step(early.id, down: true, in: moved) == nil, "Nowhere to go at either end")
+            put(&moved, late, TranscriptLayout.step(late.id, down: true, in: moved)!)
+            precondition(pageShape(moved) == ["图:3", "说:看这一页。左边是问题。", "图:2", "图:4", "说:下一页。", "说:好的。", "图:1"], "\(pageShape(moved))")
+            put(&moved, twin, TranscriptLayout.step(twin.id, down: true, in: moved)!)
+            precondition(pageShape(moved) == ["说:看这一页。左边是问题。", "图:3", "图:2", "图:4", "说:下一页。", "说:好的。", "图:1"], "Past a whole paragraph, not into it: \(pageShape(moved))")
+            put(&moved, early, TranscriptLayout.step(early.id, down: false, in: moved)!)
+            precondition(pageShape(moved) == ["说:看这一页。左边是问题。", "图:3", "图:2", "图:4", "说:下一页。", "图:1", "说:好的。"], "\(pageShape(moved))")
+            precondition(TranscriptLayout.placement(of: late.id, beside: late.id, after: true, in: moved) == nil
+                         && TranscriptLayout.placement(of: UUID(), beside: row1ID, after: true, in: moved) == nil
+                         && TranscriptLayout.placement(of: late.id, beside: UUID(), after: true, in: moved) == nil, "Nothing to do with ids that are not on the page")
+            // The place holds when the sentences are recognized again and come back as other lines.
+            var rerecognized = moved
+            rerecognized.lines = moved.lines.map { TranscriptLine(start: $0.start, end: $0.end, source: $0.source, text: $0.text, latency: 0, refined: true) }
+            precondition(pageShape(rerecognized) == ["说:看这一页。", "说:左边是问题。", "图:3", "图:2", "图:4", "说:下一页。", "图:1", "说:好的。"], "\(pageShape(rerecognized))")
+            // Saved with the session; when it was taken is untouched, and that is what an agent is told.
+            let movedAgain = try JSONDecoder().decode(MeetingSession.self, from: JSONEncoder().encode(moved))
+            precondition(pageShape(movedAgain) == pageShape(moved))
+            let movedEarly = movedAgain.imageLibrary.first { $0.id == early.id }!
+            precondition(movedEarly.placed != nil && movedEarly.addedAt == early.addedAt && legacyImage.placed == nil && legacyImage.position == legacyImage.addedAt)
+            let movedPages = Lstf.images(moved, in: 0..<4)
+            precondition(movedPages[2]?.map(\.number) == [3, 2, 4] && movedPages[3]?.map(\.number) == [1] && movedPages[0] == nil && movedPages[4] == nil, "lstf shows a moved picture where it was put")
+            precondition(Lstf.json(movedEarly, session: moved, beforeLine: 4)["at"] as? String == "00:04")
+            put(&moved, early, nil)
+            precondition(pageShape(moved).first == "图:1", "Put back where it was taken")
+            // Taking one out: the file goes, the others stay.
+            let twinURL = ImageAttachmentStore.url(for: twin, sessionID: pictured.id)
+            try ImageAttachmentStore.discard(twin, sessionID: pictured.id, toTrash: false)
+            precondition(!FileManager.default.fileExists(atPath: twinURL.path) && FileManager.default.fileExists(atPath: middleURL.path))
+            try ImageAttachmentStore.discard(twin, sessionID: pictured.id, toTrash: false)
             precondition(Lstf.help.contains("[截屏]"))
 
             // Hot words: one file, shared by the app and the tool; order is priority.
@@ -983,6 +1040,7 @@ enum CaptureFailure: LocalizedError {
         print("PASS: recording refinement (span index, upload planning and cutting, clock mapping, WAV, request, replacement guards, paragraphs, when to cut on pauses), kept speech store, key file")
         print("PASS: lstf (arguments, choosing a session, paging, output, search), app/tool request files, refinement applied to a stored session")
         print("PASS: session list summaries, saving off the main thread, paragraphs on the page, screenshots kept by time and shown to lstf, hot word file and lstf hotword, console tables, kept-audio files held open")
+        print("PASS: pictures on the page (moved before and after paragraphs and each other, one place at a time, holding through re-recognition, put back, taken out)")
         // --- 0.12.0: sessions filed under groups ---
         do {
             let groupRoot = FileManager.default.temporaryDirectory.appendingPathComponent("lf-groups-\(UUID().uuidString)")

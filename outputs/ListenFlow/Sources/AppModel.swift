@@ -373,6 +373,9 @@ final class AppModel: ObservableObject {
         if ListenFlowHome.isPreview, let path = ProcessInfo.processInfo.environment["LISTENFLOW_PREVIEW_DELETECHECK"] {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.deleteCheck(to: path) }
         }
+        if ListenFlowHome.isPreview, let path = ProcessInfo.processInfo.environment["LISTENFLOW_PREVIEW_PICTURECHECK"] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.pictureCheck(to: path) }
+        }
         if ListenFlowHome.isPreview, let path = ProcessInfo.processInfo.environment["LISTENFLOW_PREVIEW_SCROLLCHECK"] {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.scrollCheck(to: path) }
         }
@@ -1387,6 +1390,43 @@ final class AppModel: ObservableObject {
         if selected { organizationImageIDs.insert(image.id) } else { organizationImageIDs.remove(image.id) }
     }
 
+    // MARK: Pictures on the page
+
+    /// Puts a picture just before or after a paragraph or another picture.
+    /// Only where it is shown changes; when it was taken stays.
+    func moveImage(_ id: UUID, beside entry: UUID, after: Bool) {
+        if let moment = TranscriptLayout.placement(of: id, beside: entry, after: after, in: session, breakBefore: liveTailStart) { placeImage(id, at: moment) }
+    }
+    func stepImage(_ id: UUID, down: Bool) {
+        if let moment = TranscriptLayout.step(id, down: down, in: session, breakBefore: liveTailStart) { placeImage(id, at: moment) }
+    }
+    /// Back to where it was taken.
+    func resetImagePlace(_ id: UUID) { placeImage(id, at: nil) }
+    private func placeImage(_ id: UUID, at moment: Date?) {
+        guard SessionStore.writes, var images = session.images, let index = images.firstIndex(where: { $0.id == id }),
+              images[index].placed != moment else { return }
+        images[index].placed = moment
+        session.images = images
+        persist()
+    }
+
+    /// Takes one picture out of the session. Its file goes to the Trash.
+    func deleteImage(_ id: UUID) {
+        guard SessionStore.writes, let image = session.imageLibrary.first(where: { $0.id == id }) else { return }
+        // A draft being written may be reading the file this moment.
+        guard !isOrganizing, !isImportingImages else { error = "正在整理或导入图片，完成后再删除。"; return }
+        session.images = session.imageLibrary.filter { $0.id != id }
+        organizationImageIDs.remove(id)
+        // Not `persist`: that leaves an empty session alone, and this one is on disk with the picture still in it.
+        writer.save(session)
+        remember(SessionSummary(session))
+        do {
+            // A check run from a terminal has no business in the user's Trash.
+            try ImageAttachmentStore.discard(image, sessionID: session.id, toTrash: !ListenFlowHome.isPreview)
+            notice = "已删除这张\(image.isShot ? "截屏" : "图片")，文件在废纸篓里。"
+        } catch { self.error = "图片已从会话里去掉，但文件没有删掉：\(error.localizedDescription)" }
+    }
+
     /// One click keeps the whole screen with the session, at this moment: no
     /// region to drag, no window hidden. The transcript shows it where it
     /// happened, and `lstf` hands its path to an agent at the same place.
@@ -2144,6 +2184,65 @@ extension AppModel {
         writer.flush()
         result["4 sessions left on disk"] = SessionStore.all().map(\.id.uuidString)
         result["4 rows left in the list"] = history.map(\.id.uuidString)
+        finish()
+    }
+
+    /// Moving pictures about the page and taking them out, by the calls the
+    /// page makes, on a stored session; what the page shows and what is on
+    /// disk after each. Needs LISTENFLOW_PREVIEW_STORE holding a session with
+    /// three paragraphs and three pictures.
+    private func pictureCheck(to path: String) {
+        var result: [String: Any] = [:]
+        func finish() {
+            if let data = try? JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys]) {
+                try? data.write(to: URL(fileURLWithPath: path))
+            }
+            NSApp.terminate(nil)
+        }
+        guard SessionStore.folderOverride != nil,
+              let stored = SessionStore.all().first(where: { $0.imageLibrary.count >= 3 && $0.lines.count >= 3 }) else {
+            result["error"] = "needs LISTENFLOW_PREVIEW_STORE with a session of three lines and three pictures"; finish(); return
+        }
+        history = SessionStore.summaries()
+        openSession(stored.id)
+        func shape(_ session: MeetingSession) -> [String] {
+            TranscriptLayout.timeline(session).map { entry in
+                switch entry {
+                case let .block(block): "说:" + block.text
+                case let .image(image): "图:\(image.number)" + (image.placed == nil ? "" : "(挪过)")
+                }
+            }
+        }
+        func record(_ step: String) {
+            writer.flush()
+            let files = (try? FileManager.default.contentsOfDirectory(atPath: ImageAttachmentStore.folder(for: stored.id).path))?.sorted() ?? []
+            result[step] = ["page": shape(session), "on disk": SessionStore.all().first { $0.id == stored.id }.map(shape) ?? [],
+                            "files": files, "notice": notice ?? "", "error": error ?? "",
+                            "listed pictures": history.first { $0.id == stored.id }?.imageCount ?? -1,
+                            "chosen for the draft": organizationImageIDs.count] as [String: Any]
+            notice = nil; error = nil
+        }
+        let pictures = TranscriptLayout.ordered(session.imageLibrary)
+        let paragraphs = TranscriptLayout.timeline(session).compactMap { entry -> UUID? in if case let .block(block) = entry { return block.id }; return nil }
+        record("0 as stored")
+        moveImage(pictures[2].id, beside: paragraphs[0], after: false)
+        record("1 the last picture dropped on the upper half of the first paragraph")
+        moveImage(pictures[0].id, beside: pictures[1].id, after: true)
+        record("2 the first picture dropped on the lower half of the second picture")
+        stepImage(pictures[1].id, down: true)
+        record("3 the second picture, one place down from the menu")
+        resetImagePlace(pictures[2].id)
+        record("4 the last picture put back where it was taken")
+        selectImage(pictures[1], selected: true)
+        isOrganizing = true
+        deleteImage(pictures[1].id)
+        record("5 delete while a draft is being written: refused")
+        isOrganizing = false
+        deleteImage(pictures[1].id)
+        record("6 the second picture deleted")
+        deleteImage(pictures[0].id)
+        deleteImage(pictures[2].id)
+        record("7 the other two deleted")
         finish()
     }
 

@@ -18,8 +18,14 @@ struct ImageAttachment: Identifiable, Codable, Sendable {
     /// A full-screen capture taken during the session, as opposed to a picture
     /// the user added as reference material.
     var shot: Bool? = nil
+    /// Where on the page the user moved it to, as a moment of the session; nil
+    /// while it sits where it was taken. A moment rather than a line, so that it
+    /// holds when the sentences around it are recognized again and replaced.
+    var placed: Date? = nil
     var label: String { "图片\(number)" }
     var isShot: Bool { shot == true }
+    /// The moment it is shown at.
+    var position: Date { placed ?? addedAt }
 }
 
 enum ImageImportSource: Sendable {
@@ -137,6 +143,15 @@ enum ImageAttachmentStore {
         try jpeg.write(to: output, options: .atomic)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: output.path)
         return attachment
+    }
+
+    /// A deleted picture goes to the Trash, where a slip can still be undone;
+    /// one that cannot be moved there is removed. A file already gone is no error.
+    static func discard(_ image: ImageAttachment, sessionID: UUID, toTrash: Bool = true) throws {
+        let file = url(for: image, sessionID: sessionID)
+        guard FileManager.default.fileExists(atPath: file.path) else { return }
+        if toTrash, (try? FileManager.default.trashItem(at: file, resultingItemURL: nil)) != nil { return }
+        try FileManager.default.removeItem(at: file)
     }
 
     static func content(text: String, images: [ImageAttachment], sessionID: UUID) throws -> Any {
