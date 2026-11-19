@@ -1944,6 +1944,18 @@ extension AppModel {
                     .fill(Color(red: 0.2, green: 0.2, blue: 0.24)).frame(width: notch, height: 32)
             }, NSSize(width: 700, height: 380), name)
         }
+        // As short as it goes: while a sentence is still being said, and between sentences.
+        for live in [true, false] {
+            if !live { livePreview.clear(); hasLivePartial = false }
+            for body in [NotchIslandController.minBody] {
+                let short = IslandState()
+                short.mode = .expanded
+                shot(ZStack(alignment: .top) {
+                    Color(white: 0.82)
+                    NotchIslandView(model: self, levels: levels, state: short).frame(width: 720, height: short.notch.height + body)
+                }, NSSize(width: 800, height: 160), "island-short" + (live ? "-live" : ""))
+            }
+        }
         isRecording = false
         activeSource = nil
         micEnabled = false

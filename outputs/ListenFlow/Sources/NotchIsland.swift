@@ -21,8 +21,9 @@ final class IslandState: ObservableObject {
 final class NotchIslandController {
     /// Body height bounds for dragging. For scale, measured on a real lecture in
     /// quality mode (merged lines of 63–113 characters): 300 pt shows about 4 of
-    /// them, 520 pt about 8.
-    static let minBody: CGFloat = 120
+    /// them, 520 pt about 8. The least is one line whole, with its time and
+    /// source: at 60 pt the fade at the top edge cut into it.
+    static let minBody: CGFloat = 68
     static func maxBody(on screen: NSScreen) -> CGFloat { screen.visibleFrame.height * 0.75 }
     /// Beside the notch from here up, the header has the spacing it was drawn with.
     static let roomyHeader: CGFloat = 300
