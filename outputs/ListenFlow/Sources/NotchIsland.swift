@@ -24,6 +24,18 @@ final class NotchIslandController {
     /// them, 520 pt about 8.
     static let minBody: CGFloat = 120
     static func maxBody(on screen: NSScreen) -> CGFloat { screen.visibleFrame.height * 0.75 }
+    /// Beside the notch from here up, the header has the spacing it was drawn with.
+    static let roomyHeader: CGFloat = 300
+    /// The narrowest the panel goes: the one row of status and controls beside
+    /// the notch still fits, drawn closer together (measured: the clock at
+    /// 「123:45」 with every control showing needs the notch plus 234 pt).
+    static func minWidth(notch: CGFloat) -> CGFloat { notch + 240 }
+    /// For the settings slider, which has no panel to ask.
+    static func minWidth() -> CGFloat {
+        guard let screen = NSScreen.screens.first(where: { $0.safeAreaInsets.top > 0 }),
+              let left = screen.auxiliaryTopLeftArea, let right = screen.auxiliaryTopRightArea else { return minWidth(notch: 190) }
+        return minWidth(notch: screen.frame.width - left.width - right.width)
+    }
 
     let state = IslandState()
     private weak var model: AppModel?
@@ -140,7 +152,7 @@ final class NotchIslandController {
         let frame = screen.frame
         // Never narrower than the notch plus room for the controls beside it,
         // never wider than the screen.
-        let width = min(max(CGFloat(laidOutWidth), state.notch.width + 300), frame.width - 40)
+        let width = min(max(CGFloat(laidOutWidth), Self.minWidth(notch: state.notch.width)), frame.width - 40)
         let height = state.notch.height + liveBody
         panel.setFrame(NSRect(x: frame.midX - width / 2, y: frame.maxY - height, width: width, height: height), display: true)
     }
@@ -216,7 +228,7 @@ struct NotchIslandView: View {
             ZStack(alignment: .top) {
                 shape.fill(Color.black)
                 switch state.mode {
-                case .expanded: expanded.transition(.opacity)
+                case .expanded: expanded(tight: size.width < state.notch.width + NotchIslandController.roomyHeader).transition(.opacity)
                 case .compact: compact.transition(.opacity)
                 case .hidden: EmptyView()
                 }
@@ -240,10 +252,12 @@ struct NotchIslandView: View {
 
     // MARK: Expanded
 
-    private var expanded: some View {
+    /// `tight`: the panel was set narrower than the header was drawn for, so
+    /// what sits beside the notch closes up and the text gets the room back.
+    private func expanded(tight: Bool) -> some View {
         VStack(spacing: 0) {
-            header.frame(height: state.notch.height)
-            transcript
+            header(tight: tight).frame(height: state.notch.height)
+            transcript(edge: tight ? 14 : 22)
             resizeHandle
         }
     }
@@ -261,25 +275,26 @@ struct NotchIslandView: View {
     }
 
     /// Status on the left of the notch, controls on the right; nothing under the camera.
-    private var header: some View {
-        HStack(spacing: 10) {
-            HStack(spacing: 8) {
+    private func header(tight: Bool) -> some View {
+        HStack(spacing: tight ? 6 : 10) {
+            HStack(spacing: tight ? 6 : 8) {
                 if model.isRecording {
                     Circle().fill(Color.red).frame(width: 7, height: 7)
                     TimelineView(.periodic(from: model.session.created, by: 1)) { context in
                         Text(SessionStore.timestamp(context.date, relativeTo: model.session.created))
                             .font(.system(size: 11.5, weight: .medium, design: .monospaced)).monospacedDigit()
+                            .lineLimit(1).fixedSize()
                     }
                 } else {
                     Text(model.pendingCount > 0 ? "识别中" : "未在转写").font(.system(size: 11.5, weight: .medium))
-                        .foregroundStyle(.white.opacity(0.6))
+                        .foregroundStyle(.white.opacity(0.6)).lineLimit(1).fixedSize()
                 }
                 iconButton(model.isRecording ? "pause.fill" : "record.circle", help: model.isRecording ? "暂停转写" : "开始转写") {
                     Task { await model.toggleRecording() }
                 }.disabled(!model.canToggleRecording)
             }
-            Spacer(minLength: state.notch.width + 20)
-            HStack(spacing: 12) {
+            Spacer(minLength: state.notch.width + (tight ? 10 : 20))
+            HStack(spacing: tight ? 8 : 12) {
                 if model.isRecording { IslandLevel(levels: levels) }
                 IslandShotButton(model: model)
                 iconButton(model.islandPinned ? "pin.fill" : "pin", help: model.islandPinned ? "取消固定，移开鼠标后收起" : "固定展开") {
@@ -289,7 +304,7 @@ struct NotchIslandView: View {
             }
         }
         .foregroundStyle(.white.opacity(0.9))
-        .padding(.horizontal, 22)
+        .padding(.horizontal, tight ? 14 : 22)
     }
 
     private func iconButton(_ name: String, help: String, action: @escaping () -> Void) -> some View {
@@ -307,7 +322,7 @@ struct NotchIslandView: View {
         Set(shownLines.map(\.source)).count > 1 || (model.micEnabled && model.activeSource != .microphone)
     }
 
-    private var transcript: some View {
+    private func transcript(edge: CGFloat) -> some View {
         let lines = shownLines
         let tail = model.liveTailStart
         let tags = showSources
@@ -336,7 +351,7 @@ struct NotchIslandView: View {
                     }
                     Color.clear.frame(height: 1).id("end")
                 }
-                .padding(.horizontal, 22).padding(.top, 8).padding(.bottom, 6)
+                .padding(.horizontal, edge).padding(.top, 8).padding(.bottom, 6)
             }
             .scrollIndicators(.never)
             // Lazy rows are measured late; anchoring keeps the newest line in view

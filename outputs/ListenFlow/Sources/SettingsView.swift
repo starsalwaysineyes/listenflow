@@ -79,7 +79,8 @@ struct SettingsView: View {
                             Toggle("收起时常亮显示最新一句", isOn: $draft.islandShowLatest).disabled(!draft.islandEnabled)
                             HStack(spacing: 10) {
                                 Text("宽度")
-                                Slider(value: $draft.islandWidth, in: 480...1100, step: 20)
+                                // As narrow as this Mac's notch allows, in round numbers.
+                                Slider(value: $draft.islandWidth, in: (Double(NotchIslandController.minWidth()) / 10).rounded(.up) * 10...1100, step: 10)
                                 Text("\(Int(draft.islandWidth)) pt").font(.system(size: 11, design: .monospaced))
                                     .foregroundStyle(.secondary).frame(width: 52, alignment: .trailing)
                             }.disabled(!draft.islandEnabled)

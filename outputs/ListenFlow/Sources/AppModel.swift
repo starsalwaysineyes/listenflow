@@ -1931,6 +1931,19 @@ extension AppModel {
             .font(.system(size: 13)).foregroundStyle(.black.opacity(0.8)).padding(.horizontal, 48).frame(height: 32)
             NotchIslandView(model: self, levels: levels, state: hanging).frame(width: 720, height: 300)
         }, NSSize(width: 1200, height: 420), "island")
+        // As narrow as it goes, with the notch drawn in so that anything under it shows.
+        for (notch, name) in [(CGFloat(185), "island-narrow"), (220, "island-narrow-wide-notch")] {
+            let narrow = IslandState()
+            narrow.mode = .expanded
+            narrow.notch = CGSize(width: notch, height: 32)
+            shot(ZStack(alignment: .top) {
+                Color(white: 0.82)
+                NotchIslandView(model: self, levels: levels, state: narrow)
+                    .frame(width: NotchIslandController.minWidth(notch: notch), height: 300)
+                UnevenRoundedRectangle(cornerRadii: .init(bottomLeading: 8, bottomTrailing: 8))
+                    .fill(Color(red: 0.2, green: 0.2, blue: 0.24)).frame(width: notch, height: 32)
+            }, NSSize(width: 700, height: 380), name)
+        }
         isRecording = false
         activeSource = nil
         micEnabled = false
