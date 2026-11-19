@@ -838,6 +838,12 @@ enum CaptureFailure: LocalizedError {
             let movedPages = Lstf.images(moved, in: 0..<4)
             precondition(movedPages[2]?.map(\.number) == [3, 2, 4] && movedPages[3]?.map(\.number) == [1] && movedPages[0] == nil && movedPages[4] == nil, "lstf shows a moved picture where it was put")
             precondition(Lstf.json(movedEarly, session: moved, beforeLine: 4)["at"] as? String == "00:04")
+            // And says so: among lines of another time, a picture's own time would read as a mistake.
+            let movedRows = Lstf.page(Lstf.Info(session: moved), range: 0..<4, note: nil).split(separator: "\n").map(String.init).filter { $0.contains("[截屏") }
+            precondition(movedRows.count == 4 && movedRows.allSatisfy { $0.contains("[截屏，用户挪到此处] /") } && movedRows[3].contains("[00:04] [截屏，用户挪到此处]"), "\(movedRows)")
+            precondition(Lstf.json(movedEarly, session: moved, beforeLine: 4)["moved"] as? Bool == true && pictureJSON["moved"] as? Bool == false
+                         && bodyRows[0].contains("[00:04] [截屏] /"), "A picture left where it was taken is shown as before")
+            precondition(Lstf.help.contains("用户挪到此处") && Lstf.help.contains("moved"))
             put(&moved, early, nil)
             precondition(pageShape(moved).first == "图:1", "Put back where it was taken")
             // Taking one out: the file goes, the others stay.

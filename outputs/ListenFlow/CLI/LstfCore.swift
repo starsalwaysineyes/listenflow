@@ -52,6 +52,8 @@ enum Lstf {
       每行是一句定稿的话：行号、从会话开始算起的时间、来源（麦克风 / 电脑声音 / App 名）、文字。
       没有行号、标着 [截屏] 或 [图片] 的行是一张图：用户当时截下的整个屏幕（幻灯片、共享的文档），
       或手动加进会话的图片。后面是图片文件的路径，按时间插在转写中间，需要时直接读这个文件。
+      图片行在哪两行之间，它讲的就是那里的内容。标着「用户挪到此处」的图是用户自己摆到这个位置的：
+      以位置为准，行首的时间是截下的时刻，可能和上下行差得很远。--json 里对应 beforeLine 和 moved。
       --offset N         从第 N 行开始（从 1 起，默认 1）
       --limit N          最多读 N 行（默认 200）
       --tail N           只读最后 N 行
@@ -480,7 +482,8 @@ enum Lstf {
     }
 
     static func imageRow(_ image: ImageAttachment, session: MeetingSession, width: Int) -> String {
-        let kind = image.isShot ? "截屏" : "图片"
+        // A moved picture stands among lines of another time: say that it was put here, or its own time reads as a mistake.
+        let kind = (image.isShot ? "截屏" : "图片") + (image.placed == nil ? "" : "，用户挪到此处")
         return String(repeating: " ", count: width) + "  [\(clock(image.addedAt.timeIntervalSince(session.created)))] [\(kind)] "
             + ImageAttachmentStore.url(for: image, sessionID: session.id).path
     }
@@ -585,11 +588,13 @@ enum Lstf {
     }
 
     /// `beforeLine` is the number of the line the picture comes before; one more
-    /// than the last line when it came after everything said so far.
+    /// than the last line when it came after everything said so far. `moved`:
+    /// the user put it there, and `at` — when it was taken — may be far from
+    /// the lines around it.
     static func json(_ image: ImageAttachment, session: MeetingSession, beforeLine: Int) -> [String: Any] {
         ["kind": image.isShot ? "screenshot" : "image", "at": clock(image.addedAt.timeIntervalSince(session.created)),
          "time": iso(image.addedAt), "path": ImageAttachmentStore.url(for: image, sessionID: session.id).path,
-         "width": image.width, "height": image.height, "beforeLine": beforeLine]
+         "width": image.width, "height": image.height, "beforeLine": beforeLine, "moved": image.placed != nil]
     }
 
     static func json(_ line: TranscriptLine, number: Int, created: Date) -> [String: Any] {
