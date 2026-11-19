@@ -523,8 +523,11 @@ private struct SessionRow: View {
                 // Outside `disabled`: a session can be renamed or filed while another one is recording.
                 .contextMenu {
                     Button("改名…") { renaming = true }
-                    // A session with nothing in it yet has no file to keep a group in.
+                    // A session with nothing in it yet has no file to keep a group in, and none for `lstf` to find.
                     if row.lineCount > 0 || row.imageCount > 0 {
+                        Button("复制给 agent 的命令（lstf info）") { model.copySession(row.id, asCommand: true) }
+                        Button("复制会话 ID") { model.copySession(row.id, asCommand: false) }
+                        Divider()
                         Menu("移到分组") {
                             ForEach(groups, id: \.self) { name in
                                 Button { file(under: name) } label: {

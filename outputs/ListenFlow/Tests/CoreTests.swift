@@ -789,6 +789,36 @@ enum CaptureFailure: LocalizedError {
             onlyPictures.images = [early]
             precondition(Lstf.page(Lstf.Info(session: onlyPictures), range: 0..<0, note: nil).contains("只有上面的图片"))
 
+            // Handing a session to an agent: the app copies one command, and that command finds the session and says what it is.
+            let handed = AgentBridge.infoCommand(pictured.id)
+            precondition(handed == "lstf info " + pictured.id.uuidString, "The command and nothing around it")
+            let handedCommand = try Lstf.parse(Array(handed.split(separator: " ").dropFirst().map(String.init)))
+            precondition(handedCommand == .info(session: pictured.id.uuidString, json: false))
+            let infoBare = try Lstf.parse(["info"]), infoJSON = try Lstf.parse(["info", "latest", "--json"])
+            precondition(infoBare == .info(session: nil, json: false) && infoJSON == .info(session: "latest", json: true))
+            precondition((try? Lstf.parse(["info", "a", "b"])) == nil && (try? Lstf.parse(["info", "--limit", "3"])) == nil)
+            var other = MeetingSession(title: "另一场", created: listStart)
+            other.lines = [said(1, 1, "麦克风", "别的。")]
+            let byID = try Lstf.resolve(pictured.id.uuidString, sessions: [other, pictured], open: nil, running: false).session.id
+            let byLowerID = try Lstf.resolve(pictured.id.uuidString.lowercased(), sessions: [other, pictured], open: nil, running: false).session.id
+            precondition(byID == pictured.id && byLowerID == pictured.id, "The whole id finds it, in either case")
+            var aboutSession = pictured
+            aboutSession.group = "产品周会"
+            let about = Lstf.about(Lstf.Info(session: aboutSession), note: nil)
+            let short = Lstf.shortID(pictured.id)
+            precondition(about.hasPrefix("会话 \(short)「带截屏」\n") && about.contains("  ID      " + pictured.id.uuidString + "\n")
+                         && about.contains("  转写    4 行（电脑声音 3，麦克风 1）") && about.contains("  分组    「产品周会」") && about.contains("  整理稿  还没有")
+                         && about.contains("  图片    截屏 4 张") && about.contains("  lstf read \(short) ") && !about.contains("--organized")
+                         && about.contains("lstf search 关键词 --session \(short)"), about)
+            precondition(!about.contains("看这一页") && !about.contains("下一页"), "None of what was said")
+            aboutSession.setDraft("整理好的。", through: 3, author: "agent")
+            let aboutDrafted = Lstf.about(Lstf.Info(session: aboutSession, open: true), note: "提示")
+            precondition(aboutDrafted.hasPrefix("提示\n会话 ") && aboutDrafted.contains("agent 通过 lstf 写入") && aboutDrafted.contains("之后还有 1 行没有纳入")
+                         && aboutDrafted.contains("lstf read \(short) --organized") && aboutDrafted.contains("听流里正打开着"), aboutDrafted)
+            let aboutEmpty = Lstf.about(Lstf.Info(session: MeetingSession(title: "空的", created: listStart)), note: nil)
+            precondition(aboutEmpty.contains("  转写    还没有内容") && aboutEmpty.contains("还没有可读的内容") && !aboutEmpty.contains("lstf read"), aboutEmpty)
+            precondition(Lstf.help.contains("lstf info [会话]") && Lstf.help.contains("lstf info <完整 ID>"))
+
             // Moving a picture: only the moment it is shown at changes, and it lands between the two sentences it was put between.
             func pageShape(_ session: MeetingSession) -> [String] {
                 TranscriptLayout.timeline(session).map { entry in
@@ -1046,6 +1076,7 @@ enum CaptureFailure: LocalizedError {
         print("PASS: recording refinement (span index, upload planning and cutting, clock mapping, WAV, request, replacement guards, paragraphs, when to cut on pauses), kept speech store, key file")
         print("PASS: lstf (arguments, choosing a session, paging, output, search), app/tool request files, refinement applied to a stored session")
         print("PASS: session list summaries, saving off the main thread, paragraphs on the page, screenshots kept by time and shown to lstf, hot word file and lstf hotword, console tables, kept-audio files held open")
+        print("PASS: a session handed to an agent (the command the app copies, lstf info by the whole id, what it says and leaves out)")
         print("PASS: pictures on the page (moved before and after paragraphs and each other, one place at a time, holding through re-recognition, put back, taken out)")
         // --- 0.12.0: sessions filed under groups ---
         do {

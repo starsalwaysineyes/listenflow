@@ -100,6 +100,23 @@ enum Tool {
             shown.forEach { print(Lstf.listRow($0)) }
             if sessions.count > shown.count { print("— 共 \(sessions.count) 场，只列出最近 \(shown.count) 场；加 --limit 看更多。") }
 
+        case let .info(selector, json):
+            let picked = try Lstf.resolve(selector, sessions: SessionStore.all(), open: state?.sessionID, running: state != nil)
+            let item = info(picked.session, state)
+            if json {
+                var object = Lstf.json(item)
+                object["sources"] = Lstf.sources(picked.session).map { ["source": $0.name, "lines": $0.lines] as [String: Any] }
+                if let last = picked.session.lines.last { object["ended"] = Lstf.iso(last.end) }
+                if let organized = picked.session.organized {
+                    object["organizedBy"] = organized.fromAgent ? "agent" : "app"
+                    object["linesNotInDraft"] = picked.session.unorganizedCount
+                }
+                if let note = picked.note { object["note"] = note }
+                emit(object)
+                return
+            }
+            print(Lstf.about(item, note: picked.note), terminator: "")
+
         case let .read(options):
             let picked = try Lstf.resolve(options.session, sessions: SessionStore.all(), open: state?.sessionID, running: state != nil)
             let item = info(picked.session, state)

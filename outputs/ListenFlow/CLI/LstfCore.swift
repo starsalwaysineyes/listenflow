@@ -25,6 +25,7 @@ enum Lstf {
       lstf status                      听流是否在运行、是否在录、当前是哪一场
       lstf list [--limit N] [--group 分组]
                                        历史会话，新的在前（默认 20 场）；--group 只列某个分组里的
+      lstf info [会话]                 一场会话的概况：是哪一场、多长、有没有整理稿和截屏、接着怎么读
       lstf read [会话] [选项]           读一场会话的转写
       lstf search 关键词 [--session 会话] [--limit N]
                                        在全部（或一场）会话里找包含关键词的句子
@@ -47,6 +48,8 @@ enum Lstf {
       省略或 current     听流里当前打开的那一场（正在录的就是它）；没有就取最近一场
       latest             最近一场
       3F2A91BC           会话 ID 开头的几位（lstf list 的第一列），至少 4 位
+      3F2A91BC-…-…       完整的会话 ID。用户在听流里右键一场会话可以复制它，或者直接复制一条
+                         lstf info <完整 ID>：收到这样一条命令，就是用户在指给你看这一场，先运行它。
 
     read：像读文件一样按行读
       每行是一句定稿的话：行号、从会话开始算起的时间、来源（麦克风 / 电脑声音 / App 名）、文字。
@@ -67,6 +70,7 @@ enum Lstf {
       刚才 / 最近几分钟说了什么         lstf read --minutes 5
       当时屏幕上放的是什么               lstf read 里找 [截屏] 行，读它给出的图片文件
       读完当前这一场                     lstf read，再按末尾提示用 --offset 翻页
+      用户给了一个会话 ID                lstf info <ID> 看是哪一场，再 lstf read <ID>
       昨天那场会讲了什么                 lstf list 找到 ID，再 lstf read <ID>
       哪场会提到过"预算"                 lstf search 预算
       整理前想要更准的文字               lstf refine <ID> --wait，完成后重新 read
@@ -146,6 +150,7 @@ enum Lstf {
         case status(json: Bool)
         case list(limit: Int, group: String?, json: Bool)
         case read(Read)
+        case info(session: String?, json: Bool)
         case search(text: String, session: String?, limit: Int, json: Bool)
         case refine(session: String?, wait: Bool)
         case hotwords(json: Bool)
@@ -205,6 +210,9 @@ enum Lstf {
                 group = name
             }
             return .list(limit: try number("--limit", atLeast: 1) ?? 20, group: group, json: json)
+        case "info", "show":
+            try allow(["--json"], words: 1)
+            return .info(session: words.first, json: json)
         case "read", "cat":
             try allow(["--json", "--offset", "--limit", "--tail", "--minutes", "--organized"], words: 1)
             var read = Read(session: words.first, offset: try number("--offset", atLeast: 1), limit: try number("--limit", atLeast: 1),
@@ -452,6 +460,61 @@ enum Lstf {
         let session = info.session
         return "会话 \(shortID(session.id))「\(session.title)」\n"
             + "开始 \(stamp(session.lines.first?.start ?? session.created)) · 时长 \(clock(duration(session))) · 共 \(session.lines.count) 行 · \(describe(info))"
+    }
+
+    /// How many lines each source has, in the order they first speak.
+    static func sources(_ session: MeetingSession) -> [(name: String, lines: Int)] {
+        var order: [String] = [], counts: [String: Int] = [:]
+        for line in session.lines {
+            if counts[line.source] == nil { order.append(line.source) }
+            counts[line.source, default: 0] += 1
+        }
+        return order.map { ($0, counts[$0] ?? 0) }
+    }
+
+    /// One session at a glance, for an agent handed its id: what it is, how
+    /// much there is, and the commands that read it. None of the transcript.
+    static func about(_ info: Info, note: String?) -> String {
+        let session = info.session, short = shortID(session.id)
+        var rows: [(String, String)] = [("ID", session.id.uuidString),
+                                        ("开始", stamp(session.lines.first?.start ?? session.created))]
+        if let last = session.lines.last { rows.append(("结束", info.recording ? "还在录制" : stamp(last.end))) }
+        rows.append(("时长", clock(duration(session))))
+        let sources = sources(session)
+        rows.append(("转写", session.lines.isEmpty ? "还没有内容"
+                     : "\(session.lines.count) 行" + (sources.count > 1 ? "（" + sources.map { "\($0.name) \($0.lines)" }.joined(separator: "，") + "）" : "（\(sources[0].name)）")))
+        var state: [String] = []
+        if info.recording { state.append("正在录制") } else if info.open { state.append("听流里正打开着") }
+        switch refinement(info) {
+        case .running: state.append("精修中 \(info.refining?.done ?? 0)/\(info.refining?.total ?? 0)")
+        case .possible: state.append(info.recording ? "暂停后可精修" : "可精修（还没精修的录音约 \(length(info.keptSeconds))）")
+        case .windowOnly: state.append("未精修（本地模型录的，要在听流窗口里精修）")
+        case .done: state.append(info.savedSeconds > 0 ? "已精修（录音保留约 \(length(info.savedSeconds))）" : "已精修")
+        case .none: state.append("未精修，没有录音")
+        }
+        rows.append(("状态", state.joined(separator: " · ")))
+        rows.append(("分组", session.group.map { "「\($0)」" } ?? "没有归到分组"))
+        if let organized = session.organized {
+            rows.append(("整理稿", "有，\(organized.fromAgent ? "agent 通过 lstf 写入" : "听流里的模型整理")，覆盖到 \(clock(organized.through.timeIntervalSince(session.created)))"
+                         + (session.unorganizedCount > 0 ? "，之后还有 \(session.unorganizedCount) 行没有纳入" : "")))
+        } else { rows.append(("整理稿", "还没有")) }
+        let shots = session.imageLibrary.filter(\.isShot).count, others = session.imageLibrary.count - shots
+        rows.append(("图片", shots + others == 0 ? "没有" : [shots > 0 ? "截屏 \(shots) 张" : nil, others > 0 ? "图片 \(others) 张" : nil].compactMap { $0 }.joined(separator: "，")
+                     + "（路径在 lstf read 的输出里，夹在对应的行之间）"))
+        var out = (note.map { $0 + "\n" } ?? "") + "会话 \(short)「\(session.title)」\n"
+        // Labels line up in a terminal: a Chinese character takes two columns.
+        for (label, value) in rows {
+            let columns = label.unicodeScalars.reduce(0) { $0 + ($1.isASCII ? 1 : 2) }
+            out += "  " + label + String(repeating: " ", count: max(0, 6 - columns) + 2) + value + "\n"
+        }
+        out += "\n接着读\n"
+        if !session.lines.isEmpty || !session.imageLibrary.isEmpty {
+            out += "  lstf read \(short)" + String(repeating: " ", count: 14) + "转写，从头按行读（末尾会提示怎么翻页）\n"
+        }
+        if session.organized != nil { out += "  lstf read \(short) --organized" + String(repeating: " ", count: 2) + "整理稿\n" }
+        if !session.lines.isEmpty { out += "  lstf search 关键词 --session \(short)\n" }
+        if session.lines.isEmpty && session.imageLibrary.isEmpty { out += "  （这场会话还没有可读的内容。）\n" }
+        return out
     }
 
     static func row(_ line: TranscriptLine, number: Int, created: Date, width: Int) -> String {

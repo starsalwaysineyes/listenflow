@@ -7,6 +7,10 @@ import Foundation
 /// wrote, and make or fill a group. While it runs, the app stays the one
 /// writer of sessions.
 enum AgentBridge {
+    /// What the app copies for handing a session to an agent: the one command
+    /// that says what the session is and how to read it. Nothing around it.
+    static func infoCommand(_ id: UUID) -> String { "lstf info \(id.uuidString)" }
+
     struct Refining: Codable, Equatable {
         var sessionID: UUID
         var done: Int

@@ -373,6 +373,9 @@ final class AppModel: ObservableObject {
         if ListenFlowHome.isPreview, let path = ProcessInfo.processInfo.environment["LISTENFLOW_PREVIEW_DELETECHECK"] {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.deleteCheck(to: path) }
         }
+        if ListenFlowHome.isPreview, let path = ProcessInfo.processInfo.environment["LISTENFLOW_PREVIEW_PASTECHECK"] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in Task { await self?.pasteCheck(to: path) } }
+        }
         if ListenFlowHome.isPreview, let path = ProcessInfo.processInfo.environment["LISTENFLOW_PREVIEW_PICTURECHECK"] {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.pictureCheck(to: path) }
         }
@@ -1390,6 +1393,15 @@ final class AppModel: ObservableObject {
         if selected { organizationImageIDs.insert(image.id) } else { organizationImageIDs.remove(image.id) }
     }
 
+    /// For handing a session to an agent: the command that tells it which
+    /// session and how to read it — that line and nothing else — or the bare id.
+    func copySession(_ id: UUID, asCommand: Bool) {
+        let text = asCommand ? AgentBridge.infoCommand(id) : id.uuidString
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        notice = "已复制：\(text)"
+    }
+
     // MARK: Pictures on the page
 
     /// Puts a picture just before or after a paragraph or another picture.
@@ -1471,9 +1483,24 @@ final class AppModel: ObservableObject {
         importImages(panel.urls.map(ImageImportSource.file))
     }
 
-    private func importImages(_ sources: [ImageImportSource]) {
+    /// ⌘V with a picture on the clipboard: it goes into the session at this
+    /// moment, like a screenshot taken now — the end of a session that is not
+    /// being recorded — and can be dragged from there. On the draft page it is
+    /// also chosen as reference for the draft, as a picture added there is.
+    /// False when the clipboard holds no picture, and the paste is someone else's.
+    @discardableResult
+    func pastePictures(from board: NSPasteboard = .general) -> Bool {
+        let sources = PastedPictures.sources(on: board)
+        guard !sources.isEmpty, SessionStore.writes else { return false }
+        guard !isImportingImages, !isOrganizing else { error = "正在整理或导入图片，完成后再粘贴。"; return true }
+        let select = showOrganized && organizationImageIDs.count + sources.count <= ImageAttachmentStore.maxSelected
+        importImages(sources, select: select, pasted: true)
+        return true
+    }
+
+    private func importImages(_ sources: [ImageImportSource], select: Bool = true, pasted: Bool = false) {
         guard !sources.isEmpty, !isImportingImages, !isOrganizing else { return }
-        guard organizationImageIDs.count + sources.count <= ImageAttachmentStore.maxSelected else { error = "每次最多选择 6 张图片，请减少选择。"; return }
+        guard !select || organizationImageIDs.count + sources.count <= ImageAttachmentStore.maxSelected else { error = "每次最多选择 6 张图片，请减少选择。"; return }
         let sessionID = session.id
         let firstNumber = (session.imageLibrary.map(\.number).max() ?? 0) + 1
         isImportingImages = true
@@ -1489,7 +1516,11 @@ final class AppModel: ObservableObject {
             }.value
             guard self.session.id == sessionID else { self.isImportingImages = false; return }
             self.session.images = self.session.imageLibrary + result.0
-            self.organizationImageIDs.formUnion(result.0.map(\.id))
+            if select { self.organizationImageIDs.formUnion(result.0.map(\.id)) }
+            if pasted, !result.0.isEmpty {
+                self.notice = "已粘贴 \(result.0.count) 张图片，" + (select ? "并选作这次整理的参考；" : "") + "在原始转写的"
+                    + (self.isRecording ? "当前位置" : "末尾") + "，可以拖到别的段落前后。"
+            }
             if self.session.title == "新的会话", self.session.renamed != true, !result.0.isEmpty { self.session.title = "图片资料 · \(Date().formatted(date: .abbreviated, time: .shortened))" }
             self.isImportingImages = false
             if !result.1.isEmpty { self.error = result.1.joined(separator: "\n") }
@@ -2184,6 +2215,67 @@ extension AppModel {
         writer.flush()
         result["4 sessions left on disk"] = SessionStore.all().map(\.id.uuidString)
         result["4 rows left in the list"] = history.map(\.id.uuidString)
+        finish()
+    }
+
+    /// What ⌘V does with each kind of clipboard, on a clipboard of its own —
+    /// the user's is not touched. Needs LISTENFLOW_PREVIEW_STORE holding a
+    /// session with lines and at least one picture file.
+    private func pasteCheck(to path: String) async {
+        var result: [String: Any] = [:]
+        func finish() {
+            if let data = try? JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys]) {
+                try? data.write(to: URL(fileURLWithPath: path))
+            }
+            NSApp.terminate(nil)
+        }
+        guard SessionStore.folderOverride != nil, let stored = SessionStore.all().first(where: { !$0.imageLibrary.isEmpty && !$0.lines.isEmpty }) else {
+            result["error"] = "needs LISTENFLOW_PREVIEW_STORE with a session of lines and a picture"; finish(); return
+        }
+        history = SessionStore.summaries()
+        openSession(stored.id)
+        let board = NSPasteboard.withUniqueName()
+        defer { board.releaseGlobally() }
+        func paste(_ step: String, _ fill: () -> Void) async {
+            board.clearContents()
+            fill()
+            let taken = pastePictures(from: board)
+            while isImportingImages { try? await Task.sleep(nanoseconds: 50_000_000) }
+            writer.flush()
+            let page = TranscriptLayout.timeline(session).map { entry -> String in
+                switch entry {
+                case let .block(block): "说:" + block.text
+                case let .image(image): "图:\(image.number) \(image.name) \(image.width)×\(image.height)"
+                }
+            }
+            let files = (try? FileManager.default.contentsOfDirectory(atPath: ImageAttachmentStore.folder(for: stored.id).path))?.count ?? 0
+            result[step] = ["taken": taken, "page": page, "pictures on disk": SessionStore.all().first { $0.id == stored.id }?.imageLibrary.count ?? -1,
+                            "files": files, "chosen for the draft": organizationImageIDs.count, "notice": notice ?? "", "error": error ?? ""] as [String: Any]
+            notice = nil; error = nil
+        }
+        func picture(_ type: NSBitmapImageRep.FileType, width: Int, height: Int) -> Data {
+            let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: width, pixelsHigh: height, bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
+                                       isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
+            return rep.representation(using: type, properties: [:]) ?? Data()
+        }
+        let existing = ImageAttachmentStore.url(for: stored.imageLibrary[0], sessionID: stored.id)
+        let notPicture = SessionStore.folder.appendingPathComponent(stored.id.uuidString + ".json")
+        await paste("1 text only") { board.setString("只是文字", forType: .string) }
+        await paste("2 a copied screenshot (PNG and TIFF of it)") {
+            board.setData(picture(.tiff, width: 300, height: 200), forType: .tiff)
+            board.setData(picture(.png, width: 300, height: 200), forType: .png)
+        }
+        await paste("3 an image file copied in Finder") { board.writeObjects([existing as NSURL]) }
+        await paste("4 a file that is no picture, with its icon as image data") {
+            board.writeObjects([notPicture as NSURL])
+            board.setData(picture(.tiff, width: 32, height: 32), forType: .tiff)
+        }
+        await paste("5 data that is no picture under a picture's type") { board.setData(Data("not a png".utf8), forType: .png) }
+        showOrganized = true
+        await paste("6 on the draft page") { board.setData(picture(.jpeg, width: 120, height: 80), forType: NSPasteboard.PasteboardType("public.jpeg")) }
+        isOrganizing = true
+        await paste("7 while a draft is being written") { board.setData(picture(.png, width: 50, height: 50), forType: .png) }
+        isOrganizing = false
         finish()
     }
 

@@ -1,6 +1,29 @@
 import SwiftUI
 import AppKit
 import ImageIO
+import UniformTypeIdentifiers
+
+/// The pictures a paste would bring: image files copied in Finder, or image
+/// data copied from a screenshot, a browser, a chat.
+enum PastedPictures {
+    static let name = "粘贴的图片"
+    static func sources(on board: NSPasteboard) -> [ImageImportSource] {
+        // Copied files come with their icon as image data, so the files decide:
+        // a copied PDF must not paste its icon.
+        if let files = board.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL], !files.isEmpty {
+            return files.filter { (try? $0.resourceValues(forKeys: [.contentTypeKey]))?.contentType?.conforms(to: .image) == true }
+                .map(ImageImportSource.file)
+        }
+        // The compressed forms first: the same picture as TIFF is several times the size.
+        let types = board.types ?? []
+        let preferred = [UTType.png, .jpeg, .heic, .webP, .gif, .tiff].map { NSPasteboard.PasteboardType($0.identifier) }
+        let others = types.filter { UTType($0.rawValue)?.conforms(to: .image) == true }
+        for type in preferred.filter(types.contains) + others {
+            if let data = board.data(forType: type), !data.isEmpty { return [.data(data, name: name)] }
+        }
+        return []
+    }
+}
 
 enum AttachmentThumbnails {
     private static let cache: NSCache<NSString, NSImage> = {

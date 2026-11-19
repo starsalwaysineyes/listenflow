@@ -4,6 +4,7 @@ import AppKit
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var model: AppModel?
     private var hotKeys: [GlobalHotKey] = []
+    private var pasteMonitor: Any?
 
     /// Replays and offscreen snapshots are logic checks driven from a terminal:
     /// they must not put a window on screen or take focus from whoever is
@@ -14,7 +15,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             && (env["LISTENFLOW_REPLAY"] != nil || env["LISTENFLOW_PREVIEW_SNAPSHOT"] != nil
                 || env["LISTENFLOW_PREVIEW_SCROLLCHECK"] != nil || env["LISTENFLOW_PREVIEW_SERVE"] != nil
                 || env["LISTENFLOW_PREVIEW_DELETECHECK"] != nil || env["LISTENFLOW_PREVIEW_GROUPCHECK"] != nil
-                || env["LISTENFLOW_PREVIEW_PICTURECHECK"] != nil)
+                || env["LISTENFLOW_PREVIEW_PICTURECHECK"] != nil || env["LISTENFLOW_PREVIEW_PASTECHECK"] != nil)
     }()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -41,6 +42,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Task { @MainActor in self?.model?.captureScreenshot() }
         }) { keys.append(key) }
         hotKeys = keys
+        // ⌘V in the main window with a picture on the clipboard puts it into the
+        // session. Everything else about pasting stays as it is: text being
+        // typed into a field, a sheet in front, a clipboard without a picture.
+        pasteMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .command,
+                  event.charactersIgnoringModifiers?.lowercased() == "v",
+                  let window = NSApp.keyWindow, window === event.window, window.canBecomeMain, window.sheetParent == nil, window.attachedSheet == nil,
+                  (window.firstResponder as? NSTextView)?.isEditable != true,
+                  let model = self?.model else { return event }
+            return MainActor.assumeIsolated { model.pastePictures() } ? nil : event
+        }
     }
 
     /// The window closes to the menu bar rather than quitting, so an in-progress
@@ -99,6 +111,8 @@ struct ListenFlowApp: App {
                     model.showMainWindow()
                     model.groupPrompt = .create
                 }
+                Button("复制给 agent 的命令（lstf info）") { model.copySession(model.session.id, asCommand: true) }.disabled(model.sessionIsEmpty)
+                Button("复制这场会话的 ID") { model.copySession(model.session.id, asCommand: false) }.disabled(model.sessionIsEmpty)
                 Button("删除这场会话…") {
                     model.showMainWindow()
                     model.askToDelete(model.session.id)
