@@ -1078,6 +1078,164 @@ enum CaptureFailure: LocalizedError {
         print("PASS: session list summaries, saving off the main thread, paragraphs on the page, screenshots kept by time and shown to lstf, hot word file and lstf hotword, console tables, kept-audio files held open")
         print("PASS: a session handed to an agent (the command the app copies, lstf info by the whole id, what it says and leaves out)")
         print("PASS: pictures on the page (moved before and after paragraphs and each other, one place at a time, holding through re-recognition, put back, taken out)")
+        print("PASS: pictures added afterwards carry no time (page, lstf), a paragraph's own lines and the command that reads them, search (matching, snippets, across sessions), a picture set aside and brought back, a name from the model (excerpt, cleaning, the switch)")
+        // --- 0.16.0: pictures added afterwards, a paragraph's lines, search, taking a picture back, a name from the model ---
+        do {
+            let fm = FileManager.default
+            let root = fm.temporaryDirectory.appendingPathComponent("lf-0160-\(UUID().uuidString)")
+            defer { try? fm.removeItem(at: root) }
+            SessionStore.folderOverride = root.appendingPathComponent("Sessions")
+            defer { SessionStore.folderOverride = nil }
+            let began = Date(timeIntervalSince1970: 1_800_100_000)
+            func said(_ at: Double, _ text: String, _ source: String = "电脑声音", length: Double = 2) -> TranscriptLine {
+                TranscriptLine(start: began.addingTimeInterval(at), end: began.addingTimeInterval(at + length), source: source, text: text, latency: 1)
+            }
+            func kept(_ number: Int, at: Double, shot: Bool, placed: Double? = nil, live: Bool? = nil) -> ImageAttachment {
+                ImageAttachment(id: UUID(), number: number, name: shot ? "截屏" : "粘贴的图片", width: 10, height: 10, byteCount: 3,
+                                addedAt: began.addingTimeInterval(at), file: "pic-\(number).jpg", shot: shot ? true : nil,
+                                placed: placed.map(began.addingTimeInterval), live: live)
+            }
+
+            // A picture put in long after the last thing said has no moment of the session.
+            var talk = MeetingSession(title: "排期", created: began)
+            talk.lines = [said(0, "先看排期。"), said(2.5, "前端做完了。"), said(20, "我这边还差分页。", "麦克风"), said(60, "那就周一上线，"), said(62, "API 周三联调。")]
+            let lastEnd = 64.0
+            let during = kept(1, at: 30, shot: true), justAfter = kept(2, at: lastEnd + 200, shot: false)
+            let nextDay = kept(3, at: lastEnd + 9 * 3600, shot: false), nextDayMoved = kept(4, at: lastEnd + 9 * 3600 + 5, shot: true, placed: 10)
+            let silentEnd = kept(5, at: lastEnd + 1200, shot: true, live: true)
+            talk.images = [during, justAfter, nextDay, nextDayMoved, silentEnd]
+            precondition(talk.lastSpoken == began.addingTimeInterval(lastEnd))
+            precondition(!talk.addedLater(during) && !talk.addedLater(justAfter), "During the session, and within a few minutes of its end")
+            precondition(talk.addedLater(nextDay) && talk.addedLater(nextDayMoved), "The next day, wherever it was put since")
+            precondition(!talk.addedLater(silentEnd), "Taken while recording: a moment of the session however long nobody had spoken")
+            precondition(talk.lateImages == [nextDay.id, nextDayMoved.id])
+            var silent = MeetingSession(title: "只有图", created: began)
+            silent.images = [nextDay]
+            precondition(!silent.addedLater(nextDay) && silent.lateImages.isEmpty, "Nothing said: nothing to be late for")
+            let width = 1
+            precondition(Lstf.imageRow(during, session: talk, width: width).contains("[00:30] [截屏] "))
+            precondition(Lstf.imageRow(nextDay, session: talk, width: width).contains("  [后加] [图片] ")
+                         && !Lstf.imageRow(nextDay, session: talk, width: width).contains("9:0"), "No time counted from the session's start")
+            precondition(Lstf.imageRow(nextDayMoved, session: talk, width: width).contains("  [后加] [截屏，用户挪到此处] "))
+            let lateJSON = Lstf.json(nextDay, session: talk, beforeLine: 6), duringJSON = Lstf.json(during, session: talk, beforeLine: 3)
+            precondition(lateJSON["late"] as? Bool == true && lateJSON["at"] == nil && lateJSON["time"] != nil)
+            precondition(duringJSON["late"] as? Bool == false && duringJSON["at"] as? String == "00:30")
+            let read = Lstf.page(Lstf.Info(session: talk), range: 0..<5, note: nil).components(separatedBy: "\n")
+            let rows = read.filter { $0.contains("[截屏") || $0.contains("[图片") || $0.contains("] [电脑声音]") || $0.contains("] [麦克风]") }
+            precondition(rows.count == 10 && rows[1].contains("前端做完了") && rows[2].contains("[后加] [截屏，用户挪到此处]") && rows[3].contains("分页")
+                         && rows.last!.contains("[后加] [图片]"), "A moved one stands where it was put, the other after everything said: \(rows)")
+            precondition(Lstf.help.contains("[后加]") && Lstf.help.contains("late"))
+            // Stored and read back, the new field included; an older file has none.
+            try SessionStore.save(talk)
+            let reread = SessionStore.load(talk.id)!
+            precondition(reread.imageLibrary.map(\.live) == [nil, nil, nil, nil, true] && reread.lateImages == talk.lateImages)
+
+            // A paragraph knows which lines it is made of, and the command that reads exactly those.
+            let paragraphs = TranscriptLayout.blocks(talk.lines)
+            precondition(paragraphs.map(\.index) == [0, 2, 3] && paragraphs.map(\.count) == [2, 1, 2], "\(paragraphs.map { [$0.index, $0.count] })")
+            let command = AgentBridge.readCommand(talk.id, block: paragraphs[2])
+            precondition(command == "lstf read \(talk.id.uuidString) --offset 4 --limit 2")
+            guard case let .read(options) = try Lstf.parse(Array(command.split(separator: " ").dropFirst().map(String.init))) else { fatalError("not a read") }
+            precondition(options.session == talk.id.uuidString && options.offset == 4 && options.limit == 2)
+            let part = Lstf.page(Lstf.Info(session: talk), range: 3..<5, note: nil)
+            precondition(part.contains("那就周一上线") && part.contains("API 周三联调") && !part.contains("分页") && !part.contains("前端"))
+            // With pictures on the page a paragraph is cut where one stands, and still counts its own lines.
+            var split = talk
+            split.images = [kept(9, at: 1, shot: true)]
+            let entries = TranscriptLayout.timeline(split)
+            let cut = entries.compactMap { entry -> TranscriptBlock? in if case let .block(block) = entry { return block }; return nil }
+            precondition(cut.map(\.index) == [0, 1, 2, 3] && cut.map(\.count) == [1, 1, 1, 2], "\(cut.map { [$0.index, $0.count] })")
+            precondition(cut.reduce(0) { $0 + $1.count } == talk.lines.count)
+
+            // Search: the same match in the window and in lstf.
+            precondition(TranscriptSearch.query("  预算 \n") == "预算" && TranscriptSearch.query("   ") == nil)
+            let mixed = "调用 ＡＰＩ 之前先看 Api 文档，api 的限额另说"
+            precondition(TranscriptSearch.ranges(of: "api", in: mixed).map { String(mixed[$0]) } == ["ＡＰＩ", "Api", "api"], "Whatever the case or the width")
+            precondition(TranscriptSearch.ranges(of: "aa", in: "aaaaa").count == 2 && TranscriptSearch.ranges(of: "没有", in: mixed).isEmpty)
+            precondition(TranscriptSearch.contains("API", in: "api 周三联调") && !TranscriptSearch.contains("预算", in: mixed))
+            let long = "这一句很长很长很长很长很长，讲到中间才提到预算这个词，后面还有很多很多很多很多很多很多很多很多很多很多很多很多很多的话没有说完\n第二行"
+            let snippet = TranscriptSearch.snippet(long, query: "预算")!
+            precondition(snippet.match == "预算" && snippet.before.hasPrefix("…") && snippet.before.count == 11 && snippet.after.hasSuffix("…")
+                         && snippet.after.count == 37 && !snippet.text.contains("\n"), "\(snippet)")
+            let whole = TranscriptSearch.snippet("预算还没批", query: "预算")!
+            precondition(whole.before.isEmpty && whole.after == "还没批" && TranscriptSearch.snippet("没有", query: "预算") == nil)
+            var budget = MeetingSession(title: "季度规划", created: began.addingTimeInterval(-86400))
+            budget.renamed = true
+            budget.lines = (0..<8).map { said(Double($0) * 10 - 86400, $0 % 2 == 0 ? "第 \($0 + 1) 句说到预算。" : "第 \($0 + 1) 句没有。") }
+            var named = MeetingSession(title: "预算评审", created: began.addingTimeInterval(-2 * 86400))
+            named.renamed = true
+            named.lines = [said(-2 * 86400, "只有名字里有。")]
+            let found = TranscriptSearch.across("预算", in: [talk, budget, named])
+            precondition(found.map(\.id) == [budget.id, named.id], "In the order given; a session without it is left out")
+            precondition(found[0].count == 4 && found[0].lines.map(\.number) == [1, 3, 5] && !found[0].named && found[0].name == "季度规划"
+                         && found[0].lines[1].id == budget.lines[2].id && found[0].lines[0].snippet.match == "预算")
+            precondition(found[1].count == 0 && found[1].lines.isEmpty && found[1].named)
+            precondition(TranscriptSearch.across("api", in: [talk]).first?.lines.map(\.number) == [5])
+            let hits = Lstf.search("预算", in: [talk, budget, named], limit: 10)
+            precondition(hits.hits.map(\.number) == [1, 3, 5, 7] && hits.hits.allSatisfy { $0.session == budget.id }, "lstf search finds the same lines")
+            precondition(TranscriptSearch.blocks("上线", in: entries) == [cut[3].id] && TranscriptSearch.blocks("没有这个词", in: entries).isEmpty)
+            precondition(TranscriptSearch.block(holding: talk.lines[4].id, of: talk, in: entries) == cut[3].id
+                         && TranscriptSearch.block(holding: talk.lines[0].id, of: talk, in: entries) == cut[0].id
+                         && TranscriptSearch.block(holding: UUID(), of: talk, in: entries) == nil, "The paragraph a found line is shown in")
+
+            // A picture taken out waits where it can be brought back from.
+            let folder = ImageAttachmentStore.folder(for: talk.id)
+            try fm.createDirectory(at: folder, withIntermediateDirectories: true)
+            let file = ImageAttachmentStore.url(for: during, sessionID: talk.id), aside = ImageAttachmentStore.held(during, sessionID: talk.id)
+            try Data([1, 2, 3]).write(to: file)
+            try ImageAttachmentStore.hold(during, sessionID: talk.id)
+            precondition(!fm.fileExists(atPath: file.path) && fm.fileExists(atPath: aside.path) && aside.deletingLastPathComponent().lastPathComponent == ".removed")
+            try ImageAttachmentStore.restore(during, sessionID: talk.id)
+            let back = try Data(contentsOf: file)
+            precondition(back == Data([1, 2, 3]) && !fm.fileExists(atPath: aside.deletingLastPathComponent().path), "Back as it was, nothing left behind")
+            try ImageAttachmentStore.hold(during, sessionID: talk.id)
+            try ImageAttachmentStore.discardHeld(during, sessionID: talk.id, toTrash: false)
+            precondition(!fm.fileExists(atPath: file.path) && !fm.fileExists(atPath: aside.deletingLastPathComponent().path))
+            try ImageAttachmentStore.hold(during, sessionID: talk.id)
+            try ImageAttachmentStore.restore(during, sessionID: talk.id)
+            try ImageAttachmentStore.discardHeld(during, sessionID: talk.id, toTrash: false)
+            precondition(!fm.fileExists(atPath: file.path), "A file that was gone already is nothing to stumble over")
+            // Left behind by a run that ended first: the removal stands.
+            let other = UUID()
+            for id in [talk.id, other] {
+                try fm.createDirectory(at: ImageAttachmentStore.folder(for: id).appendingPathComponent(".removed"), withIntermediateDirectories: true)
+                try Data([9]).write(to: ImageAttachmentStore.folder(for: id).appendingPathComponent(".removed/left.jpg"))
+                try Data([8]).write(to: ImageAttachmentStore.folder(for: id).appendingPathComponent("stays.jpg"))
+            }
+            precondition(ImageAttachmentStore.sweepHeld(toTrash: false) == 2 && ImageAttachmentStore.sweepHeld(toTrash: false) == 0)
+            for id in [talk.id, other] {
+                precondition(!fm.fileExists(atPath: ImageAttachmentStore.folder(for: id).appendingPathComponent(".removed").path)
+                             && fm.fileExists(atPath: ImageAttachmentStore.folder(for: id).appendingPathComponent("stays.jpg").path), "Only what was set aside goes")
+            }
+
+            // A name from the first of what was said.
+            precondition(LLMClient.titleExcerpt(MeetingSession(title: "空", created: began)) == nil)
+            var brief = MeetingSession(title: "短", created: began)
+            brief.lines = [said(0, "喂，听得到吗？")]
+            precondition(LLMClient.titleExcerpt(brief) == nil, "Too little to name it after")
+            var lecture = MeetingSession(title: "长", created: began)
+            lecture.lines = (0..<200).map { said(Double($0) * 5, "第 \($0 + 1) 句，凑够四十个字的一句话，讲的是导出功能排期的事情。") }
+            let excerpt = LLMClient.titleExcerpt(lecture)!
+            precondition(excerpt.count <= LLMClient.titleCharacters && excerpt.count > LLMClient.titleCharacters - 60 && excerpt.hasPrefix("第 1 句")
+                         && !excerpt.contains("第 200 句"), "The beginning, not the whole of it: \(excerpt.count)")
+            let asked = LLMClient.titleMessages(excerpt)
+            precondition(asked.count == 2 && asked.allSatisfy { $0["content"] is String } && (asked[1]["content"] as! String).contains(excerpt)
+                         && (asked[0]["content"] as! String).contains("无题"), "Text only")
+            for (raw, name) in [("导出功能排期", "导出功能排期"), ("标题：「导出功能排期」。", "导出功能排期"), ("\n  《导出排期》  \n解释一下……", "导出排期"),
+                                ("\"Export schedule review\"", "Export schedule review"), ("**导出排期**", "导出排期")] {
+                precondition(LLMClient.cleanTitle(raw) == name, "\(raw) → \(LLMClient.cleanTitle(raw) ?? "nil")")
+            }
+            for raw in ["", "  \n ", "无题", "「无题」。", String(repeating: "这不是一个名字而是一整段话", count: 5)] {
+                precondition(LLMClient.cleanTitle(raw) == nil, "\(raw) is no name")
+            }
+            precondition(LLMClient.cleanTitle(String(repeating: "长", count: 30))?.count == LLMClient.titleLimit)
+            precondition(LLMClient.isLocal("http://127.0.0.1:18764/v1") && LLMClient.isLocal("http://localhost:11434") && !LLMClient.isLocal("https://api.deepseek.com") && !LLMClient.isLocal(""))
+            let older = try JSONDecoder().decode(Preferences.self, from: Data(#"{"apiBase":"https://example.com","llmModel":"m"}"#.utf8))
+            let off = try JSONDecoder().decode(Preferences.self, from: Data(#"{"autoTitle":false}"#.utf8))
+            let again = try JSONDecoder().decode(Preferences.self, from: JSONEncoder().encode(off))
+            precondition(older.autoTitle && older.apiBase == "https://example.com" && !off.autoTitle && !again.autoTitle, "On unless switched off, and it stays off")
+        }
+
         // --- 0.12.0: sessions filed under groups ---
         do {
             let groupRoot = FileManager.default.temporaryDirectory.appendingPathComponent("lf-groups-\(UUID().uuidString)")

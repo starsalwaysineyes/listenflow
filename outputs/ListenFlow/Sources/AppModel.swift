@@ -145,6 +145,29 @@ final class AppModel: ObservableObject {
     @Published var postRefineTotal = 0
     /// A non-error outcome worth telling the user about, such as a finished refinement.
     @Published var notice: String?
+    /// A picture just taken out of the session, for as long as that can be
+    /// undone: until the strip that says so is closed, another picture is
+    /// taken out, or the session is left. Its file waits beside the others.
+    struct RemovedImage {
+        var image: ImageAttachment
+        var sessionID: UUID
+        /// Where it stood in the session's list of pictures.
+        var index: Int
+        /// It was chosen as reference for the draft.
+        var chosen: Bool
+    }
+    @Published var removedImage: RemovedImage?
+    /// Looking for words in the session that is open.
+    let find = FindState()
+    /// What a search across every session found, and what it was a search
+    /// for; an empty query when there is none.
+    @Published var searchFound: [TranscriptSearch.Found] = []
+    @Published var searchQuery = ""
+    @Published var isSearching = false
+    private var searchTask: Task<Void, Never>?
+    /// Sessions the model was asked to name in this run of the app.
+    private var titleAsked: Set<UUID> = []
+    private var titleTask: Task<Void, Never>?
     /// The notch island stays open while pinned; otherwise it follows the mouse.
     @Published var islandPinned = ProcessInfo.processInfo.environment["LISTENFLOW_PREVIEW_ISLAND"] == "expanded"
     private var island: NotchIslandController?
@@ -291,6 +314,11 @@ final class AppModel: ObservableObject {
             AudioStore.rootOverride = root.appendingPathComponent("audio", isDirectory: true)
             HotwordStore.fileOverride = root.appendingPathComponent("hotwords.txt")
         }
+        // Pictures a run of the app took out and did not finish with: their removal stands.
+        if SessionStore.writes {
+            let trash = !ListenFlowHome.isPreview
+            Task.detached(priority: .utility) { ImageAttachmentStore.sweepHeld(toTrash: trash) }
+        }
         capture.onChunk = { [weak self] chunk in Task { @MainActor in self?.submit(chunk) } }
         capture.onLevel = { [weak self] source, level in
             Task { @MainActor in
@@ -378,6 +406,12 @@ final class AppModel: ObservableObject {
         }
         if ListenFlowHome.isPreview, let path = ProcessInfo.processInfo.environment["LISTENFLOW_PREVIEW_PICTURECHECK"] {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.pictureCheck(to: path) }
+        }
+        if ListenFlowHome.isPreview, let path = ProcessInfo.processInfo.environment["LISTENFLOW_PREVIEW_FINDCHECK"] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in Task { await self?.findCheck(to: path) } }
+        }
+        if ListenFlowHome.isPreview, let path = ProcessInfo.processInfo.environment["LISTENFLOW_PREVIEW_TITLECHECK"] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in Task { await self?.titleCheck(to: path) } }
         }
         if ListenFlowHome.isPreview, let path = ProcessInfo.processInfo.environment["LISTENFLOW_PREVIEW_SCROLLCHECK"] {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.scrollCheck(to: path) }
@@ -554,6 +588,8 @@ final class AppModel: ObservableObject {
 
     func stop() async {
         guard !isBusy else { return }
+        // Quitting calls this too, with nothing being recorded.
+        let wasRecording = isRecording
         isBusy = true
         await capture.stop()
         // The cloud engine still owes the last sentence: ask for it and wait.
@@ -566,6 +602,57 @@ final class AppModel: ObservableObject {
         levels.mic = 0
         isBusy = false
         persist()
+        if wasRecording { nameSessionAfterPause() }
+    }
+
+    // MARK: - A name for the session
+
+    /// A pause is when a session gets its name: once the last sentence has
+    /// settled, the first of what was said goes to the model the drafts use,
+    /// and what comes back replaces the made-up "source · date". Only text is
+    /// sent. A session someone named is never touched, and neither is one that
+    /// was named while the model was thinking.
+    func nameSessionAfterPause() {
+        let id = session.id
+        titleTask?.cancel()
+        titleTask = Task { [weak self] in
+            // The last sentence may still be on its way, and a local model has a queue.
+            for _ in 0..<200 {
+                guard let self, !Task.isCancelled, !self.isRecording, self.session.id == id else { return }
+                if self.pendingCount == 0 { break }
+                try? await Task.sleep(for: .milliseconds(300))
+            }
+            await self?.nameSession()
+        }
+    }
+
+    /// Asks for a name now. Returns the name it was given, for the checks.
+    @discardableResult
+    func nameSession() async -> String? {
+        let settings = preferences, snapshot = session
+        guard settings.autoTitle, SessionStore.writes, !isRecording, snapshot.renamed != true, !titleAsked.contains(snapshot.id),
+              !settings.apiBase.isEmpty, !settings.llmModel.trimmingCharacters(in: .whitespaces).isEmpty,
+              LLMClient.titleExcerpt(snapshot) != nil else { return nil }
+        let key = SecretStore.read(account: settings.apiBase)
+        // No key for a service that needs one: drafts would fail the same way, and say so when asked for.
+        guard !key.isEmpty || LLMClient.isLocal(settings.apiBase) else { return nil }
+        titleAsked.insert(snapshot.id)
+        do {
+            guard let name = try await LLMClient.title(preferences: settings, key: key, session: snapshot) else { return nil }
+            return giveName(name, to: snapshot.id) ? name : nil
+        } catch {
+            // A name is a nicety: no banner. The next pause asks again.
+            titleAsked.remove(snapshot.id)
+            return nil
+        }
+    }
+
+    /// False when the session was named by someone in the meantime, or is gone.
+    private func giveName(_ name: String, to id: UUID) -> Bool {
+        if id == session.id { guard session.renamed != true else { return false } }
+        else if let run = storedRefine, run.session.id == id { guard run.session.renamed != true else { return false } }
+        else { guard history.first(where: { $0.id == id })?.renamed == false else { return false } }
+        return renameSession(id, to: name) == nil
     }
 
     func toggleMic(_ value: Bool) async {
@@ -1402,6 +1489,99 @@ final class AppModel: ObservableObject {
         notice = "已复制：\(text)"
     }
 
+    /// For asking an agent about one paragraph: the command that reads exactly its lines.
+    func copyBlock(_ block: TranscriptBlock) {
+        let text = AgentBridge.readCommand(session.id, block: block)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        notice = "已复制：\(text)"
+    }
+
+    // MARK: Search
+
+    /// ⌘F: the field over the transcript, with the cursor in it.
+    func showFind() {
+        guard !session.lines.isEmpty else { return }
+        showOrganized = false
+        find.shown = true
+        find.focus += 1
+    }
+    func hideFind() {
+        find.shown = false
+        find.current = nil
+        find.jump = nil
+    }
+    private var findEntries: [TranscriptEntry] { TranscriptLayout.timeline(session, breakBefore: liveTailStart) }
+    /// The paragraphs that have what is typed in the field, top to bottom.
+    var findMatches: [UUID] {
+        guard find.shown, let query = TranscriptSearch.query(find.text) else { return [] }
+        return TranscriptSearch.blocks(query, in: findEntries)
+    }
+    private func findShow(_ id: UUID) {
+        find.current = id
+        find.move += 1
+    }
+    /// To the next paragraph that has it, or the one before; round and round.
+    func findStep(_ forward: Bool) {
+        let found = findMatches
+        guard !found.isEmpty else { find.current = nil; return }
+        let next = find.current.flatMap(found.firstIndex).map { ($0 + (forward ? 1 : found.count - 1)) % found.count }
+            ?? (forward ? 0 : found.count - 1)
+        findShow(found[next])
+    }
+    /// What is looked for changed: to the first place that has it, unless the reader is at one already.
+    func findTyped() {
+        let found = findMatches
+        if let current = find.current, found.contains(current) { return }
+        if let first = found.first { findShow(first) } else { find.current = nil }
+    }
+    /// To the paragraph a line is in.
+    func findLine(_ line: UUID) {
+        if let block = TranscriptSearch.block(holding: line, of: session, in: findEntries) { findShow(block) }
+    }
+
+    /// Every session, for the field above the list. Reading them all takes a
+    /// moment, so it waits for a pause in the typing and runs off the main thread.
+    func search(_ raw: String) {
+        searchTask?.cancel()
+        guard let query = TranscriptSearch.query(raw) else {
+            searchQuery = ""; searchFound = []; isSearching = false
+            return
+        }
+        isSearching = true
+        let open = session, stored = SessionStore.writes
+        searchTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(180))
+            guard !Task.isCancelled else { return }
+            let found = await Task.detached(priority: .userInitiated) { () -> [TranscriptSearch.Found] in
+                // A preview build showing made-up history has only the session that is open.
+                var sessions = stored ? SessionStore.all() : []
+                // The open one as it is this moment, not as it was last saved.
+                if let index = sessions.firstIndex(where: { $0.id == open.id }) { sessions[index] = open }
+                else if !open.lines.isEmpty { sessions.insert(open, at: 0) }
+                return TranscriptSearch.across(query, in: sessions)
+            }.value
+            guard !Task.isCancelled, let self else { return }
+            self.searchQuery = query
+            self.searchFound = found
+            self.isSearching = false
+        }
+    }
+
+    /// Opens what a search found: the session, and on its page the line.
+    func openFound(_ id: UUID, line: UUID?) {
+        if id != session.id {
+            guard canChangeSession else { notice = "暂停转写并等识别完成后，才能打开别的会话。"; return }
+            openSession(id)
+            guard session.id == id else { return }
+        }
+        showOrganized = false
+        find.text = searchQuery
+        find.shown = true
+        find.current = nil
+        find.jump = line
+    }
+
     // MARK: Pictures on the page
 
     /// Puts a picture just before or after a paragraph or another picture.
@@ -1422,21 +1602,57 @@ final class AppModel: ObservableObject {
         persist()
     }
 
-    /// Takes one picture out of the session. Its file goes to the Trash.
+    /// Takes one picture out of the session. A slip can be taken back: the
+    /// file is set aside, and goes to the Trash once the strip that offers
+    /// "撤销" is closed, another picture is taken out, or the session is left.
     func deleteImage(_ id: UUID) {
-        guard SessionStore.writes, let image = session.imageLibrary.first(where: { $0.id == id }) else { return }
+        guard SessionStore.writes, let index = session.imageLibrary.firstIndex(where: { $0.id == id }) else { return }
         // A draft being written may be reading the file this moment.
         guard !isOrganizing, !isImportingImages else { error = "正在整理或导入图片，完成后再删除。"; return }
+        let image = session.imageLibrary[index]
+        settleRemovedImage()
+        do { try ImageAttachmentStore.hold(image, sessionID: session.id) }
+        catch { self.error = "这张图没有删掉：\(error.localizedDescription)"; return }
+        let chosen = organizationImageIDs.remove(id) != nil
         session.images = session.imageLibrary.filter { $0.id != id }
-        organizationImageIDs.remove(id)
         // Not `persist`: that leaves an empty session alone, and this one is on disk with the picture still in it.
         writer.save(session)
         remember(SessionSummary(session))
-        do {
-            // A check run from a terminal has no business in the user's Trash.
-            try ImageAttachmentStore.discard(image, sessionID: session.id, toTrash: !ListenFlowHome.isPreview)
-            notice = "已删除这张\(image.isShot ? "截屏" : "图片")，文件在废纸篓里。"
-        } catch { self.error = "图片已从会话里去掉，但文件没有删掉：\(error.localizedDescription)" }
+        removedImage = RemovedImage(image: image, sessionID: session.id, index: index, chosen: chosen)
+    }
+
+    /// Puts back the picture that was just taken out: the same place on the
+    /// page, the same number. False when there is none to put back, and ⌘Z is
+    /// someone else's.
+    @discardableResult
+    func restoreRemovedImage() -> Bool {
+        guard let removed = removedImage, removed.sessionID == session.id, SessionStore.writes else { return false }
+        guard !isOrganizing, !isImportingImages else { error = "正在整理或导入图片，完成后再撤销。"; return true }
+        do { try ImageAttachmentStore.restore(removed.image, sessionID: removed.sessionID) }
+        catch { self.error = "这张图没有放回来：\(error.localizedDescription)"; return true }
+        var images = session.imageLibrary
+        images.insert(removed.image, at: min(removed.index, images.count))
+        session.images = images
+        if removed.chosen, organizationImageIDs.count < ImageAttachmentStore.maxSelected { organizationImageIDs.insert(removed.image.id) }
+        removedImage = nil
+        writer.save(session)
+        remember(SessionSummary(session))
+        return true
+    }
+
+    /// The removal stands: the file goes to the Trash.
+    func settleRemovedImage() {
+        guard let removed = removedImage else { return }
+        removedImage = nil
+        // A check run from a terminal has no business in the user's Trash.
+        do { try ImageAttachmentStore.discardHeld(removed.image, sessionID: removed.sessionID, toTrash: !ListenFlowHome.isPreview) }
+        catch { self.error = "图片已从会话里去掉，但文件没有删掉：\(error.localizedDescription)" }
+    }
+
+    /// The number the next picture gets. One that was just taken out keeps
+    /// its number while it can still come back.
+    private var nextImageNumber: Int {
+        max(session.imageLibrary.map(\.number).max() ?? 0, removedImage?.sessionID == session.id ? removedImage?.image.number ?? 0 : 0) + 1
     }
 
     /// One click keeps the whole screen with the session, at this moment: no
@@ -1446,15 +1662,17 @@ final class AppModel: ObservableObject {
         guard SessionStore.writes, !isCapturingShot else { return }
         isCapturingShot = true
         let sessionID = session.id
-        let number = (session.imageLibrary.map(\.number).max() ?? 0) + 1
+        let number = nextImageNumber
         let display = ScreenshotCapture.displayUnderPointer()
         let taken = Date()
+        let recording = isRecording
         Task {
             do {
                 let image = try await ScreenshotCapture.capture(display: display)
-                let shot = try await Task.detached(priority: .userInitiated) {
+                var shot = try await Task.detached(priority: .userInitiated) {
                     try ImageAttachmentStore.storeShot(image, at: taken, sessionID: sessionID, number: number)
                 }.value
+                if recording { shot.live = true }
                 if self.session.id == sessionID {
                     self.session.images = self.session.imageLibrary + [shot]
                     if self.session.title == "新的会话", self.session.renamed != true { self.session.title = "截屏 · \(taken.formatted(date: .abbreviated, time: .shortened))" }
@@ -1502,7 +1720,8 @@ final class AppModel: ObservableObject {
         guard !sources.isEmpty, !isImportingImages, !isOrganizing else { return }
         guard !select || organizationImageIDs.count + sources.count <= ImageAttachmentStore.maxSelected else { error = "每次最多选择 6 张图片，请减少选择。"; return }
         let sessionID = session.id
-        let firstNumber = (session.imageLibrary.map(\.number).max() ?? 0) + 1
+        let firstNumber = nextImageNumber
+        let recording = isRecording
         isImportingImages = true
         error = nil
         Task {
@@ -1515,7 +1734,11 @@ final class AppModel: ObservableObject {
                 return (imported, failures)
             }.value
             guard self.session.id == sessionID else { self.isImportingImages = false; return }
-            self.session.images = self.session.imageLibrary + result.0
+            self.session.images = self.session.imageLibrary + result.0.map { image in
+                var image = image
+                if recording { image.live = true }
+                return image
+            }
             if select { self.organizationImageIDs.formUnion(result.0.map(\.id)) }
             if pasted, !result.0.isEmpty {
                 self.notice = "已粘贴 \(result.0.count) 张图片，" + (select ? "并选作这次整理的参考；" : "") + "在原始转写的"
@@ -1534,6 +1757,7 @@ final class AppModel: ObservableObject {
         startFresh()
     }
     private func startFresh() {
+        settleRemovedImage()
         session = MeetingSession()
         micMuted = false
         keptStreamSeconds = 0
@@ -1556,6 +1780,7 @@ final class AppModel: ObservableObject {
             history.removeAll { $0.id == id }
             return
         }
+        settleRemovedImage()
         session = value
         micMuted = false
         keptStreamSeconds = 0
@@ -1698,6 +1923,7 @@ final class AppModel: ObservableObject {
         if let blocker = deleteBlocker(id) { return blocker }
         let open = id == session.id
         let name = open ? session.name : history.first { $0.id == id }?.name
+        if removedImage?.sessionID == id { settleRemovedImage() }
         writer.flush()      // a save still on its way would bring the file back
         if SessionStore.writes {
             // Preview builds are checks run from a terminal: they stay out of the user's Trash.
@@ -1762,6 +1988,7 @@ final class AppModel: ObservableObject {
         catch { self.error = error.localizedDescription }
     }
     func shutdown() {
+        settleRemovedImage()
         organizeTask?.cancel()
         cloudRefineTask?.cancel()
         persist()
@@ -1934,6 +2161,9 @@ extension AppModel {
     /// screen — so layout can be checked on a locked or headless Mac. Preview
     /// builds only.
     func snapshotViews(to folder: String) {
+        // The strip that offers to bring a picture back, for a look at it.
+        if ProcessInfo.processInfo.environment["LISTENFLOW_PREVIEW_REMOVE_FIRST"] == "1",
+           let first = TranscriptLayout.ordered(session.imageLibrary).first { deleteImage(first.id) }
         func shot<V: View>(_ view: V, _ size: NSSize, _ name: String, dark: Bool = false) {
             let host = NSHostingView(rootView: view.frame(width: size.width, height: size.height))
             host.frame = NSRect(origin: .zero, size: size)
@@ -2327,15 +2557,18 @@ extension AppModel {
             TranscriptLayout.timeline(session).map { entry in
                 switch entry {
                 case let .block(block): "说:" + block.text
-                case let .image(image): "图:\(image.number)" + (image.placed == nil ? "" : "(挪过)")
+                case let .image(image): "图:\(image.number)" + (image.placed == nil ? "" : "(挪过)") + (session.addedLater(image) ? "(后加)" : "")
                 }
             }
         }
         func record(_ step: String) {
             writer.flush()
-            let files = (try? FileManager.default.contentsOfDirectory(atPath: ImageAttachmentStore.folder(for: stored.id).path))?.sorted() ?? []
+            let folder = ImageAttachmentStore.folder(for: stored.id)
+            let files = (try? FileManager.default.contentsOfDirectory(atPath: folder.path))?.sorted() ?? []
             result[step] = ["page": shape(session), "on disk": SessionStore.all().first { $0.id == stored.id }.map(shape) ?? [],
                             "files": files, "notice": notice ?? "", "error": error ?? "",
+                            "set aside": (try? FileManager.default.contentsOfDirectory(atPath: folder.appendingPathComponent(".removed").path))?.sorted() ?? [],
+                            "can be undone": removedImage.map { "图:\($0.image.number)" } ?? "",
                             "listed pictures": history.first { $0.id == stored.id }?.imageCount ?? -1,
                             "chosen for the draft": organizationImageIDs.count] as [String: Any]
             notice = nil; error = nil
@@ -2357,10 +2590,216 @@ extension AppModel {
         record("5 delete while a draft is being written: refused")
         isOrganizing = false
         deleteImage(pictures[1].id)
-        record("6 the second picture deleted")
+        record("6 the second picture deleted: set aside, can be undone")
+        result["6a ⌘Z takes it"] = restoreRemovedImage()
+        record("7 undone: back where it was, chosen for the draft again")
+        result["7a ⌘Z with nothing to put back is left alone"] = restoreRemovedImage()
+        deleteImage(pictures[1].id)
         deleteImage(pictures[0].id)
+        record("8 the second deleted again, then the first: the second is gone for good, the first can be undone")
+        restoreRemovedImage()
+        record("9 the first one back")
+        deleteImage(pictures[0].id)
+        settleRemovedImage()
+        record("10 deleted and the strip closed: gone for good")
         deleteImage(pictures[2].id)
-        record("7 the other two deleted")
+        result["11a the next picture's number while one is set aside"] = nextImageNumber
+        newSession()
+        record("11 the last one deleted, then a new session: nothing left to undo")
+        finish()
+    }
+
+    /// Searching: across every session by the call the field makes, then in
+    /// one session on a page that is really laid out, by the calls the find
+    /// bar makes; where the page stands after each. Needs
+    /// LISTENFLOW_PREVIEW_STORE with a long session that says 预算 several
+    /// times and at least one other that says it.
+    private func findCheck(to path: String) async {
+        var result: [String: Any] = [:]
+        func finish() {
+            if let data = try? JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys]) {
+                try? data.write(to: URL(fileURLWithPath: path))
+            }
+            NSApp.terminate(nil)
+        }
+        let all = SessionStore.all()
+        guard SessionStore.folderOverride != nil, let long = all.max(by: { $0.lines.count < $1.lines.count }), long.lines.count >= 40, all.count >= 2 else {
+            result["error"] = "needs LISTENFLOW_PREVIEW_STORE with a session of forty lines and another one"; finish(); return
+        }
+        history = SessionStore.summaries()
+        volcKeyPresent = true
+        openSession(long.id)
+        let word = ProcessInfo.processInfo.environment["LISTENFLOW_PREVIEW_FINDWORD"] ?? "预算"
+
+        search(word)
+        try? await Task.sleep(for: .milliseconds(900))
+        result["1 across every session"] = searchFound.map { found in
+            ["session": found.name, "sentences": found.count, "named": found.named,
+             "shown": found.lines.map { "\($0.number) [\(SessionStore.timestamp($0.start, relativeTo: found.created))] \($0.snippet.before)【\($0.snippet.match)】\($0.snippet.after)" }] as [String: Any]
+        }
+        search("这个词哪里都没有")
+        try? await Task.sleep(for: .milliseconds(600))
+        result["1a a word nobody said"] = ["query": searchQuery, "found": searchFound.count]
+        search(word)
+        try? await Task.sleep(for: .milliseconds(600))
+
+        let size = NSSize(width: 1080, height: 740)
+        let host = NSHostingView(rootView: ContentView(model: self).frame(width: size.width, height: size.height))
+        host.frame = NSRect(origin: .zero, size: size)
+        let window = NSWindow(contentRect: host.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+        window.contentView = host
+        func settle(_ seconds: TimeInterval) async {
+            host.layoutSubtreeIfNeeded()
+            try? await Task.sleep(for: .milliseconds(Int(seconds * 1000)))
+            host.layoutSubtreeIfNeeded()
+        }
+        func page() -> NSScrollView? {
+            var found: [NSScrollView] = []
+            func walk(_ view: NSView) {
+                if let scroll = view as? NSScrollView { found.append(scroll) }
+                view.subviews.forEach(walk)
+            }
+            walk(host)
+            return found.filter { $0.frame.width > 500 }.max { ($0.documentView?.frame.height ?? 0) < ($1.documentView?.frame.height ?? 0) }
+        }
+        func record(_ name: String) {
+            let entries = TranscriptLayout.timeline(session, breakBefore: liveTailStart)
+            let blocks = entries.compactMap { entry -> TranscriptBlock? in if case let .block(block) = entry { return block }; return nil }
+            let at = find.current.flatMap { id in blocks.firstIndex { $0.id == id } }
+            var state: [String: Any] = ["session": session.name, "bar shown": find.shown, "looking for": find.text,
+                                        "paragraphs with it": findMatches.count, "paragraphs": blocks.count,
+                                        "taken to paragraph": at.map { $0 + 1 } ?? 0, "which says": at.map { blocks[$0].text } ?? ""]
+            if let scroll = page(), let document = scroll.documentView {
+                let bounds = scroll.contentView.bounds
+                state["offset"] = Double(bounds.origin.y)
+                state["viewport"] = Double(bounds.height)
+                state["documentHeight"] = Double(document.frame.height)
+                // With paragraphs of one height, where the middle of the one found sits in the viewport: 0.5 is the centre.
+                if let at { state["its middle in the viewport"] = ((Double(at) + 0.5) / Double(blocks.count) * Double(document.frame.height) - Double(bounds.origin.y)) / Double(bounds.height) }
+            }
+            result[name] = state
+        }
+        func picture(_ name: String) {
+            guard let bitmap = host.bitmapImageRepForCachingDisplay(in: host.bounds) else { return }
+            host.cacheDisplay(in: host.bounds, to: bitmap)
+            try? bitmap.representation(using: .png, properties: [:])?
+                .write(to: URL(fileURLWithPath: path).deletingLastPathComponent().appendingPathComponent(name + ".png"))
+        }
+        await settle(1.2)
+        record("2 the session as opened")
+        showFind()
+        find.text = word
+        await settle(1.0)
+        record("3 ⌘F and the word typed: at the first paragraph that has it")
+        picture("find-first")
+        for step in 1...3 {
+            findStep(true)
+            await settle(0.8)
+            record("4.\(step) next")
+        }
+        picture("find-after-three")
+        findStep(false)
+        await settle(0.8)
+        record("5 previous")
+        // What a right click on the paragraph the reader is at would offer.
+        if let scroll = page() {
+            let point = NSPoint(x: scroll.frame.midX, y: scroll.frame.midY)
+            var view = host.hitTest(host.convert(scroll.convert(point, from: scroll.superview), from: scroll))
+            var chain: [String] = [], titles: [String] = []
+            let event = NSEvent.mouseEvent(with: .rightMouseDown, location: host.convert(scroll.convert(point, from: scroll.superview), from: scroll),
+                                           modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+                                           context: nil, eventNumber: 0, clickCount: 1, pressure: 1)
+            while let current = view, titles.isEmpty {
+                chain.append(String(describing: type(of: current)))
+                if let event, let menu = current.menu(for: event) { titles = menu.items.map(\.title) }
+                view = current.superview
+            }
+            result["6 a right click in the middle of the page"] = ["views": Array(chain.prefix(6)), "menu": titles]
+        }
+        if let other = searchFound.first(where: { $0.id != long.id && !$0.lines.isEmpty }), let line = other.lines.last {
+            openFound(other.id, line: line.id)
+            await settle(1.2)
+            record("7 a result of another session picked from the list")
+            picture("find-other-session")
+            result["7a the line picked"] = "\(line.number) \(line.snippet.text)"
+        } else { result["7 a result of another session picked from the list"] = "no other session has it" }
+        isRecording = true
+        if let first = searchFound.first(where: { $0.id != session.id }) {
+            let before = session.id
+            openFound(first.id, line: first.lines.first?.id)
+            result["8 a result of another session while recording"] = ["stayed": session.id == before, "notice": notice ?? ""]
+        }
+        isRecording = false
+        hideFind()
+        await settle(0.5)
+        record("9 the bar closed")
+        finish()
+    }
+
+    /// Naming sessions after a pause, against a model service that is a
+    /// script on this Mac: which sessions are asked about, what becomes of
+    /// the answer. Needs LISTENFLOW_PREVIEW_STORE with sessions titled
+    /// 待起名, 手动起的名字, 太短, 说不出主题, 服务出错 and 暂停之后.
+    private func titleCheck(to path: String) async {
+        var result: [String: Any] = [:]
+        func finish() {
+            if let data = try? JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys]) {
+                try? data.write(to: URL(fileURLWithPath: path))
+            }
+            NSApp.terminate(nil)
+        }
+        let all = SessionStore.all()
+        guard SessionStore.folderOverride != nil, !all.isEmpty else { result["error"] = "needs LISTENFLOW_PREVIEW_STORE"; finish(); return }
+        history = SessionStore.summaries()
+        // Never the service the user has set up: a script on this Mac, which needs no key.
+        preferences.apiBase = ProcessInfo.processInfo.environment["LISTENFLOW_PREVIEW_API"] ?? "http://127.0.0.1:18764/v1"
+        preferences.llmModel = "preview"
+        func state(_ id: UUID) -> [String: Any] {
+            writer.flush()
+            let stored = SessionStore.load(id)
+            return ["open": session.title, "on disk": stored?.title ?? "", "marked as named": stored?.renamed == true,
+                    "in the list": history.first { $0.id == id }?.name ?? "", "error": error ?? "", "notice": notice ?? ""]
+        }
+        func run(_ title: String, _ step: String, twice: Bool = false) async {
+            guard let stored = all.first(where: { $0.title.hasPrefix(title) }) else { result[step] = "no session titled \(title)"; return }
+            openSession(stored.id)
+            var answers: [String] = [await nameSession() ?? "(none)"]
+            if twice { answers.append(await nameSession() ?? "(none)") }
+            var entry = state(stored.id)
+            entry["given"] = answers
+            result[step] = entry
+        }
+        await run("待起名", "1 a session with its made-up title, asked twice", twice: true)
+        await run("手动起的名字", "2 a session someone named")
+        await run("太短", "3 too little said")
+        await run("说不出主题", "4 the model answers 无题")
+        await run("服务出错", "5 the service fails, then is asked again", twice: true)
+        preferences.autoTitle = false
+        await run("开关关着", "6 switched off in Settings")
+        preferences.autoTitle = true
+        if let stored = all.first(where: { $0.title.hasPrefix("暂停之后") }) {
+            openSession(stored.id)
+            // As `stop` leaves it: one sentence still on its way.
+            pendingCount = 1
+            nameSessionAfterPause()
+            try? await Task.sleep(for: .milliseconds(700))
+            let early = session.title
+            pendingCount = 0
+            try? await Task.sleep(for: .milliseconds(1500))
+            var entry = state(stored.id)
+            entry["while the last sentence was on its way"] = early
+            result["7 after a pause, once the last sentence has settled"] = entry
+        }
+        if let stored = all.first(where: { $0.title.hasPrefix("中途改名") }) {
+            openSession(stored.id)
+            async let given = nameSession()
+            try? await Task.sleep(for: .milliseconds(200))
+            _ = renameSession(stored.id, to: "我自己起的")
+            var entry = state(stored.id)
+            entry["given"] = await given ?? "(none)"
+            entry = entry.merging(state(stored.id)) { _, new in new }
+            result["8 named by hand while the model was thinking"] = entry
+        }
         finish()
     }
 
@@ -2372,4 +2811,20 @@ extension AppModel {
             try? data.write(to: URL(fileURLWithPath: path))
         }
     }
+}
+
+/// The field that looks for words in the open session, and where it has
+/// taken the reader. An object of its own: typing redraws the page that
+/// shows the matches, not the whole window.
+@MainActor final class FindState: ObservableObject {
+    @Published var shown = false
+    @Published var text = ""
+    /// Raised to put the cursor in the field.
+    @Published var focus = 0
+    /// The paragraph the reader was last taken to.
+    @Published var current: UUID?
+    /// Raised each time the page should go to `current`, which may be where it was taken before.
+    @Published var move = 0
+    /// A line to go to once the page shows its session: a result picked from the search across all sessions.
+    @Published var jump: UUID?
 }

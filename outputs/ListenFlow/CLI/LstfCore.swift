@@ -57,6 +57,8 @@ enum Lstf {
       或手动加进会话的图片。后面是图片文件的路径，按时间插在转写中间，需要时直接读这个文件。
       图片行在哪两行之间，它讲的就是那里的内容。标着「用户挪到此处」的图是用户自己摆到这个位置的：
       以位置为准，行首的时间是截下的时刻，可能和上下行差得很远。--json 里对应 beforeLine 和 moved。
+      行首是 [后加] 而不是时间的图，是会话结束以后才放进来的（比如第二天贴进去的资料）：它不属于
+      会上的某个时刻；没被挪过就排在最后，被挪过就以位置为准。--json 里是 late，这时没有 at。
       --offset N         从第 N 行开始（从 1 起，默认 1）
       --limit N          最多读 N 行（默认 200）
       --tail N           只读最后 N 行
@@ -547,7 +549,9 @@ enum Lstf {
     static func imageRow(_ image: ImageAttachment, session: MeetingSession, width: Int) -> String {
         // A moved picture stands among lines of another time: say that it was put here, or its own time reads as a mistake.
         let kind = (image.isShot ? "截屏" : "图片") + (image.placed == nil ? "" : "，用户挪到此处")
-        return String(repeating: " ", count: width) + "  [\(clock(image.addedAt.timeIntervalSince(session.created)))] [\(kind)] "
+        // Put in after the talking was over: counted from the session's start its time is no moment of the session.
+        let time = session.addedLater(image) ? "后加" : clock(image.addedAt.timeIntervalSince(session.created))
+        return String(repeating: " ", count: width) + "  [\(time)] [\(kind)] "
             + ImageAttachmentStore.url(for: image, sessionID: session.id).path
     }
 
@@ -591,7 +595,7 @@ enum Lstf {
     static func search(_ text: String, in sessions: [MeetingSession], limit: Int) -> (hits: [Hit], more: Bool) {
         var hits: [Hit] = []
         for session in sessions {
-            for (index, line) in session.lines.enumerated() where line.text.range(of: text, options: [.caseInsensitive, .widthInsensitive]) != nil {
+            for (index, line) in session.lines.enumerated() where TranscriptSearch.contains(text, in: line.text) {
                 if hits.count == limit { return (hits, true) }
                 hits.append(Hit(session: session.id, number: index + 1))
             }
@@ -653,11 +657,15 @@ enum Lstf {
     /// `beforeLine` is the number of the line the picture comes before; one more
     /// than the last line when it came after everything said so far. `moved`:
     /// the user put it there, and `at` — when it was taken — may be far from
-    /// the lines around it.
+    /// the lines around it. `late`: it was added after the session was over;
+    /// there is no `at` then, only the date in `time`.
     static func json(_ image: ImageAttachment, session: MeetingSession, beforeLine: Int) -> [String: Any] {
-        ["kind": image.isShot ? "screenshot" : "image", "at": clock(image.addedAt.timeIntervalSince(session.created)),
+        let late = session.addedLater(image)
+        var object: [String: Any] = ["kind": image.isShot ? "screenshot" : "image",
          "time": iso(image.addedAt), "path": ImageAttachmentStore.url(for: image, sessionID: session.id).path,
-         "width": image.width, "height": image.height, "beforeLine": beforeLine, "moved": image.placed != nil]
+         "width": image.width, "height": image.height, "beforeLine": beforeLine, "moved": image.placed != nil, "late": late]
+        if !late { object["at"] = clock(image.addedAt.timeIntervalSince(session.created)) }
+        return object
     }
 
     static func json(_ line: TranscriptLine, number: Int, created: Date) -> [String: Any] {

@@ -67,6 +67,9 @@ struct Preferences: Codable {
     /// 720 pt suits a 16-inch screen at its larger text sizes; a 14-inch screen
     /// (1512 pt wide by default) may want it narrower.
     var islandWidth: Double = 720
+    /// After a pause, name a session that still carries its made-up title from
+    /// the first of what was said. Text only, sent to the API the drafts use.
+    var autoTitle = true
 
     init() {}
 
@@ -91,6 +94,7 @@ struct Preferences: Codable {
         islandShowLatest = try c.decodeIfPresent(Bool.self, forKey: .islandShowLatest) ?? d.islandShowLatest
         islandHeight = try c.decodeIfPresent(Double.self, forKey: .islandHeight) ?? d.islandHeight
         islandWidth = try c.decodeIfPresent(Double.self, forKey: .islandWidth) ?? d.islandWidth
+        autoTitle = try c.decodeIfPresent(Bool.self, forKey: .autoTitle) ?? d.autoTitle
     }
 
     var hotwordList: [String] {
@@ -438,6 +442,24 @@ struct MeetingSession: Codable, Identifiable {
     }
     /// What the session is called where its date is shown beside it anyway.
     var name: String { SessionStore.name(title: title, renamed: renamed == true) }
+    /// A picture is still of the session this long after the last thing said.
+    static let lateMargin: TimeInterval = 300
+    /// When the last sentence ended; nil while nothing has been said.
+    var lastSpoken: Date? { lines.map(\.end).max() }
+    /// The picture was put in once the talking was over — pasted the next day,
+    /// say. Counted from the session's start its time would read `569:59`,
+    /// which is no moment of the session: it is shown without one. Never true
+    /// of a picture taken while recording, however long the silence before it.
+    func addedLater(_ image: ImageAttachment) -> Bool { Self.isLate(image, after: lastSpoken) }
+    /// Every such picture, for a page that shows them all.
+    var lateImages: Set<UUID> {
+        let end = lastSpoken
+        return Set(imageLibrary.filter { Self.isLate($0, after: end) }.map(\.id))
+    }
+    private static func isLate(_ image: ImageAttachment, after end: Date?) -> Bool {
+        guard image.live != true, let end else { return false }
+        return image.addedAt.timeIntervalSince(end) > lateMargin
+    }
     var unorganizedCount: Int {
         let included = Set(organized?.sourceLineIDs ?? [])
         return lines.filter { !included.contains($0.id) }.count
@@ -615,6 +637,11 @@ struct TranscriptBlock: Identifiable, Equatable {
     var showsSource: Bool
     /// When its last sentence began.
     var tail: Date
+    /// Which of the session's lines it is made of: the first one's place in
+    /// the list, counted from 0, and how many. What `lstf read` calls
+    /// `--offset index + 1 --limit count`.
+    var index: Int
+    var count: Int
 }
 
 /// One thing on the transcript page: a paragraph of speech, or a picture kept
@@ -653,7 +680,7 @@ enum TranscriptLayout {
     /// each of `cuts`: a paragraph does not run across a picture.
     static func blocks(_ lines: [TranscriptLine], breakBefore: UUID? = nil, cuts: [Date] = []) -> [TranscriptBlock] {
         var out: [TranscriptBlock] = []
-        for line in lines {
+        for (index, line) in lines.enumerated() {
             if var last = out.last, !last.refined, line.refined != true, line.id != breakBefore,
                last.source == line.source, line.start.timeIntervalSince(last.end) <= gap,
                line.end.timeIntervalSince(last.start) <= seconds,
@@ -664,10 +691,12 @@ enum TranscriptLayout {
                 last.text += (latin ? " " : "") + line.text
                 last.end = max(last.end, line.end)
                 last.tail = max(last.tail, line.start)
+                last.count += 1
                 out[out.count - 1] = last
             } else {
                 out.append(TranscriptBlock(id: line.id, start: line.start, end: line.end, source: line.source, text: line.text,
-                                           refined: line.refined == true, showsSource: out.last?.source != line.source, tail: line.start))
+                                           refined: line.refined == true, showsSource: out.last?.source != line.source, tail: line.start,
+                                           index: index, count: 1))
             }
         }
         return out
@@ -723,6 +752,98 @@ enum TranscriptLayout {
         let entries = timeline(session, breakBefore: breakBefore)
         guard let at = entries.firstIndex(where: { $0.id == image }), entries.indices.contains(down ? at + 1 : at - 1) else { return nil }
         return placement(of: image, beside: entries[down ? at + 1 : at - 1].id, after: down, in: session, breakBefore: breakBefore)
+    }
+}
+
+/// Finding words in what was said. The window's search and `lstf search`
+/// match the same way: whatever the case, full-width or half-width.
+enum TranscriptSearch {
+    static let options: String.CompareOptions = [.caseInsensitive, .widthInsensitive]
+
+    /// What is searched for, as typed but without the space around it; nil when nothing is left.
+    static func query(_ raw: String) -> String? {
+        let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return text.isEmpty ? nil : text
+    }
+    static func contains(_ query: String, in text: String) -> Bool { text.range(of: query, options: options) != nil }
+    /// Every place `query` stands in `text`, left to right, none overlapping another.
+    static func ranges(of query: String, in text: String) -> [Range<String.Index>] {
+        var found: [Range<String.Index>] = [], from = text.startIndex
+        while from < text.endIndex, let range = text.range(of: query, options: options, range: from..<text.endIndex), !range.isEmpty {
+            found.append(range)
+            from = range.upperBound
+        }
+        return found
+    }
+
+    /// A sentence cut down to what a result row has room for: the first match,
+    /// a few characters before it and more after.
+    struct Snippet: Equatable {
+        var before: String
+        var match: String
+        var after: String
+        var text: String { before + match + after }
+    }
+    static func snippet(_ text: String, query: String, lead: Int = 10, trail: Int = 36) -> Snippet? {
+        let flat = text.replacingOccurrences(of: "\n", with: " ")
+        guard let range = flat.range(of: query, options: options) else { return nil }
+        let start = flat.index(range.lowerBound, offsetBy: -lead, limitedBy: flat.startIndex) ?? flat.startIndex
+        let end = flat.index(range.upperBound, offsetBy: trail, limitedBy: flat.endIndex) ?? flat.endIndex
+        return Snippet(before: (start > flat.startIndex ? "…" : "") + String(flat[start..<range.lowerBound]),
+                       match: String(flat[range]),
+                       after: String(flat[range.upperBound..<end]) + (end < flat.endIndex ? "…" : ""))
+    }
+
+    /// The paragraphs of a page that have `query`, top to bottom.
+    static func blocks(_ query: String, in entries: [TranscriptEntry]) -> [UUID] {
+        entries.compactMap { entry in
+            if case let .block(block) = entry, contains(query, in: block.text) { return block.id }
+            return nil
+        }
+    }
+    /// The paragraph a line is shown in.
+    static func block(holding line: UUID, of session: MeetingSession, in entries: [TranscriptEntry]) -> UUID? {
+        guard let index = session.lines.firstIndex(where: { $0.id == line }) else { return nil }
+        for case let .block(block) in entries where block.index <= index && index < block.index + block.count { return block.id }
+        return nil
+    }
+
+    struct Line: Identifiable, Equatable {
+        /// The line's own id.
+        let id: UUID
+        /// Its number, as `lstf read` counts: from 1.
+        let number: Int
+        let start: Date
+        let source: String
+        let snippet: Snippet
+    }
+    /// One session's share of a search across all of them.
+    struct Found: Identifiable, Equatable {
+        /// The session's id.
+        let id: UUID
+        let name: String
+        let created: Date
+        /// How many lines have it; `lines` holds the first few.
+        let count: Int
+        let lines: [Line]
+        /// Its name has it too.
+        let named: Bool
+    }
+    /// The sessions that have `query` in what was said or in their name, in
+    /// the order given, with the first `shown` lines of each.
+    static func across(_ query: String, in sessions: [MeetingSession], shown: Int = 3) -> [Found] {
+        sessions.compactMap { session in
+            var lines: [Line] = [], count = 0
+            for (index, line) in session.lines.enumerated() where contains(query, in: line.text) {
+                count += 1
+                if lines.count < shown, let snippet = snippet(line.text, query: query) {
+                    lines.append(Line(id: line.id, number: index + 1, start: line.start, source: line.source, snippet: snippet))
+                }
+            }
+            let named = contains(query, in: session.name)
+            guard count > 0 || named else { return nil }
+            return Found(id: session.id, name: session.name, created: session.created, count: count, lines: lines, named: named)
+        }
     }
 }
 

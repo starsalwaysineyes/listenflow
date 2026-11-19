@@ -22,6 +22,10 @@ struct ImageAttachment: Identifiable, Codable, Sendable {
     /// while it sits where it was taken. A moment rather than a line, so that it
     /// holds when the sentences around it are recognized again and replaced.
     var placed: Date? = nil
+    /// Added while the session was being recorded: its time is a moment of the
+    /// session however long nobody had spoken. Nil for pictures kept before
+    /// 0.16.0, and for those added while nothing was being recorded.
+    var live: Bool? = nil
     var label: String { "图片\(number)" }
     var isShot: Bool { shot == true }
     /// The moment it is shown at.
@@ -152,6 +156,64 @@ enum ImageAttachmentStore {
         guard FileManager.default.fileExists(atPath: file.path) else { return }
         if toTrash, (try? FileManager.default.trashItem(at: file, resultingItemURL: nil)) != nil { return }
         try FileManager.default.removeItem(at: file)
+    }
+
+    // MARK: Taking a picture out, and putting it back
+
+    /// Where a picture's file waits while its removal can still be undone. Inside
+    /// the session's own folder, so deleting the session takes it along.
+    static func held(_ image: ImageAttachment, sessionID: UUID) -> URL {
+        folder(for: sessionID).appendingPathComponent(".removed", isDirectory: true)
+            .appendingPathComponent(url(for: image, sessionID: sessionID).lastPathComponent)
+    }
+
+    /// Sets the file aside. A file already gone is no error.
+    static func hold(_ image: ImageAttachment, sessionID: UUID) throws {
+        let file = url(for: image, sessionID: sessionID), target = held(image, sessionID: sessionID)
+        guard FileManager.default.fileExists(atPath: file.path) else { return }
+        try FileManager.default.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true,
+                                                attributes: [.posixPermissions: 0o700])
+        try? FileManager.default.removeItem(at: target)
+        try FileManager.default.moveItem(at: file, to: target)
+    }
+
+    /// Back to where it was. A picture whose file was gone before stays without one.
+    static func restore(_ image: ImageAttachment, sessionID: UUID) throws {
+        let file = url(for: image, sessionID: sessionID), source = held(image, sessionID: sessionID)
+        guard FileManager.default.fileExists(atPath: source.path) else { return }
+        try FileManager.default.moveItem(at: source, to: file)
+        removeIfEmpty(source.deletingLastPathComponent())
+    }
+
+    /// The removal stands: the file goes to the Trash, or is removed when it cannot be moved there.
+    static func discardHeld(_ image: ImageAttachment, sessionID: UUID, toTrash: Bool = true) throws {
+        let source = held(image, sessionID: sessionID)
+        guard FileManager.default.fileExists(atPath: source.path) else { return }
+        if !toTrash || (try? FileManager.default.trashItem(at: source, resultingItemURL: nil)) == nil {
+            try FileManager.default.removeItem(at: source)
+        }
+        removeIfEmpty(source.deletingLastPathComponent())
+    }
+
+    /// Pictures set aside by a run of the app that ended before it could finish
+    /// with them: their removal stands. Returns how many there were.
+    @discardableResult
+    static func sweepHeld(toTrash: Bool = true) -> Int {
+        let fm = FileManager.default
+        var count = 0
+        for session in (try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)) ?? [] {
+            let dir = session.appendingPathComponent(".removed", isDirectory: true)
+            for file in (try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? [] {
+                if !toTrash || (try? fm.trashItem(at: file, resultingItemURL: nil)) == nil { try? fm.removeItem(at: file) }
+                count += 1
+            }
+            removeIfEmpty(dir)
+        }
+        return count
+    }
+
+    private static func removeIfEmpty(_ dir: URL) {
+        if (try? FileManager.default.contentsOfDirectory(atPath: dir.path))?.isEmpty == true { try? FileManager.default.removeItem(at: dir) }
     }
 
     static func content(text: String, images: [ImageAttachment], sessionID: UUID) throws -> Any {

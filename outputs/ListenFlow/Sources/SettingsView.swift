@@ -105,6 +105,9 @@ struct SettingsView: View {
                                 SecureField("保存在 ~/.listenflow/keys.json，仅本人可读", text: $key).textFieldStyle(.roundedBorder)
                             }
                             Button("读取此地址已保存的密钥") { key = SecretStore.read(account: draft.apiBase) }.font(.caption)
+                            Toggle("暂停后给还没起名的会话起个名字", isOn: $draft.autoTitle)
+                            Text("暂停转写时，把开头约 1500 字的转写文字发给上面的 API，换回一个短名字，代替「全局声音 · 日期」。只发文字；改过名的会话不动；没有填 API Key 时不做。")
+                                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                             Text("「整理稿」用这个模型把零碎的转写连成文章。支持 chat/completions 兼容接口；整理时发送当前会话的转写文字和选中的参考图片，音频不会发送。").font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                         }.padding(12)
                     }

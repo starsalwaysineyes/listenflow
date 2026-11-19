@@ -4,7 +4,7 @@ import AppKit
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var model: AppModel?
     private var hotKeys: [GlobalHotKey] = []
-    private var pasteMonitor: Any?
+    private var keyMonitor: Any?
 
     /// Replays and offscreen snapshots are logic checks driven from a terminal:
     /// they must not put a window on screen or take focus from whoever is
@@ -15,7 +15,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             && (env["LISTENFLOW_REPLAY"] != nil || env["LISTENFLOW_PREVIEW_SNAPSHOT"] != nil
                 || env["LISTENFLOW_PREVIEW_SCROLLCHECK"] != nil || env["LISTENFLOW_PREVIEW_SERVE"] != nil
                 || env["LISTENFLOW_PREVIEW_DELETECHECK"] != nil || env["LISTENFLOW_PREVIEW_GROUPCHECK"] != nil
-                || env["LISTENFLOW_PREVIEW_PICTURECHECK"] != nil || env["LISTENFLOW_PREVIEW_PASTECHECK"] != nil)
+                || env["LISTENFLOW_PREVIEW_PICTURECHECK"] != nil || env["LISTENFLOW_PREVIEW_PASTECHECK"] != nil
+                || env["LISTENFLOW_PREVIEW_FINDCHECK"] != nil || env["LISTENFLOW_PREVIEW_TITLECHECK"] != nil)
     }()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -43,15 +44,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }) { keys.append(key) }
         hotKeys = keys
         // ⌘V in the main window with a picture on the clipboard puts it into the
-        // session. Everything else about pasting stays as it is: text being
-        // typed into a field, a sheet in front, a clipboard without a picture.
-        pasteMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+        // session; ⌘Z puts back a picture that was just taken out. Everything
+        // else about those keys stays as it is: text being typed into a field,
+        // a sheet in front, a clipboard without a picture, nothing to put back.
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .command,
-                  event.charactersIgnoringModifiers?.lowercased() == "v",
+                  let key = event.charactersIgnoringModifiers?.lowercased(), key == "v" || key == "z",
                   let window = NSApp.keyWindow, window === event.window, window.canBecomeMain, window.sheetParent == nil, window.attachedSheet == nil,
                   (window.firstResponder as? NSTextView)?.isEditable != true,
                   let model = self?.model else { return event }
-            return MainActor.assumeIsolated { model.pastePictures() } ? nil : event
+            return MainActor.assumeIsolated { key == "v" ? model.pastePictures() : model.restoreRemovedImage() } ? nil : event
         }
     }
 
@@ -117,6 +119,13 @@ struct ListenFlowApp: App {
                     model.showMainWindow()
                     model.askToDelete(model.session.id)
                 }.disabled(model.sessionIsEmpty)
+            }
+            CommandGroup(after: .pasteboard) {
+                Divider()
+                Button("在这场会话里查找") {
+                    model.showMainWindow()
+                    model.showFind()
+                }.keyboardShortcut("f").disabled(model.session.lines.isEmpty)
             }
             CommandGroup(replacing: .appSettings) {
                 Button("设置…") { model.showSettings = true }.keyboardShortcut(",")

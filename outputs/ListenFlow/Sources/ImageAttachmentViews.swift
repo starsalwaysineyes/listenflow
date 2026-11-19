@@ -98,12 +98,15 @@ struct ImageAttachmentPicker: View {
                     .font(.system(size: 10)).foregroundStyle(.secondary)
             }
         }
-        .sheet(item: $preview) { image in AttachmentPreview(image: image, sessionID: model.session.id, created: model.session.created) }
+        .sheet(item: $preview) { image in
+            AttachmentPreview(image: image, sessionID: model.session.id, created: model.session.created, late: model.session.addedLater(image))
+        }
     }
 
     private func title(_ image: ImageAttachment) -> String {
-        image.isShot ? "\(image.label)，\(SessionStore.timestamp(image.addedAt, relativeTo: model.session.created)) 的截屏"
-                     : "\(image.label)，\(image.name)"
+        guard image.isShot else { return "\(image.label)，\(image.name)" }
+        return model.session.addedLater(image) ? "\(image.label)，后加的截屏"
+            : "\(image.label)，\(SessionStore.timestamp(image.addedAt, relativeTo: model.session.created)) 的截屏"
     }
 }
 
@@ -127,12 +130,14 @@ struct AttachmentPreview: View {
     let image: ImageAttachment
     let sessionID: UUID
     let created: Date
+    /// Put in after the session was over: no moment of the session to name it by.
+    var late = false
     @Environment(\.dismiss) private var dismiss
     var body: some View {
         let url = ImageAttachmentStore.url(for: image, sessionID: sessionID)
         VStack(alignment: .leading, spacing: 14) {
             HStack {
-                Text(image.isShot ? "\(SessionStore.timestamp(image.addedAt, relativeTo: created)) 的截屏" : image.name)
+                Text(!image.isShot ? image.name : late ? "后加的截屏" : "\(SessionStore.timestamp(image.addedAt, relativeTo: created)) 的截屏")
                     .font(.headline).lineLimit(1)
                 Spacer()
                 Button("在访达中显示") { NSWorkspace.shared.activateFileViewerSelecting([url]) }

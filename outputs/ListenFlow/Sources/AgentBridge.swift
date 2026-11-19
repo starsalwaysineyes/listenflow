@@ -10,6 +10,10 @@ enum AgentBridge {
     /// What the app copies for handing a session to an agent: the one command
     /// that says what the session is and how to read it. Nothing around it.
     static func infoCommand(_ id: UUID) -> String { "lstf info \(id.uuidString)" }
+    /// The command that reads one paragraph of the page: the lines it is made of, and no others.
+    static func readCommand(_ id: UUID, block: TranscriptBlock) -> String {
+        "lstf read \(id.uuidString) --offset \(block.index + 1) --limit \(block.count)"
+    }
 
     struct Refining: Codable, Equatable {
         var sessionID: UUID

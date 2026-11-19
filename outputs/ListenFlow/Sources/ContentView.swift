@@ -225,7 +225,7 @@ struct ContentView: View {
                     banners
                     viewBar
                     Rectangle().fill(Palette.hairline).frame(height: 1)
-                    if model.showOrganized { DraftPage(model: model) } else { TranscriptPage(model: model) }
+                    if model.showOrganized { DraftPage(model: model) } else { TranscriptPage(model: model, find: model.find) }
                     StatusBar(model: model)
                 }.background(Palette.page)
             }
@@ -285,12 +285,21 @@ struct ContentView: View {
         if let notice = model.notice {
             banner(notice, icon: "checkmark.circle.fill", color: Palette.stream) { model.notice = nil }
         }
+        // A picture taken out can be put back for as long as this strip is there.
+        if let removed = model.removedImage {
+            banner("已删除这张\(removed.image.isShot ? "截屏" : "图片")。关掉这条提示后，文件进废纸篓。", icon: "trash", color: Palette.stream,
+                   undo: { model.restoreRemovedImage() }) { model.settleRemovedImage() }
+        }
     }
 
-    private func banner(_ text: String, icon: String, color: Color, dismiss: @escaping () -> Void) -> some View {
+    private func banner(_ text: String, icon: String, color: Color, undo: (() -> Void)? = nil, dismiss: @escaping () -> Void) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 9) {
             Image(systemName: icon).foregroundStyle(color)
             Text(text).font(.system(size: 12)).lineSpacing(3).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+            if let undo {
+                Button("撤销", action: undo).buttonStyle(.plain).font(.system(size: 12, weight: .semibold)).foregroundStyle(color)
+                    .padding(.trailing, 6).help("把这张图放回原处（⌘Z）")
+            }
             Button(action: dismiss) { Image(systemName: "xmark").font(.system(size: 10, weight: .semibold)) }
                 .buttonStyle(.plain).foregroundStyle(Palette.muted).help("关闭这条提示")
         }
@@ -357,6 +366,8 @@ private struct SessionRail: View {
     /// Group names, one per line: which groups are folded away, and which show all their sessions.
     @AppStorage("collapsedGroups") private var collapsedNames = ""
     @State private var expanded: Set<String> = []
+    /// What is typed into the search across every session. A preview build can be started with it filled in.
+    @State private var typed = ListenFlowHome.isPreview ? ProcessInfo.processInfo.environment["LISTENFLOW_PREVIEW_SEARCH"] ?? "" : ""
 
     private var collapsed: Set<String> { Set(collapsedNames.split(separator: "\n").map(String.init)) }
     private func toggle(_ name: String) {
@@ -393,9 +404,16 @@ private struct SessionRail: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain).disabled(!model.canChangeSession)
-            .padding(.horizontal, 10).padding(.top, 12).padding(.bottom, 6)
+            .padding(.horizontal, 10).padding(.top, 12).padding(.bottom, 4)
 
-            ScrollView {
+            SearchField(text: $typed)
+                .padding(.horizontal, 10).padding(.bottom, 6)
+                .onChange(of: typed, initial: !typed.isEmpty) { _, text in model.search(text) }
+
+            if TranscriptSearch.query(typed) != nil {
+                SearchResults(model: model)
+            } else {
+              ScrollView {
                 LazyVStack(alignment: .leading, spacing: 1) {
                     // Groups first: the sessions someone filed away on purpose. Each is
                     // also in the list of recent ones below, so nothing is ever hidden.
@@ -423,12 +441,110 @@ private struct SessionRail: View {
                     heading("最近")
                     ForEach(recent) { row in SessionRow(model: model, row: row, groups: names, compact: false) }
                 }.padding(.horizontal, 10).padding(.bottom, 12)
+              }
             }
 
             Rectangle().fill(Palette.hairline).frame(height: 1)
             EngineFooter(model: model)
         }
         .background(Palette.rail)
+    }
+}
+
+/// The field above the list: what is typed is looked for in every session.
+private struct SearchField: View {
+    @Binding var text: String
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass").font(.system(size: 12)).foregroundStyle(Palette.muted).frame(width: 16)
+            TextField("搜索全部会话", text: $text)
+                .textFieldStyle(.plain).font(.system(size: 13))
+                .onExitCommand { text = "" }
+            if !text.isEmpty {
+                Button { text = "" } label: { Image(systemName: "xmark.circle.fill").font(.system(size: 12)) }
+                    .buttonStyle(.plain).foregroundStyle(Palette.faint).help("清空，回到会话列表")
+            }
+        }
+        .padding(.horizontal, 10).frame(height: 30)
+        .background(Palette.wash, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+    }
+}
+
+/// What the search found, in place of the list: session by session, newest
+/// first, each with the first few sentences that have it. A click opens the
+/// session at that sentence.
+private struct SearchResults: View {
+    @ObservedObject var model: AppModel
+
+    private func note(_ text: String) -> some View {
+        Text(text).font(.system(size: 12)).foregroundStyle(Palette.muted).lineSpacing(3)
+            .padding(.horizontal, 10).padding(.top, 10).frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    var body: some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 1) {
+                if model.searchQuery.isEmpty {
+                    note("正在找…")
+                } else if model.searchFound.isEmpty {
+                    note("没有找到「\(model.searchQuery)」。找的是转写里说过的话和会话的名字。")
+                } else {
+                    ForEach(model.searchFound) { found in FoundSession(model: model, found: found) }
+                }
+            }.padding(.horizontal, 10).padding(.bottom, 12)
+        }
+        .opacity(model.isSearching && !model.searchQuery.isEmpty ? 0.55 : 1)
+    }
+}
+
+private struct FoundSession: View {
+    @ObservedObject var model: AppModel
+    let found: TranscriptSearch.Found
+
+    private func marked(_ snippet: TranscriptSearch.Snippet) -> AttributedString {
+        var before = AttributedString(snippet.before), match = AttributedString(snippet.match), after = AttributedString(snippet.after)
+        before.foregroundColor = Palette.muted
+        after.foregroundColor = Palette.muted
+        match.foregroundColor = Palette.ink
+        match.font = .system(size: 12, weight: .semibold)
+        return before + match + after
+    }
+
+    var body: some View {
+        let current = found.id == model.session.id
+        let reachable = current || model.canChangeSession
+        VStack(alignment: .leading, spacing: 0) {
+            Button { model.openFound(found.id, line: found.lines.first?.id) } label: {
+                HStack(spacing: 6) {
+                    Text(found.name).font(.system(size: 13, weight: current ? .semibold : .medium)).lineLimit(1)
+                    Spacer(minLength: 4)
+                    Text(Format.when(found.created)).font(.system(size: 11)).monospacedDigit().foregroundStyle(Palette.muted)
+                }
+                .padding(.horizontal, 10).frame(height: 30).contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            ForEach(found.lines) { line in
+                Button { model.openFound(found.id, line: line.id) } label: {
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Text(SessionStore.timestamp(line.start, relativeTo: found.created))
+                            .font(.system(size: 11)).monospacedDigit().foregroundStyle(Palette.faint)
+                        Text(marked(line.snippet)).font(.system(size: 12)).lineSpacing(2).lineLimit(2)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .padding(.leading, 10).padding(.trailing, 8).padding(.vertical, 5).contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+            if found.count > found.lines.count {
+                Text("还有 \(found.count - found.lines.count) 句，打开后用上下箭头逐处看").font(.system(size: 11)).foregroundStyle(Palette.faint)
+                    .padding(.leading, 10).padding(.vertical, 4)
+            } else if found.count == 0 {
+                Text("名字里有").font(.system(size: 11)).foregroundStyle(Palette.faint).padding(.leading, 10).padding(.bottom, 4)
+            }
+        }
+        .padding(.top, 6)
+        .disabled(!reachable).opacity(reachable ? 1 : 0.5)
+        .help(reachable ? "打开「\(found.name)」，到这一句" : "暂停转写并等识别完成后，才能换到别的会话")
     }
 }
 
@@ -802,6 +918,7 @@ private struct LevelBar: View {
 /// up to re-read something and it stays put.
 private struct TranscriptPage: View {
     @ObservedObject var model: AppModel
+    @ObservedObject var find: FindState
     @State private var following = true
     /// There is more below the bottom edge. A session that fits on the page has no end to go to.
     @State private var below = false
@@ -828,18 +945,53 @@ private struct TranscriptPage: View {
     private var page: some View {
         let tail = model.liveTailStart
         let entries = TranscriptLayout.timeline(model.session, breakBefore: tail)
-        return ScrollView {
+        let query = find.shown ? TranscriptSearch.query(find.text) ?? "" : ""
+        let found = query.isEmpty ? [] : TranscriptSearch.blocks(query, in: entries)
+        let late = model.session.lateImages
+        return ScrollViewReader { proxy in
+            VStack(spacing: 0) {
+                if find.shown {
+                    FindBar(find: find, searching: !query.isEmpty, count: found.count, place: find.current.flatMap(found.firstIndex),
+                            step: model.findStep, close: model.hideFind)
+                }
+                scroll(entries, tail: tail, query: query, late: late)
+            }
+            // Typing takes the reader to the first place that has it.
+            .onChange(of: query) { _, _ in model.findTyped() }
+            // The search has a paragraph to show: the page goes there and stays.
+            .onChange(of: find.move) { _, _ in
+                guard let id = find.current else { return }
+                following = false
+                withAnimation(.easeOut(duration: 0.18)) { proxy.scrollTo(id, anchor: .center) }
+            }
+            // A result picked from the search across sessions: the paragraph its line is in.
+            .task(id: find.jump) {
+                guard let line = find.jump else { return }
+                // Once the page has turned to that session and gone to its top.
+                try? await Task.sleep(for: .milliseconds(150))
+                guard !Task.isCancelled else { return }
+                model.findLine(line)
+                find.jump = nil
+            }
+        }
+    }
+
+    private func scroll(_ entries: [TranscriptEntry], tail: UUID?, query: String, late: Set<UUID>) -> some View {
+        ScrollView {
             LazyVStack(alignment: .leading, spacing: 20) {
                 ForEach(entries) { entry in
                     switch entry {
                     case let .block(block):
                         if block.id == tail { LiveTailDivider() }
                         LandingRow(entry: block.id, dragging: $dragging, landing: $landing, move: model.moveImage) {
-                            BlockRow(block: block, created: model.session.created).equatable()
+                            BlockRow(block: block, created: model.session.created, find: query, current: find.current == block.id).equatable()
+                                .contextMenu {
+                                    Button("复制给 agent 的命令（lstf read 这一段）") { model.copyBlock(block) }
+                                }
                         }
                     case let .image(image):
                         LandingRow(entry: image.id, dragging: $dragging, landing: $landing, move: model.moveImage) {
-                            ShotRow(image: image, sessionID: model.session.id, created: model.session.created,
+                            ShotRow(image: image, sessionID: model.session.id, created: model.session.created, late: late.contains(image.id),
                                     first: entries.first?.id == image.id, last: entries.last?.id == image.id) { action in
                                 switch action {
                                 case .open: preview = image
@@ -887,6 +1039,7 @@ private struct TranscriptPage: View {
         // A session being recorded opens at its newest line, a finished one at its start.
         .onChange(of: model.session.id, initial: true) { _, _ in
             following = model.isRecording
+            find.current = nil
             position.scrollTo(edge: model.isRecording ? .bottom : .top)
         }
         .onChange(of: model.isRecording) { _, recording in
@@ -905,8 +1058,46 @@ private struct TranscriptPage: View {
             }
         }
         .sheet(item: $preview) { image in
-            AttachmentPreview(image: image, sessionID: model.session.id, created: model.session.created)
+            AttachmentPreview(image: image, sessionID: model.session.id, created: model.session.created, late: model.session.addedLater(image))
         }
+    }
+}
+
+/// ⌘F: a field over the transcript. It counts paragraphs, which is what the
+/// page is made of and what the reader is taken to.
+private struct FindBar: View {
+    @ObservedObject var find: FindState
+    /// There is something typed to look for.
+    let searching: Bool
+    let count: Int
+    /// Which of the paragraphs found the reader is at, from 0.
+    let place: Int?
+    var step: (Bool) -> Void
+    var close: () -> Void
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "magnifyingglass").font(.system(size: 12)).foregroundStyle(Palette.muted)
+            TextField("在这场会话里查找", text: $find.text)
+                .textFieldStyle(.plain).font(.system(size: 13)).focused($focused)
+                .onSubmit { step(true) }
+                .onExitCommand(perform: close)
+            if searching {
+                Text(count == 0 ? "没有找到" : place.map { "第 \($0 + 1) 段，共 \(count) 段" } ?? "\(count) 段")
+                    .font(.system(size: 11)).monospacedDigit().foregroundStyle(Palette.muted).lineLimit(1).fixedSize()
+            }
+            Button { step(false) } label: { Image(systemName: "chevron.up") }
+                .buttonStyle(.plain).disabled(count == 0).help("上一处")
+            Button { step(true) } label: { Image(systemName: "chevron.down") }
+                .buttonStyle(.plain).disabled(count == 0).help("下一处（回车）")
+            Button("完成", action: close).buttonStyle(.plain).font(.system(size: 12, weight: .medium)).help("关掉查找（Esc）")
+        }
+        .font(.system(size: 12))
+        .padding(.horizontal, 28).frame(height: 38)
+        .overlay(alignment: .bottom) { Rectangle().fill(Palette.hairline).frame(height: 1) }
+        // The field is not in the window yet at the moment the bar appears.
+        .onChange(of: find.focus, initial: true) { _, _ in DispatchQueue.main.async { focused = true } }
     }
 }
 
@@ -955,15 +1146,31 @@ private struct VerticalLine: Shape {
 private struct BlockRow: View, Equatable {
     let block: TranscriptBlock
     let created: Date
+    /// What is being looked for, marked where it stands; empty when nothing is.
+    var find = ""
+    /// The search has taken the reader to this paragraph.
+    var current = false
     var body: some View {
         MarginRow(time: SessionStore.timestamp(block.start, relativeTo: created), color: Palette.source(block.source)) {
             VStack(alignment: .leading, spacing: 5) {
                 if block.showsSource {
                     Text(block.source).font(.system(size: 11, weight: .semibold)).foregroundStyle(Palette.source(block.source))
                 }
-                Text(block.text).font(.system(size: 15)).lineSpacing(7).textSelection(.enabled)
+                Group { if find.isEmpty { Text(block.text) } else { Text(marked) } }
+                    .font(.system(size: 15)).lineSpacing(7).textSelection(.enabled)
             }
         }
+    }
+
+    private var marked: AttributedString {
+        var text = AttributedString(block.text)
+        let plain = block.text
+        for range in TranscriptSearch.ranges(of: find, in: plain) {
+            let start = text.index(text.startIndex, offsetByCharacters: plain.distance(from: plain.startIndex, to: range.lowerBound))
+            let end = text.index(start, offsetByCharacters: plain.distance(from: range.lowerBound, to: range.upperBound))
+            text[start..<end].backgroundColor = Palette.accent.opacity(current ? 0.36 : 0.16)
+        }
+        return text
     }
 }
 
@@ -1037,6 +1244,8 @@ private struct ShotRow: View {
     let image: ImageAttachment
     let sessionID: UUID
     let created: Date
+    /// Put in after the session was over: it has no moment of the session to show.
+    let late: Bool
     /// Nothing above it, or nothing below it, to move past.
     let first: Bool
     let last: Bool
@@ -1044,10 +1253,12 @@ private struct ShotRow: View {
     @State private var hovering = false
 
     var body: some View {
-        MarginRow(time: SessionStore.timestamp(image.addedAt, relativeTo: created), color: Palette.faint) {
+        MarginRow(time: late ? "" : SessionStore.timestamp(image.addedAt, relativeTo: created), color: Palette.faint) {
             VStack(alignment: .leading, spacing: 6) {
                 HStack(spacing: 6) {
                     Text(image.isShot ? "截屏" : image.name).font(.system(size: 11, weight: .semibold)).foregroundStyle(Palette.muted).lineLimit(1)
+                    // Counted from the session's start, its time would be hours after anything said.
+                    if late { Text("后加").font(.system(size: 11)).foregroundStyle(Palette.faint) }
                     // The time in the margin is when it was taken, which no longer matches its place.
                     if image.placed != nil { Text("挪过位置").font(.system(size: 11)).foregroundStyle(Palette.faint) }
                 }
@@ -1083,12 +1294,12 @@ private struct ShotRow: View {
                     Divider()
                     Button("上移一段") { act(.up) }.disabled(first)
                     Button("下移一段") { act(.down) }.disabled(last)
-                    if image.placed != nil { Button("放回截下时的位置") { act(.reset) } }
+                    if image.placed != nil { Button(image.isShot && !late ? "放回截下时的位置" : "放回原来的位置") { act(.reset) } }
                     Divider()
                     Button("删除这张图", role: .destructive) { act(.delete) }
                 }
                 .frame(maxWidth: 360, maxHeight: 230, alignment: .leading)
-                .help("点开看大图；拖到别的段落前后可以换位置，右键可以删除")
+                .help((late ? "会话结束以后才放进来的图。" : "") + "点开看大图；拖到别的段落前后可以换位置，右键可以删除")
                 .accessibilityLabel(image.isShot ? "截屏" : image.name)
                 .accessibilityAddTraits(.isButton)
             }
